@@ -13,20 +13,6 @@ def frame_name(index: int, ext: str = "dds") -> str:
     return f"{index:02d}.{ext}"
 
 
-def build_index_xml(frame_count: int, wait: int) -> str:
-    """index.xml for the background.raf folder.
-
-    One <case> per frame, in order, with the wait the user picked.
-    """
-    lines = ['<?xml version="1.0" ?>', "<raf>"]
-    lines += [
-        f'  <case wait="{wait}" target="{frame_name(i)}"/>'
-        for i in range(frame_count)
-    ]
-    lines.append("</raf>")
-    return "\n".join(lines) + "\n"
-
-
 def write_index_xml(dest: Path, content: str) -> Path:
     """Writes index.xml always with LF line endings.
 
