@@ -21,7 +21,7 @@ from .storage import StudioError, sha256
 MAX_DIMENSION = 4096
 MAX_PIXELS = 4096 * 2304
 MAX_DURATION = 300
-MEDIA_TIMEOUT = 18
+MEDIA_TIMEOUT = 90  # Includes first-frame decoding of 4K/60FPS source media.
 STILL = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp",
          "GIF": "image/gif", "BMP": "image/bmp"}
 FORMATS = {
