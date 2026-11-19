@@ -32,7 +32,7 @@ class ChunkedUploadTests(unittest.TestCase):
     def test_parts_resume_checks_and_finish(self):
         data = (Path(__file__).parent / "sample.mp4").read_bytes()
         start = self.client.post(self.base + "/uploads", headers=self.auth,
-                                 json={"name": "paisagem.mp4", "size": len(data)})
+                                 json={"name": "paisagem.mp4", "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
         self.assertEqual(start.status_code, 201, start.text)
         key = start.json()["id"]
         endpoint = self.base + "/uploads/" + key
@@ -63,7 +63,7 @@ class ChunkedUploadTests(unittest.TestCase):
     def test_security_incomplete_cancel(self):
         data = b"not a video"
         r = self.client.post(self.base + "/uploads", headers=self.auth,
-                             json={"name": "video.mp4", "size": len(data)})
+                             json={"name": "video.mp4", "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
         self.assertEqual(r.status_code, 201)
         url = self.base + "/uploads/" + r.json()["id"]
         self.assertEqual(self.client.post(url + "/finalize", headers=self.auth).status_code, 409)
@@ -80,7 +80,7 @@ class ChunkedUploadTests(unittest.TestCase):
 
     def test_chunk_limits_and_invalid_media(self):
         r = self.client.post(self.base + "/uploads", headers=self.auth,
-                             json={"name": "bad.mp4", "size": 4})
+                             json={"name": "bad.mp4", "size": 4, "sha256": hashlib.sha256(b"abcd").hexdigest()})
         self.assertEqual(r.status_code, 201)
         url = self.base + "/uploads/" + r.json()["id"]
         self.assertEqual(self.client.put(url, headers={**self.auth, "x-upload-offset": "0"},
