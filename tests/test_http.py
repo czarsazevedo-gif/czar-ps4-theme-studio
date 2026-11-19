@@ -2,7 +2,8 @@
 import io, json, sys, time, urllib.request, urllib.error, zipfile, mimetypes, uuid
 from pathlib import Path
 
-BASE = "http://127.0.0.1:8000"
+import os
+BASE = os.environ.get("CZAR_TEST_URL", "http://127.0.0.1:8000")
 HERE = Path(__file__).parent
 
 def multipart(fields, files):

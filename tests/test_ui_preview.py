@@ -13,7 +13,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = Path(__file__).resolve().parent
 SHOTS = HERE / "shots"; SHOTS.mkdir(exist_ok=True)
-BASE = "http://127.0.0.1:8000"
+import os
+BASE = os.environ.get("CZAR_TEST_URL", "http://127.0.0.1:8000")
 
 fails = []
 def check(label, cond, extra=""):
@@ -216,7 +217,8 @@ with sync_playwright() as pw:
     page.click('.tab[data-tab="package"]'); page.wait_for_timeout(300)
     check("el titulo vuelve", page.input_value("#pkg-title") == "Tema Que Sobrevive",
           page.input_value("#pkg-title"))
-    check("y con el, el boton de empaquetar", not page.is_disabled("#pkg-build"))
+    tools_available = page.request.get(BASE + "/api/system").json()["pkg_tools"]
+    check("disponibilidad del empaquetador", page.is_enabled("#pkg-build") == tools_available)
 
     # El Content ID se autogenera desde el Title ID, PERO tras recargar dejaba
     # de hacerlo: la sesion lo marcaba como "editado a mano" solo porque tenia

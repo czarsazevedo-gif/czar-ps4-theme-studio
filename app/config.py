@@ -164,13 +164,13 @@ PKG_FIXED_PATHS = {
     "pic1": "sce_sys/pic1.png",
 }
 
-def L(en: str, es: str) -> dict:
+def L(en: str, es: str, pt_br: str) -> dict:
     """A label in both languages.
 
     The interface picks by the active language; the key is always present so a
     missing translation shows up as a KeyError here, not as a blank in the UI.
     """
-    return {"en": en, "es": es}
+    return {"en": en, "es": es, "pt-BR": pt_br}
 
 
 #: What each icon is called on the console. The key is the FILE name, which is
@@ -179,26 +179,26 @@ def L(en: str, es: str) -> dict:
 #: generating stays useful when debugging.
 ICON_LABELS = {
     # function
-    "community": L("Communities", "Comunidades"),
-    "event": L("Events", "Eventos"),
-    "friend": L("Friends", "Amigos"),
-    "message": L("Messages", "Mensajes"),
-    "notification": L("Notifications", "Notificaciones"),
-    "party": L("Party", "Grupo"),
-    "power": L("Power", "Encendido"),
-    "setting": L("Settings", "Ajustes"),
-    "trophy": L("Trophies", "Trofeos"),
+    "community": L("Communities", "Comunidades", "Comunidades"),
+    "event": L("Events", "Eventos", "Eventos"),
+    "friend": L("Friends", "Amigos", "Amigos"),
+    "message": L("Messages", "Mensajes", "Mensagens"),
+    "notification": L("Notifications", "Notificaciones", "Notificações"),
+    "party": L("Party", "Grupo", "Grupo"),
+    "power": L("Power", "Encendido", "Energia"),
+    "setting": L("Settings", "Ajustes", "Configurações"),
+    "trophy": L("Trophies", "Trofeos", "Troféus"),
     # content
-    "browser": L("Browser", "Navegador"),
-    "disc": L("Disc", "Disco"),
-    "discoverlay": L("Disc (overlay)", "Disco (superpuesto)"),
-    "folder": L("Folder", "Carpeta"),
-    "gallery": L("Capture Gallery", "Galeria de captura"),
-    "library": L("Library", "Biblioteca"),
-    "livefromps": L("Live from PlayStation", "Live from PlayStation"),
-    "shareplay": L("Share Play", "Share Play"),
-    "tvvideo": L("TV & Video", "TV y video"),
-    "usbmusic": L("USB Music", "Musica USB"),
+    "browser": L("Browser", "Navegador", "Navegador"),
+    "disc": L("Disc", "Disco", "Disco"),
+    "discoverlay": L("Disc (overlay)", "Disco (superpuesto)", "Sobreposição do disco"),
+    "folder": L("Folder", "Carpeta", "Pasta"),
+    "gallery": L("Capture Gallery", "Galeria de captura", "Galeria de capturas"),
+    "library": L("Library", "Biblioteca", "Biblioteca"),
+    "livefromps": L("Live from PlayStation", "Live from PlayStation", "Ao vivo do PlayStation"),
+    "shareplay": L("Share Play", "Share Play", "Share Play"),
+    "tvvideo": L("TV & Video", "TV y video", "TV e vídeo"),
+    "usbmusic": L("USB Music", "Musica USB", "Música USB"),
 }
 
 #: Names the console expects in texture/function_icon/.
@@ -224,7 +224,7 @@ def _build_slots() -> dict:
     """
     slots: dict[str, dict] = {
         "home": {
-            "label": L("Home background", "Fondo de la home"),
+            "label": L("Home background", "Fondo de la home", "Fundo da tela inicial"),
             "path": THEME_PATHS["homescreen"],
             "size": STATIC_SIZE,
             "group": "background",
@@ -233,10 +233,10 @@ def _build_slots() -> dict:
             # the icon and the store pic1 come from here. That is why it gets
             # renamed instead of disappearing like the top-menu one.
             "hidden_by_raf": True,
-            "raf_label": L("Theme image", "Imagen del tema"),
+            "raf_label": L("Theme image", "Imagen del tema", "Imagem do tema"),
         },
         "function": {
-            "label": L("Top menu background", "Fondo del menú superior"),
+            "label": L("Top menu background", "Fondo del menú superior", "Fundo do menu superior"),
             "path": THEME_PATHS["functionscreen"],
             "size": STATIC_SIZE,
             "group": "background",
@@ -244,14 +244,14 @@ def _build_slots() -> dict:
             "hidden_by_raf": True,
         },
         "preview": {
-            "label": L("Theme thumbnail", "Miniatura del tema"),
+            "label": L("Theme thumbnail", "Miniatura del tema", "Miniatura do tema"),
             "path": THEME_PATHS["preview"],
             "size": PREVIEW_SIZE,
             "group": "background",
             "fallback": "home",
         },
         "icon0": {
-            "label": L("Content icon", "Icono del contenido"),
+            "label": L("Content icon", "Icono del contenido", "Ícone de conteúdo"),
             "path": PKG_FIXED_PATHS["sce_icon"],
             "size": SCE_ICON_SIZE,
             "group": "background",
@@ -283,9 +283,9 @@ def _build_slots() -> dict:
 IMAGE_SLOTS = _build_slots()
 
 SLOT_GROUPS = [
-    {"id": "background", "label": L("Backgrounds", "Fondos")},
-    {"id": "function_icon", "label": L("Function icons", "Iconos de función")},
-    {"id": "content_icon", "label": L("Content icons", "Iconos de contenido")},
+    {"id": "background", "label": L("Backgrounds", "Fondos", "Fundos")},
+    {"id": "function_icon", "label": L("Function icons", "Iconos de función", "Ícones de função")},
+    {"id": "content_icon", "label": L("Content icons", "Iconos de contenido", "Ícones de conteúdo")},
 ]
 
 # --- Audio ----------------------------------------------------------------
@@ -297,7 +297,7 @@ SLOT_GROUPS = [
 #: Music has to arrive as .at9; the effects are converted here.
 AUDIO_SLOTS = {
     "bgm": {
-        "label": L("Menu music", "Música del menú"),
+        "label": L("Menu music", "Música del menú", "Música do menu"),
         "path": "sound/bgm_home.at9",
         "codec": "atrac9",
         "rate": 48000,
@@ -305,21 +305,21 @@ AUDIO_SLOTS = {
         "exts": {".at9"},
     },
     "se_decide": {
-        "label": L("Confirm", "Aceptar"),
+        "label": L("Confirm", "Aceptar", "Confirmar"),
         "path": "sound/se_decide.vag",
         "rate": 48000,
         "convert": True,
         "exts": None,          # cualquier audio que lea ffmpeg
     },
     "se_cursor": {
-        "label": L("Move cursor", "Mover el cursor"),
+        "label": L("Move cursor", "Mover el cursor", "Mover cursor"),
         "path": "sound/se_cursor.vag",
         "rate": 48000,
         "convert": True,
         "exts": None,
     },
     "se_cancel": {
-        "label": L("Cancel", "Cancelar"),
+        "label": L("Cancel", "Cancelar", "Cancelar"),
         "path": "sound/se_cancel.vag",
         "rate": 48000,
         "convert": True,

@@ -22,14 +22,14 @@ FORMAT_VERSION = "4.0"
 
 #: The 8 system colours, exactly as Sony documents them inside the xml.
 THEME_COLORS = [
-    (0, L("blue (default)", "azul (por defecto)")),
-    (1, L("pink", "rosa")),
-    (2, L("red", "rojo")),
-    (3, L("navy", "azul marino")),
-    (4, L("dark grey", "gris oscuro")),
-    (5, L("gold", "dorado")),
-    (6, L("light steel blue", "azul acero claro")),
-    (7, L("purple", "morado")),
+    (0, L("blue (default)", "azul (por defecto)", "Azul (padrão)")),
+    (1, L("pink", "rosa", "Rosa")),
+    (2, L("red", "rojo", "Vermelho")),
+    (3, L("navy", "azul marino", "Azul-marinho")),
+    (4, L("dark grey", "gris oscuro", "Cinza-escuro")),
+    (5, L("gold", "dorado", "Dourado")),
+    (6, L("light steel blue", "azul acero claro", "Azul-aço claro")),
+    (7, L("purple", "morado", "Roxo")),
 ]
 
 ARGB_RE = re.compile(r"^#[0-9A-Fa-f]{8}$")

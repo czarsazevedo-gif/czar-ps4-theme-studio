@@ -8,13 +8,14 @@ que cambiar la cantidad de frames o el wait no obliga a volver a subir nada.
 from __future__ import annotations
 
 import json
-import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import MAX_JOBS_KEPT, WORKSPACE
+from .config import WORKSPACE as DATA_ROOT
+
+WORKSPACE = DATA_ROOT / "recovery"
 
 
 @dataclass
@@ -68,7 +69,6 @@ def _safe_suffix(filename: str) -> str:
 
 def create(kind: str, filename: str, data: bytes) -> Job:
     WORKSPACE.mkdir(parents=True, exist_ok=True)
-    _prune()
 
     job_id = uuid.uuid4().hex[:12]
     root = WORKSPACE / f"{kind}-{job_id}"
@@ -117,20 +117,8 @@ def load(kind: str, job_id: str) -> Job | None:
     )
 
 
-def _prune() -> None:
-    """Deja solo los jobs mas recientes; los viejos se borran enteros."""
-    if not WORKSPACE.is_dir():
-        return
-    dirs = [d for d in WORKSPACE.iterdir() if d.is_dir()]
-    if len(dirs) <= MAX_JOBS_KEPT:
-        return
-    dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-    for stale in dirs[MAX_JOBS_KEPT:]:
-        shutil.rmtree(stale, ignore_errors=True)
-
-
 def touch(job: Job) -> None:
-    """Marca el job como usado para que _prune no se lo lleve."""
+    """Registra o último acesso ao trabalho."""
     try:
         job.root.touch()
     except OSError:

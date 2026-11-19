@@ -754,7 +754,7 @@ async function bootSlots() {
  * backend on startup, because jobs.prune() may have cleaned the old ones:
  * whatever is still alive is restored and the rest is dropped silently. */
 
-const SESION_KEY = "ps4theme.sesion.v1";
+const SESION_KEY = "czar.recovery.sesion.v1";
 const PKG_CAMPOS = ["pkg-title", "pkg-title-id", "pkg-content-id", "pkg-themecolor",
                     "pkg-fontcolor", "pkg-fontshadow", "pkg-focuscolor"];
 

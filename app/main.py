@@ -74,7 +74,7 @@ async def _read_upload(file: UploadFile, allowed: set[str]) -> bytes:
             f"Unsupported extension: {suffix or '(no extension)'}. "
             f"Accepted: {', '.join(sorted(allowed))}",
         )
-    data = await file.read()
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
     if not data:
         raise HTTPException(400, "The file arrived empty.")
     if len(data) > MAX_UPLOAD_BYTES:
