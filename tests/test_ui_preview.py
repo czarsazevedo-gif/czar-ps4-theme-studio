@@ -5,6 +5,7 @@ verdad sobre el tema: que respete la cadena de respaldos, que con escena
 animada las dos pantallas ensenen lo mismo (que es lo que hace la consola) y
 que los colores salgan de los mismos campos que van al theme.xml.
 """
+import os
 import sys
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -43,7 +44,7 @@ def pin_lang(pg, code="en"):
 
 
 with sync_playwright() as pw:
-    b = pw.chromium.launch()
+    b = pw.chromium.launch(executable_path=os.environ.get("CZAR_CHROMIUM"))
     page = b.new_page(viewport={"width": 1440, "height": 950})
     errs = []
     page.on("console", lambda m: errs.append(m.text) if m.type == "error" else None)
@@ -216,7 +217,8 @@ with sync_playwright() as pw:
     page.click('.tab[data-tab="package"]'); page.wait_for_timeout(300)
     check("el titulo vuelve", page.input_value("#pkg-title") == "Tema Que Sobrevive",
           page.input_value("#pkg-title"))
-    check("y con el, el boton de empaquetar", not page.is_disabled("#pkg-build"))
+    pkgs_available = page.evaluate("pkg.defaults?.available === true")
+    check("boton de empaquetar coherente con las herramientas", page.is_enabled("#pkg-build") == pkgs_available)
 
     # El Content ID se autogenera desde el Title ID, PERO tras recargar dejaba
     # de hacerlo: la sesion lo marcaba como "editado a mano" solo porque tenia

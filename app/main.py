@@ -8,10 +8,12 @@ else keeps working.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -49,8 +51,45 @@ from .config import (
 )
 from .dds import DEFAULT_BACKEND, available_backends, encode_frame, encode_sequence
 from .media import MediaError
+from .studio import api as studio
+from .studio.storage import StudioError
 
-app = FastAPI(title="PS4 Theme Asset Creator", docs_url=None, redoc_url=None)
+app = FastAPI(title="Czar PS4 Theme Studio", docs_url=None, redoc_url=None, openapi_url=None)
+app.include_router(studio.router)
+app.add_exception_handler(RequestValidationError, studio.validation_error)
+
+
+@app.exception_handler(StudioError)
+async def studio_error(_request, exc: StudioError):
+    return studio.error_response(exc)
+
+
+@app.middleware("http")
+async def studio_boundary(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and not path.startswith("/api/studio/"):
+        if os.environ.get("CZAR_LEGACY", "0") != "1" or not studio.valid_origin(request):
+            return studio.error_response(StudioError(404, "route_missing", "Rota indisponível."))
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    response.headers["Referrer-Policy"] = "same-origin"
+    if path.startswith("/api/studio/"):
+        response.headers["Cache-Control"] = "no-store"
+    if path == "/" and os.environ.get("CZAR_LEGACY") != "1":
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; img-src 'self' blob:; media-src 'self' blob:; "
+            "style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; "
+            "object-src 'none'; base-uri 'none'; form-action 'self'"
+        )
+    return response
+
+
+@app.get("/healthz")
+def health():
+    ready = bool(media.FFMPEG and media.FFPROBE)
+    return JSONResponse({"status": "ok" if ready else "unavailable"}, status_code=200 if ready else 503)
+
 
 #: Upload cap. A source video can be large; the result never is.
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
@@ -1050,7 +1089,7 @@ def package_download(job_id: str) -> FileResponse:
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
-    return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+    return HTMLResponse((STATIC_DIR / ("index.html" if os.environ.get("CZAR_LEGACY") == "1" else "studio.html")).read_text(encoding="utf-8"))
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

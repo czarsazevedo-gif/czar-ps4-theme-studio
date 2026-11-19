@@ -1,42 +1,13 @@
-Packaging tools
-===============
+Componentes externos
+====================
 
-THIS FOLDER SHIPS EMPTY IN THE REPOSITORY. The binaries are proprietary Sony
-software and are not redistributed here; you have to obtain them separately
-and lay them out like this:
+O Studio Linux prepara o tema e o GP4 para empacotamento externo. O código
+do editor é MIT. Essa licença não concede direitos sobre ferramentas da Sony.
 
-  tools/
-    orbis-pub-cmd.exe     builds param.sfo and the package image (img_create)
-    at9tool.exe           optional: converts the music to ATRAC9
-    ext/
-      sc.exe              orbis-pub-cmd calls it; without it, it won't start
-      di.exe              same
-      libatrac9.dll       needed to measure the loudness of an .at9
+orbis-pub-cmd.exe, sc.exe, di.exe, libatrac9.dll e at9tool.exe são componentes
+proprietários. O repositório e os scripts de Codespaces não os distribuem
+nem os obtêm. Um operador pode usar ferramentas externas para as quais
+tenha acesso legítimo em um ambiente compatível.
 
-The app works without them: on startup it detects they are missing, disables
-the Package tab on its own and everything else keeps working. Without
-at9tool.exe the music has to be uploaded already converted to .at9.
-
-Where they come from
---------------------
-
-orbis-pub-cmd.exe, sc.exe and di.exe come from "PS4 Fake PKG Tools 3.87
-(Patched) V7", packaged by CyB1K, with credit to flat_z, cfwprophet,
-SocraticBliss, TheRadziu, Arczi and Opoisso. It is Sony Interactive
-Entertainment Inc.'s "Publishing Tools ver. 3.87" -- proprietary SDK software
-with binary patches applied by the scene (Custom PKG Key, Fake SELF Support,
-Online Checks Patched). It is not free software and there is no public source,
-which is why the app shells out to it instead of reimplementing it.
-
-at9tool.exe is the "SCEI ATRAC9 TOOL", also from Sony's official SDK.
-
-Why only these
---------------
-
-They are the minimum set. Verified empirically: the package they produce is
-byte-for-byte identical to the one from the full 16 MB distribution. The rest
-(the gengp4/orbis-pub-gen GUIs, the orbis-pub-chk validator, the trophy
-utilities and the PSX-PS2-FPKG folder) is unused.
-
-Heads-up: orbis-pub-chk.exe hangs without producing any output. Don't waste
-time on it.
+A interface legada local pode detectar ferramentas presentes no próprio
+ambiente. A interface padrão do Studio usa o bundle como saída.

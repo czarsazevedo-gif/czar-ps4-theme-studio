@@ -48,11 +48,12 @@ def check(label, cond, extra=""):
 print("=== validacion ===")
 s, e = req("POST", "/api/audio/bgm/upload", {}, {"file": HERE / "sample.png"})
 check("png rechazado por extension (415)", s == 415, str(e)[:80])
-s, e = req("POST", "/api/audio/inventado/upload", {}, {"file": HERE / "sample.at9"})
+s, e = req("POST", "/api/audio/inventado/upload", {}, {"file": HERE / "sample_sfx.wav"})
 check("hueco de audio desconocido (404)", s == 404, str(e)[:60])
 
 s, sysinfo = req("GET", "/api/system")
 HAS_AT9TOOL = bool(sysinfo.get("at9tool"))
+HAS_PACKAGER = bool(sysinfo.get("pkg_tools"))
 print(f"        at9tool disponible: {HAS_AT9TOOL}")
 
 if (HERE / "notaudio.at9").exists():
@@ -152,8 +153,12 @@ if (HERE / "sample_sfx.wav").exists():
             sfx_jobs[sid] = r["job_id"]
             print(f"        {sid}: {r['source_codec']} -> {r['codec']}, {r['bytes']:,} B")
 
-if sfx_jobs:
-    s, r3 = req("POST", "/api/package/build", {**base, "sfx": json.dumps(sfx_jobs)})
+if sfx_jobs and HAS_PACKAGER:
+    s, home = req("POST", "/api/slot/home/upload", {}, {"file": HERE / "sample.png"})
+    base_sfx = {"title": "Tema con efectos", "title_id": "CUSA00000",
+                "category": "ac", "passcode": Z, "mode": "theme",
+                "slots": json.dumps({"home": home["job_id"]})}
+    s, r3 = req("POST", "/api/package/build", {**base_sfx, "sfx": json.dumps(sfx_jobs)})
     check("build con efectos", s == 200, str(r3)[:90])
     if s == 200:
         s, blob3 = req("GET", r3["download"], raw=True)

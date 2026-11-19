@@ -8,13 +8,16 @@ que cambiar la cantidad de frames o el wait no obliga a volver a subir nada.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import MAX_JOBS_KEPT, WORKSPACE
+from .config import MAX_JOBS_KEPT, WORKSPACE as DEFAULT_WORKSPACE
+
+WORKSPACE = Path(os.environ.get('CZAR_LEGACY_WORKSPACE', DEFAULT_WORKSPACE))
 
 
 @dataclass
@@ -121,7 +124,7 @@ def _prune() -> None:
     """Deja solo los jobs mas recientes; los viejos se borran enteros."""
     if not WORKSPACE.is_dir():
         return
-    dirs = [d for d in WORKSPACE.iterdir() if d.is_dir()]
+    dirs = [d for d in WORKSPACE.iterdir() if d.is_dir() and "-" in d.name]
     if len(dirs) <= MAX_JOBS_KEPT:
         return
     dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)

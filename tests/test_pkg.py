@@ -47,7 +47,8 @@ def check(label, cond, extra=""):
 
 print("=== disponibilidad ===")
 s, sysinfo = req("GET", "/api/system")
-check("pkg_tools detectadas", sysinfo.get("pkg_tools") is True, str(sysinfo.get("pkg_tools")))
+has_tools = sysinfo.get("pkg_tools") is True
+print(f"        pkg_tools: {has_tools}")
 s, d = req("GET", "/api/package/defaults")
 check("defaults 200", s == 200)
 check("modo por defecto theme", d["defaults"]["mode"] == "theme", d["defaults"]["mode"])
@@ -85,6 +86,10 @@ check("category que no es 'ac' -> rechazada", s in (400, 422), f"{s}: {str(e)[:7
 print("\n=== BUILD REAL ===")
 t0 = time.time()
 s, r = req("POST", "/api/package/build", base)
+if not has_tools:
+    check("sin herramientas, build indisponible", s == 422 and "orbis-pub-cmd.exe" in r.get("detail", ""))
+    print("        generación e inspección del PKG omitidas")
+    sys.exit(1 if fails else 0)
 check("build 200", s == 200, str(r)[:220])
 if s != 200:
     print("\n".join(f"{len(fails)} FALLOS"), fails); sys.exit(1)

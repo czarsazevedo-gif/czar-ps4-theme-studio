@@ -275,7 +275,8 @@ def build_param_sfx(meta: PackageMeta) -> str:
     ])
 
 
-def build_gp4(meta: PackageMeta, targets: list[str], content_dir_name: str) -> str:
+def build_gp4(meta: PackageMeta, targets: list[str], content_dir_name: str,
+              *, source_paths: dict[str, str] | None = None) -> str:
     """Builds the .gp4 by hand.
 
     It is plain XML, so generating it here avoids calling gp4_file_add once per
@@ -304,9 +305,10 @@ def build_gp4(meta: PackageMeta, targets: list[str], content_dir_name: str) -> s
                 out.append(f'{pad}<dir targ_name="{_esc(name)}"/>')
         return out
 
+    sources = source_paths or {t: f"{content_dir_name}/{t}" for t in targets}
     files = [
         f'    <file targ_path="{_esc(t)}" '
-        f'orig_path="{_esc(content_dir_name)}\\{_esc(t.replace("/", chr(92)))}"/>'
+        f'orig_path="{_esc(sources[t].replace("/", chr(92)))}"/>'
         for t in targets
     ]
 

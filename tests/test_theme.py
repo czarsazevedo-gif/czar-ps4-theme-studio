@@ -79,6 +79,10 @@ check("modo desconocido -> 422", s == 422, str(e)[:80])
 
 print("\n=== BUILD MODO TEMA ===")
 s, r = req("POST", "/api/package/build", {**base, "mode": "theme"})
+if not req("GET", "/api/system")[1].get("pkg_tools"):
+    check("sin herramientas, build indisponible", s == 422 and "orbis-pub-cmd.exe" in r.get("detail", ""))
+    print("        inspección del PKG omitida")
+    sys.exit(1 if fails else 0)
 check("build 200", s == 200, str(r)[:200])
 if s != 200: print(fails); sys.exit(1)
 check("volume de tema", r["volume_type"] == "pkg_ps4_theme", r["volume_type"])

@@ -1,250 +1,137 @@
-# PS4 Ultimate Theme Creator
+# Czar PS4 Theme Studio
 
-Local web app that builds a custom PS4 theme — backgrounds, icons, animated
-scene, music and sound effects — and packs it into an installable `.pkg`.
+Editor web em português brasileiro para criar e validar temas estáticos e animados
+de PlayStation 4. O navegador do tablet controla o canvas e a timeline. O servidor
+Linux faz a análise, composição, codificação e exportação.
 
-Everything runs in your browser against a server on your own machine. Nothing
-is uploaded anywhere.
+![Editor em landscape com a timeline e o orçamento RAF](docs/studio-landscape.png)
 
-```powershell
-.\run.ps1
+[Veja a captura em portrait](docs/studio-portrait.png).
+
+## Começar no GitHub Codespaces
+
+1. Abra um Codespace neste repositório e aguarde a instalação do devcontainer.
+2. No terminal, execute `./start.sh`.
+3. No painel **Portas**, abra a porta **8000** no navegador. Confirme a visibilidade **Privada** e entre na mesma conta GitHub no tablet.
+
+O endereço encaminhado segue `https://<nome-do-codespace>-8000.<domínio-de-encaminhamento>`,
+normalmente `app.github.dev`. O script imprime a URL quando as variáveis de
+Codespaces estão presentes. A API `/healthz` verifica a disponibilidade de FFmpeg e ffprobe.
+
+Em Linux local, instale Python 3.11+, FFmpeg e ffprobe e execute
+`python -m pip install -r requirements.txt` seguido de `./start.sh`.
+Abra `http://127.0.0.1:8000`.
+
+## Criar um tema
+
+- Crie um tema e escolha fundo estático ou animado. Importe mídias pelo seletor Android e reutilize os originais na biblioteca do projeto.
+- No canvas, arraste com toque ou caneta para mover o fundo. Os controles de posição, enquadramento e recorte também funcionam por teclado.
+- Ajuste o trecho, o playhead e o orçamento em **Animação**. Ative o modo **Avançado** em **Projeto** para escolher tempos individuais, editar o enquadramento da animação e ajustar metadados.
+- Em **Camadas**, use imagens estáticas, o primeiro quadro de GIFs ou cores sobre a fonte principal. A composição é renderizada antes do DDS.
+- Configure ícones, áudio e cores. Use as três telas de preview e o teste de contraste por amostragem.
+- Valide e exporte o ZIP de sua escolha. Exporte o projeto com os originais para reabri-lo em outro navegador ou servidor.
+
+Projetos são gravados em `workspace/projects/<id>/`, com manifesto JSON de schema 1.
+O autosave faz gravação atômica e detecta conflitos entre abas. A sessão persistente
+do navegador identifica o proprietário. Cookies apagados, outros perfis ou outro
+domínio exigem importar um ZIP para recuperar o projeto nesses ambientes. Codespaces
+pode apagar seu armazenamento quando um Codespace for excluído.
+
+## Mídia e formatos
+
+Aceita PNG, JPEG, WebP, BMP e GIF, além de MP4/MOV modernamente encapsulados, WebM,
+WAV, MP3, AAC/M4A, OGG/Opus, FLAC, AT9 e VAG válidos. O tipo é identificado a partir
+do conteúdo. O Studio limita a mídia a 4096 px por eixo, 9,4 MP por quadro e 300 s.
+
+O fundo estático é renderizado em 1920 × 1080. No modo animado, a cena cobre a
+tela inicial e o menu superior. O Studio preserva a imagem do tema como
+capa e usa um quadro da fonte quando não há capa escolhida.
+
+| Preset RAF | Resolução | Máximo |
+| --- | --- | --- |
+| Qualidade | 1280 × 720 | 13 quadros |
+| Equilibrado | 960 × 540 | 24 quadros |
+| Movimento | 640 × 360 | 48 quadros |
+
+A cena usa DXT1a, `plane.mdx` e `index.xml` com `wait` em segundos decimais.
+A duração do loop resulta do número de quadros multiplicado por `wait`.
+O limite é de 48 quadros e 6 MiB de DDS, conforme o projeto original.
+O FPS da fonte descreve a mídia de entrada. O FPS RAF depende do intervalo de reprodução.
+
+Os efeitos de cursor, confirmar e cancelar são convertidos para VAG mono a 48 kHz.
+Para música personalizada, importe ATRAC9 a 48 kHz, aproximadamente 144 kbps e
+loop completo. Outras faixas são exportadas em WAV estéreo PCM 16 bits a 48 kHz
+para conversão externa. Ganho e fades são aplicados na preparação do WAV ou VAG.
+O preview toca até os primeiros 30 segundos do trecho musical.
+
+## Exportação e empacotamento
+
+- **Projeto** inclui o manifesto e as mídias originais.
+- **Assets processados** inclui os recursos convertidos e o relatório.
+- **Cena RAF** preserva `scene/background.raf/` e os nomes esperados.
+- **Árvore** inclui `Image0/` e `Sc0/`.
+- **Bundle** acrescenta `theme.gp4`, manifesto, hashes e instruções.
+- **Diagnóstico** inclui manifesto e relatórios sem mídia original.
+
+**Status C — bundle pronto para empacotamento externo.** O servidor gera a
+árvore, `param.sfo` e GP4, com `volume_type=pkg_ps4_theme`, `IRO_TAG=2` e
+`CATEGORY=ac`. O empacotamento precisa ser feito em um ambiente compatível
+com ferramentas fornecidas pelo proprietário. Use
+`python tools/verify_bundle.py bundle-empacotamento.zip` para verificar o ZIP
+antes de entregá-lo à etapa de empacotamento. A verificação cobre o inventário e
+a integridade do bundle. O `EMPACOTAMENTO.md` no ZIP descreve a etapa externa.
+
+A base original é [MIT](LICENSE). FFmpeg segue a licença da compilação instalada
+e sua configuração aparece em **Licenças e componentes**. Ferramentas Sony
+têm licença própria e são opcionais apenas fora do Studio Linux.
+
+## Teste físico
+
+No painel **Validar**, associe um registro ao Build ID. O alvo padrão é PS4 Slim
+com firmware 12.52. Registre instalação, listagem, aplicação, RAF, música, SFX,
+ícones, reinicialização, código CE e observações. Nenhuma validação estrutural
+substitui o teste no console. O relatório mantém a etapa de pacote como não
+verificável enquanto o ambiente só exportar bundles.
+
+## Arquitetura e segurança
+
+- `app/studio/` contém API, schema, storage, mídia, fila, composição, PSF e validação.
+- `app/static/studio/` contém módulos JS sem bundler. O preview compõe miniaturas e quadros de baixa resolução.
+- O servidor usa um processo Uvicorn e uma fila limitada, com cancelamento entre etapas, logs e retenção dos seis jobs mais recentes por projeto.
+- Os projetos são isolados pela sessão. O servidor valida origem, CSRF, UUIDs, tipos, cotas, tamanho e caminhos ZIP. FFmpeg usa argumentos fixos, contêineres reconhecidos e timeout.
+- Valores padrão de `CZAR_UPLOAD_BYTES` e `CZAR_PROJECT_BYTES` são 128 MiB por arquivo e 512 MiB por projeto. `CZAR_WORKSPACE` muda a raiz privada de armazenamento.
+- Mantenha o encaminhamento como privado. O servidor foi projetado para um Codespace privado, com a autenticação do GitHub na borda.
+- O editor original permanece disponível localmente pelo `run.ps1` ou pela opção `CZAR_LEGACY=1` restrita à interface de loopback. Ele usa o armazenamento legado.
+
+## Testar
+
+```bash
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m playwright install --with-deps chromium
+./test.sh
 ```
 
-Then open <http://127.0.0.1:8000>. The script installs the Python dependencies
-if they are missing and starts the server. The interface is available in
-English and Spanish.
+`./test.sh api`, `./test.sh ui` e `./test.sh legacy` selecionam suítes.
+Pare aplicações nas portas de teste 8000 e 8174 antes de iniciar.
+`CZAR_CHROMIUM` seleciona o executável em todos os testes de interface. As suítes de
+interface usam viewports touch de tablet em landscape e portrait. Os testes
+originais de PKG/AT9 cobrem os ramos disponíveis sem as ferramentas e só exercitam
+a construção quando as dependências legítimas estão presentes.
 
-![Preview of the console home screen](docs/03-preview-home.png)
+[Auditoria e baseline](docs/auditoria.md) · [Changelog](CHANGELOG.md)
 
----
+## Solução de problemas
 
-## Requirements
+- **Porta não abre** — confirme `./start.sh`, o painel Portas e a sessão GitHub no tablet. Teste `/healthz`.
+- **Quadro indisponível no final do vídeo** — recue o marcador de fim ou confirme que o clipe possui quadros decodificáveis nesse trecho.
+- **Orçamento RAF excedido** — reduza quadros, escolha uma resolução menor ou ajuste o FPS efetivo.
+- **Sem música no tema exportado** — se o bundle contém WAV, a conversão ATRAC9 e a reimportação estão pendentes.
+- **Sem projeto na lista** — entre no mesmo domínio e perfil de navegador ou importe o ZIP do projeto.
 
-| | |
-|---|---|
-| **Python 3.10+** | `run.ps1` installs `fastapi`, `uvicorn`, `python-multipart`, `numpy` |
-| **ffmpeg** + **ffprobe** on PATH | decode the input video and audio |
-| Windows | the packaging tools are 32-bit `.exe` |
+## Limitações desta versão
 
-ImageMagick is not needed — the DXT1a compressor is part of the project. If
-`magick` is on PATH it is offered as an alternative backend.
-
-### The packaging tools are not bundled
-
-`orbis-pub-cmd.exe` and friends are **proprietary Sony binaries** patched by
-the scene, so they are not redistributed here. You need **5 files**, and they
-come from **two different downloads**.
-
-#### 1. From "PS4 Fake PKG Tools 3.87 (Patched) V7" — 4 files
-
-Good news: the layout inside that download is **already the one this project
-wants**. Copy these four across, keeping the `ext/` subfolder, and you're done.
-
-| Copy this file | To | Size | Without it |
-|---|---|---|---|
-| `orbis-pub-cmd.exe` | `tools/` | 3.12 MB | no packaging at all |
-| `ext/sc.exe` | `tools/ext/` | 1.03 MB | `orbis-pub-cmd` won't even start |
-| `ext/di.exe` | `tools/ext/` | 0.68 MB | same |
-| `ext/libatrac9.dll` | `tools/ext/` | 0.11 MB | music loudness can't be measured |
-
-The sizes are a rough check that you grabbed the right build. Nothing else
-from that download is used — not the GUIs, not the validator, not the trophy
-utilities, not the `PSX-PS2-FPKG` folder.
-
-> That download also ships a second copy of `ext/` inside `PSX-PS2-FPKG/`.
-> Either copy works; they are byte-identical.
-
-#### 2. `at9tool.exe` — optional, 1 file
-
-| Copy this file | To | Size | Without it |
-|---|---|---|---|
-| `at9tool.exe` | `tools/` | 0.21 MB | music must be uploaded already in `.at9`, and the volume control is disabled |
-
-It is the "SCEI ATRAC9 TOOL" from Sony's SDK. It is *not* part of the Fake PKG
-Tools download.
-
-#### The end result
-
-```
-tools/
-├─ orbis-pub-cmd.exe      ← required
-├─ at9tool.exe            ← optional
-├─ NOTICE.txt             (already in the repo)
-└─ ext/
-   ├─ sc.exe              ← required
-   ├─ di.exe              ← required
-   └─ libatrac9.dll       ← required
-```
-
-**The app runs without any of this.** On startup it checks what is present,
-disables the *Package* tab if the tools are missing and carries on — you can
-still build every asset and export the animated scene `.zip`. The status pills
-in the top-right corner tell you what was detected.
-
-See [tools/NOTICE.txt](tools/NOTICE.txt) for where these binaries come from.
-
----
-
-## What it makes
-
-| Tab | What it customises | Slots |
-|---|---|---|
-| Background | **still image** (home, top menu, thumbnail, icon) or **animated** (video/gif → RAF scene) | 4 |
-| Icons | function (128×128 + 152×152 glow) and content (512×512) | 9 + 10 |
-| Sounds | menu music → `.at9` · effects → `.vag` | 1 + 3 |
-| Preview | mock-up of the console screens with your images | — |
-| Package | puts it all into a `.pkg` | — |
-
-**23 independent image slots.** The only required one is the **home
-background**; every other background copies from it when left empty, and icons
-you don't upload keep the system ones.
-
-![Background tab](docs/01-background.png)
-
-![Icons tab](docs/02-icons.png)
-
-## How it works
-
-**Still and animated backgrounds are mutually exclusive.** With a
-`scene/background.raf/` present the console paints the scene on *both* screens,
-so the two still PNGs are never visible — they are left out of the package. The
-tab makes this an explicit choice: pick *animated* and the top-menu background
-disappears, while the home one is renamed *theme image*, which is what it
-actually does there (the list thumbnail, the icon and the store shot come from
-it).
-
-**Audio is converted for you.** Upload any format and it becomes what the
-console expects. The music also has a **volume control**: a normal song lands
-about 13 dB above the music of a real theme, so without levelling it drowns out
-the rest of the system. The resulting level is declared in `param.sfo` as
-`bgmhome_loud`, which is what the console uses to balance it.
-
-**The preview** builds the three screens a theme touches — home, top menu and
-the *apply theme* screen — using your images, icons and colours, so you can
-check contrast without a package → USB → install round trip. Positions are
-measured from real console captures.
-
-![Apply theme screen](docs/04-preview-apply.png)
-
-**Work survives a page reload.** File ids are kept in the browser and checked
-against `workspace/` on startup; whatever is still alive is restored.
-
-Animated mode also exports a standalone `.zip` with the
-`scene/background.raf/` folder, in case you'd rather assemble the theme by hand.
-
----
-
-## Theme format
-
-What the console produces from your assets:
-
-```
-Image0/
-  theme.xml                              descriptor
-  texture/
-    background/homescreen.png            1920×1080  ┐ only when there is
-    background/functionscreen.png        1920×1080  ┘ no animated scene
-    preview.png                          740×416    list thumbnail
-    function_icon/<name>.png             128×128
-    function_icon/<name>_glow.png        152×152
-    content_icon/<name>.png              512×512
-  scene/background.raf/                  animated background (optional)
-    NN.dds                               DXT1a
-    plane.mdx                            shared plane
-    index.xml                            scene
-  sound/bgm_home.at9                     menu music (optional)
-  sound/se_{decide,cursor,cancel}.vag    sound effects (optional)
-Sc0/  param.sfo · icon0.png 512×512 · pic1.png   (placed by the tool)
-```
-
-Paths are not configurable — the console looks for those literal names.
-Valid function icons: `community`, `event`, `friend`, `message`,
-`notification`, `party`, `power`, `setting`, `trophy`.
-
-![Package tab](docs/05-package.png)
-
-### Rules you cannot break
-
-All of these were verified on a real console. The app enforces them, so you
-shouldn't be able to hit them from the interface — but if you touch the code,
-they are what will bite.
-
-| Rule | What happens otherwise |
-|---|---|
-| `volume_type=pkg_ps4_theme` + `IRO_TAG=2` + `CATEGORY=ac` | Without `IRO_TAG` it installs as an app with a *Start* button and throws **CE-37695-0**. With `CATEGORY=gd` it shows up in *Themes* but the console crashes (**CE-36329-3**) |
-| `theme.xml` at the root, with `format-version` and `themecolor` | the console crashes when applying the theme |
-| `background.raf/`: **≤ 6 MiB** of `.dds` **and** **≤ 48 frames** | installs fine, then fails to apply with **CE-38196-7** "data corrupted" |
-| The scene's `wait` is in **seconds with decimals** | `wait="2"` is 2 seconds per frame, not 200 ms |
-| The `.at9` is **144 kbps** with a loop (`-wholeloop`) | at 168 kbps and without an `smpl` chunk it stays silent, even though ffmpeg reads it fine |
-| `<homebgm-enable>` only `True` when `sound/bgm_home.at9` exists | `True` without music makes the console play its own |
-| Passcode of 32 zeros | it encrypts the package and is **not stored inside it**, so the installer has to know it up front |
-
-Two more traps worth knowing: `gdt` is **not** a valid category despite what
-some tutorials say, and the RAF scene has **no `target=` attribute** — the
-`<case wait target>` you'll find online is made up.
-
-Because of the frame and weight caps, the resolution you pick decides how long
-the animation can be: **13** frames at 1280×720, **24** at 960×540, **48** at
-640×360. DXT1 is fixed-rate, so the weight does not depend on the image.
-
----
-
-## Development
-
-```
-app/
-  config.py     format constants, limits and theme paths
-  dxt1.py       DXT1a (BC1) encoder/decoder in numpy + .dds header
-  dds.py        compression backends (native / ImageMagick)
-  media.py      ffmpeg and ffprobe wrappers
-  mdx.py        .mdx model (XDM format): parse, build, plane generator
-  raf.py        animated scene (index.xml)
-  vag.py        VAG (PS-ADPCM) encoder for the sound effects
-  at9.py        ATRAC9 conversion via at9tool (optional)
-  theme_xml.py  the theme.xml
-  theme.py      frame names, LF-forced writing, .zip assembly
-  pkg.py        packaging: param.sfo, keystone, .gp4, img_create
-  jobs.py       working folders under workspace/
-  main.py       API and server
-  static/       interface (html, css, js — no bundler, no build step)
-tests/          10 suites + make_fixtures.py
-tools/          drop the packaging binaries here (not included)
-workspace/      uploads and outputs, temporary — cleans itself
-```
-
-The frontend has no build step: edit `app/static/*` and reload.
-
-### Tests
-
-They need the server running on port 8000, and the browser ones need
-playwright.
-
-```powershell
-python -m playwright install chromium    # only for test_ui*
-python tests\make_fixtures.py            # sample.mp4 / .png / .at9 ... via ffmpeg
-$env:PYTHONIOENCODING = "utf-8"
-
-python tests\test_dxt1.py                # DXT1a encoder
-python tests\test_http.py                # animated background API
-python tests\test_slots.py               # slots and package tree
-python tests\test_theme.py               # param.sfo read from inside the .pkg
-python tests\test_pkg.py                 # packaging validation
-python tests\test_audio.py               # music and effects
-python tests\test_convert.py             # standalone converter
-python tests\test_ui.py                  # browser: player and sliders
-python tests\test_ui_slots.py            # browser: slot grids and packaging
-python tests\test_ui_preview.py          # browser: console mock-up and session
-```
-
-Each suite prints `OK`/`FAIL` per line and exits 1 if anything failed. The ones
-that build a `.pkg` need the tools in `tools/`.
-
----
-
-## Licence and credits
-
-The code in this repository is MIT — see [LICENSE](LICENSE). That does **not**
-cover the packaging binaries, which are proprietary Sony software and are not
-distributed here.
-
-Tool by [Imxnxl](https://github.com/Imxnxl).
+O preview é uma simulação visual com amostras, sem validação no hardware.
+As camadas animadas múltiplas, crossfade, amostragem por movimento, edição de
+texto, mascaramento avançado e PWA ficam fora desta versão. A prévia pode
+demorar no primeiro carregamento dos quadros. O hardware Galaxy Tab S10 Ultra
+e o PS4 12.52 exigem teste físico à parte.
