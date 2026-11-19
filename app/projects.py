@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 from starlette.responses import JSONResponse
 
 from . import jobs
+from .composition_model import Composition
 from .config import (
     ANIMATED_SIZES, AUDIO_SLOTS, IMAGE_SLOTS, MIN_WAIT_SECONDS, MAX_WAIT_SECONDS,
     WORKSPACE, max_frames_for,
@@ -70,6 +71,7 @@ class Editor(Model):
     bgmGain: float = Field(ge=-24, le=12)
     sfx: dict[str, JobId] = Field(max_length=len(AUDIO_SLOTS) - 1)
     anim: Animation | None
+    composition: Composition | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def check_slots(self):
@@ -124,13 +126,14 @@ async def scope_jobs(request: Request, call_next):
     project = request.query_params.get("project")
     path = request.url.path
     library_apply = path.startswith("/api/library/") and path.endswith("/apply")
-    protected = project is not None or path.startswith(("/api/projects", "/api/library"))
+    compositor = path.startswith("/api/composition/")
+    protected = project is not None or compositor or path.startswith(("/api/projects", "/api/library"))
     if protected and request.method in {"POST", "PUT"}:
         if not valid_origin(request):
             return JSONResponse({"detail": "Origem da solicitação não autorizada."}, status_code=403)
-    if library_apply and project is None:
+    if (library_apply or compositor) and project is None:
         return JSONResponse({"detail": "Abra um projeto antes de aplicar a mídia."}, status_code=400)
-    if project is None or not (library_apply or path.startswith(
+    if project is None or not (library_apply or compositor or path.startswith(
         ("/api/animated/", "/api/slot/", "/api/audio/", "/api/convert/", "/api/package/")
     )):
         return await call_next(request)
@@ -326,6 +329,10 @@ def save_project(request: Request, project: str, payload: SaveProject):
                     return current
                 raise HTTPException(409, "Outra aba salvou uma revisão mais recente.")
             find_references(root, payload.state)
+            if payload.state.composition:
+                from .compositor import validate_references
+
+                validate_references(root, payload.state.composition)
             updated = current.model_copy(update={
                 "name": payload.name, "state": payload.state, "revision": current.revision + 1,
                 "updatedAt": datetime.now(timezone.utc),

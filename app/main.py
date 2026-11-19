@@ -8,7 +8,10 @@ else keeps working.
 from __future__ import annotations
 
 import json
+import math
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -17,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from pydantic import BaseModel, ConfigDict
 
-from . import at9, jobs, library, mdx, media, pkg, projects, raf, theme, theme_xml, vag
+from . import at9, compositor, jobs, library, mdx, media, pkg, projects, raf, theme, theme_xml, vag
 from .config import (
     ANIMATED_FRAME_BYTES,
     ANIMATED_SIZE,
@@ -57,6 +60,7 @@ app = FastAPI(title="PS4 Theme Asset Creator", docs_url=None, redoc_url=None)
 app.middleware("http")(projects.scope_jobs)
 app.include_router(projects.router)
 app.include_router(library.router)
+app.include_router(compositor.router)
 
 #: The UI used to allow going over the cap "so the red bar could be seen".
 #: That let you assemble a theme the console rejects with CE-38196-7, so it no
@@ -264,10 +268,14 @@ async def animated_export(
     frames: int = Form(...),
     wait_seconds: float = Form(DEFAULT_WAIT_SECONDS),
     backend: str = Form(DEFAULT_BACKEND),
+    composition: str | None = Form(None),
+    animation_size: str = Form(""),
 ) -> dict:
     """Converts to .dds, writes the full RAF scene and assembles the .zip."""
     job = _get_job("animated", job_id)
-    size = tuple(job.meta.get("size") or ANIMATED_SIZE)
+    state = compositor.load_composition(composition)
+    has_overlay = bool(state and state.surface("animated"))
+    size = _composed_animation_size(job, animation_size if has_overlay else "")
     frame_count = _clamp_frames(frames, size)
     wait = max(MIN_WAIT_SECONDS, min(MAX_WAIT_SECONDS, wait_seconds))
 
@@ -276,21 +284,55 @@ async def animated_export(
         theme.check_budget(frame_count * dds_bytes_for(*size))
     except ValueError as exc:
         raise HTTPException(413, str(exc)) from exc
+    if has_overlay and frame_count != frames:
+        raise HTTPException(422, "A composição ultrapassa o orçamento RAF da resolução selecionada.")
+    if has_overlay and not math.isfinite(wait_seconds):
+        raise HTTPException(422, "A temporização da composição é inválida.")
+    overlay = _render_animation_overlay(state, size)
+    started = time.time()
+    zip_path = job.out_dir / "background.raf.zip"
+    try:
+        if has_overlay:
+            # Keep the last successful ZIP while the new scene is rendered.
+            with tempfile.TemporaryDirectory(dir=job.out_dir) as staging:
+                work = Path(staging)
+                total_bytes, written, index_xml = _write_raf_export(job, work, frame_count, size, wait, backend, overlay)
+                (work / zip_path.name).replace(zip_path)
+        else:
+            total_bytes, written, index_xml = _write_raf_export(job, job.out_dir, frame_count, size, wait, backend)
+    except OSError as exc:
+        if has_overlay:
+            raise HTTPException(503, "Não foi possível gravar o RAF composto. Confira o espaço em disco.") from exc
+        raise
 
-    raf_dir = job.out_dir / "background.raf"
+    return {
+        "job_id": job.id,
+        "download": f"/api/animated/{job.id}/download",
+        "frames": written,
+        "wait": wait,
+        "backend": backend,
+        "dds_bytes": total_bytes,
+        "zip_bytes": zip_path.stat().st_size,
+        "elapsed": round(time.time() - started, 2),
+        "index_xml": index_xml,
+        "budget": _budget(written, size if has_overlay else ANIMATED_SIZE),
+    }
+
+
+def _write_raf_export(job, destination, frame_count, size, wait, backend, overlay=None):
+    raf_dir = destination / "background.raf"
     if raf_dir.exists():
         for stale in raf_dir.iterdir():
             stale.unlink()
     raf_dir.mkdir(parents=True, exist_ok=True)
 
     info = media.probe(job.source)
-    started = time.time()
     total_bytes = 0
     written = 0
 
     frames_in = media.iter_raw_frames(job.source, frame_count, size, info.duration)
     names: list[str] = []
-    for index, blob in encode_sequence(frames_in, backend):
+    for index, blob in encode_sequence(compositor.compose_frames(frames_in, overlay), backend):
         name = theme.frame_name(index)
         (raf_dir / name).write_bytes(blob)
         names.append(name)
@@ -309,21 +351,8 @@ async def animated_export(
     index_xml = raf.build_scene(names, wait)
     theme.write_index_xml(raf_dir / "index.xml", index_xml)
 
-    zip_path = job.out_dir / "background.raf.zip"
-    theme.zip_raf_folder(raf_dir, zip_path)
-
-    return {
-        "job_id": job.id,
-        "download": f"/api/animated/{job.id}/download",
-        "frames": written,
-        "wait": wait,
-        "backend": backend,
-        "dds_bytes": total_bytes,
-        "zip_bytes": zip_path.stat().st_size,
-        "elapsed": round(time.time() - started, 2),
-        "index_xml": index_xml,
-        "budget": _budget(written),
-    }
+    theme.zip_raf_folder(raf_dir, destination / "background.raf.zip")
+    return total_bytes, written, index_xml
 
 
 @app.get("/api/animated/{job_id}/download")
@@ -785,8 +814,25 @@ def _add(included: list[dict], asset: str, path: Path, target: str) -> None:
     included.append({"asset": asset, "path": target, "bytes": path.stat().st_size})
 
 
+def _composed_animation_size(job: jobs.Job, raw: str) -> tuple[int, int]:
+    if not raw:
+        return tuple(job.meta.get("size") or ANIMATED_SIZE)
+    for size in ANIMATED_SIZES:
+        if raw == f"{size[0]}x{size[1]}":
+            return size
+    raise HTTPException(422, "Resolução RAF inválida.")
+
+
+def _render_animation_overlay(composition, size):
+    try:
+        return compositor.animation_overlay(composition, size)
+    except (OSError, MediaError) as exc:
+        raise HTTPException(422, "A composição da animação não pôde ser renderizada.") from exc
+
+
 def _add_animated_scene(
     job: jobs.Job, frames: int, wait_seconds: float, backend: str, content_dir: Path,
+    composition=None, animation_size: str = "",
 ) -> dict:
     """Writes scene/background.raf/ with the frames, the plane and the scene.
 
@@ -796,12 +842,13 @@ def _add_animated_scene(
     raf_dir = content_dir / THEME_PATHS["raf_dir"]
     raf_dir.mkdir(parents=True, exist_ok=True)
 
-    size = tuple(job.meta.get("size") or ANIMATED_SIZE)
+    size = _composed_animation_size(job, animation_size)
+    overlay = _render_animation_overlay(composition, size)
     info = media.probe(job.source)
     frames_in = media.iter_raw_frames(job.source, frames, size, info.duration)
     names: list[str] = []
     total = 0
-    for index, blob in encode_sequence(frames_in, backend):
+    for index, blob in encode_sequence(compositor.compose_frames(frames_in, overlay), backend):
         name = theme.frame_name(index)
         (raf_dir / name).write_bytes(blob)
         names.append(name)
@@ -821,7 +868,7 @@ def _add_animated_scene(
 
 
 def _collect_slot_assets(
-    slot_jobs: dict[str, jobs.Job], content_dir: Path, animated: bool = False
+    slot_sources: dict[str, Path], content_dir: Path, animated: bool = False
 ) -> list[dict]:
     """Renderiza cada hueco a su destino dentro del tema.
 
@@ -835,17 +882,17 @@ def _collect_slot_assets(
     included: list[dict] = []
     by_group: dict[str, list[str]] = {}
 
-    for slot_id, job in slot_jobs.items():
+    for slot_id, source in slot_sources.items():
         spec = IMAGE_SLOTS[slot_id]
         if animated and spec.get("hidden_by_raf"):
             continue
         dest = content_dir / spec["path"]
-        media.render_image(job.source, dest, spec["size"])
+        media.render_image(source, dest, spec["size"])
         total = dest.stat().st_size
 
         if "glow_path" in spec:
             glow = content_dir / spec["glow_path"]
-            media.render_image(job.source, glow, spec["glow_size"])
+            media.render_image(source, glow, spec["glow_size"])
             total += glow.stat().st_size
 
         by_group.setdefault(spec["group"], []).append(slot_id)
@@ -873,6 +920,7 @@ def _collect_theme_assets(
     audio_job: str = "", sfx_jobs: dict[str, str] | None = None,
     animated_job: str = "", frames: int = 24, wait_seconds: float = 0.1,
     backend: str = DEFAULT_BACKEND,
+    composition=None, direct_slots: set[str] | None = None, animation_size: str = "",
 ) -> list[dict]:
     """Assembles the theme tree inside the content folder.
 
@@ -913,20 +961,24 @@ def _collect_theme_assets(
         dest.write_bytes(blob.read_bytes())
         _add(included, f"SFX: {spec['label']['en']}", dest, spec["path"])
 
-    included += _collect_slot_assets(slot_jobs, content_dir, animated=bool(animated_job))
+    with tempfile.TemporaryDirectory(dir=content_dir.parent) as staging:
+        sources = compositor.composed_slots(
+            composition, {slot: job.source for slot, job in slot_jobs.items()},
+            direct_slots or set(), Path(staging),
+        )
+        included += _collect_slot_assets(sources, content_dir, animated=bool(animated_job))
 
-    # pic1 is the content's store image, not the theme's. It comes from the
-    # same place as the home background.
-    home = slot_jobs.get("home")
-    if home is not None:
-        pic1 = content_dir / PKG_FIXED_PATHS["pic1"]
-        media.render_image(home.source, pic1, PIC1_SIZE)
-        _add(included, "pic1 (ficha)", pic1, PKG_FIXED_PATHS["pic1"])
+        # pic1 uses the same home artwork as the canonical theme.
+        home = sources.get("home")
+        if home is not None:
+            pic1 = content_dir / PKG_FIXED_PATHS["pic1"]
+            media.render_image(home, pic1, PIC1_SIZE)
+            _add(included, "pic1 (ficha)", pic1, PKG_FIXED_PATHS["pic1"])
 
     if animated_job:
         anim_job = _get_job("animated", animated_job)
         included.append(
-            _add_animated_scene(anim_job, frames, wait_seconds, backend, content_dir)
+            _add_animated_scene(anim_job, frames, wait_seconds, backend, content_dir, composition, animation_size)
         )
 
     return included
@@ -995,6 +1047,10 @@ async def package_build(
     fontcolor: str = Form(theme_xml.DEFAULTS["fontcolor"]),
     fontshadowcolor: str = Form(theme_xml.DEFAULTS["fontshadowcolor"]),
     focuscolor: str = Form(theme_xml.DEFAULTS["focuscolor"]),
+    composition: str | None = Form(None),
+    composition_mode: str = Form(""),
+    animation_size: str = Form(""),
+    artifacts_only: bool = Form(False),
 ) -> dict:
     """Assembles the theme tree and builds the .pkg.
 
@@ -1013,16 +1069,27 @@ async def package_build(
     except ValueError as exc:
         raise HTTPException(422, "The `sfx` field must be a JSON object.") from exc
 
+    state = compositor.load_composition(composition)
+    if artifacts_only:
+        compositor.workspace()
+    has_overlay = bool(state and state.surface("animated"))
+    if animated_job and has_overlay and not math.isfinite(wait_seconds):
+        raise HTTPException(422, "A temporização da composição é inválida.")
+    if composition_mode == "animated" and has_overlay and not animated_job:
+        raise HTTPException(422, "Selecione uma fonte animada para exportar as sobreposições.")
     slot_jobs = _resolve_slot_jobs({str(k): str(v) for k, v in raw_slots.items()})
-    if "home" not in slot_jobs:
+    if "home" not in slot_jobs and not (state and state.surface("home")):
         raise HTTPException(
             400, "The home background is missing: it is the only required part of the theme."
         )
 
     frame_count = frames
+    animation_size = animation_size if has_overlay else ""
     if animated_job:
-        anim_size = tuple(_get_job("animated", animated_job).meta.get("size") or ANIMATED_SIZE)
+        anim_size = _composed_animation_size(_get_job("animated", animated_job), animation_size)
         frame_count = _clamp_frames(frames, anim_size)
+        if has_overlay and frame_count != frames:
+            raise HTTPException(422, "A composição ultrapassa o orçamento RAF da resolução selecionada.")
         try:
             theme.check_frame_count(frame_count)
             theme.check_budget(frame_count * dds_bytes_for(*anim_size))
@@ -1072,11 +1139,27 @@ async def package_build(
             slot_jobs, theme_settings, content_dir, audio_job=audio_job,
             sfx_jobs=parsed_sfx,
             animated_job=animated_job, frames=frame_count,
-            wait_seconds=max(0.01, min(10.0, wait_seconds)), backend=backend,
+            wait_seconds=max(MIN_WAIT_SECONDS if has_overlay else 0.01,
+                             min(MAX_WAIT_SECONDS if has_overlay else 10.0, wait_seconds)),
+            backend=backend, composition=state,
+            direct_slots={key for key, value in raw_slots.items() if value},
+            animation_size=animation_size,
         )
+        if artifacts_only:
+            archive = work_dir / "recursos-tema.zip"
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+                for path in sorted(content_dir.rglob("*")):
+                    if path.is_file():
+                        bundle.write(path, path.relative_to(content_dir).as_posix())
+            return {
+                "download": f"/api/package/{build_job.id}/assets",
+                "included": included, "bytes": archive.stat().st_size,
+            }
         pkg_path, log = pkg.build_package(work_dir, content_dir, meta)
     except (pkg.PackageError, theme_xml.ThemeXmlError) as exc:
         raise HTTPException(422, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(503, "Não foi possível gravar os recursos do tema.") from exc
 
     build_job.meta["pkg"] = pkg_path.name
     build_job.save()
@@ -1105,6 +1188,16 @@ def package_download(job_id: str) -> FileResponse:
     if not name or Path(name).name != name or not path.is_file():
         raise HTTPException(404, "That .pkg is no longer available. Build it again.")
     return FileResponse(path, media_type="application/octet-stream", filename=name)
+
+
+@app.get("/api/package/{job_id}/assets")
+def asset_archive(job_id: str) -> FileResponse:
+    compositor.workspace()
+    job = _get_job("package", job_id)
+    archive = job.root / "build" / "recursos-tema.zip"
+    if not archive.is_file():
+        raise HTTPException(404, "O ZIP não está disponível.")
+    return FileResponse(archive, media_type="application/zip", filename=archive.name)
 
 
 # --- Interface ------------------------------------------------------------
