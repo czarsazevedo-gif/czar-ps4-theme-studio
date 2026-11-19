@@ -65,9 +65,11 @@ export function upload(path, file, progress) {
   const promise = (async () => {
     let session = null;
     try {
-      const bytes = await file.arrayBuffer();
-      const digest = await crypto.subtle.digest("SHA-256", bytes);
-      const checksum = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+      const checksum = await (async () => {
+        const bytes = await file.arrayBuffer();
+        const digest = await crypto.subtle.digest("SHA-256", bytes);
+        return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+      })();
       const saved = localStorage.getItem(pendingKey);
       if (saved) {
         try {
