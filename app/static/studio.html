@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#10131b">
+  <title>Czar PS4 Theme Studio</title>
+  <link rel="stylesheet" href="/static/studio.css">
+  <script type="module" src="/static/studio/main.js"></script>
+</head>
+<body>
+  <header class="header">
+    <button class="brand plain" id="show-projects" title="Projetos" aria-label="Abrir projetos">
+      <span class="brand-mark" data-icon="studio"></span>
+      <span><strong>Czar</strong><small>PS4 Theme Studio</small></span>
+    </button>
+    <div id="project-heading" class="project-heading" hidden>
+      <strong id="project-title"></strong>
+      <small id="save-state" role="status">Salvo</small>
+    </div>
+    <div id="header-actions" class="header-actions" hidden>
+      <button id="save" data-icon="save">Salvar</button>
+      <button id="undo" data-icon="undo" aria-label="Desfazer" title="Desfazer"></button>
+      <button id="redo" data-icon="redo" aria-label="Refazer" title="Refazer"></button>
+      <button id="preview-button" data-icon="eye">Preview</button>
+      <button id="validate-button" class="primary" data-icon="check">Validar</button>
+    </div>
+  </header>
+  <main class="launcher" id="launcher">
+    <section class="welcome">
+      <div class="hero">
+        <div>
+          <span class="brand-mark hero-mark" data-icon="studio"></span>
+          <h1>Czar PS4<br>Theme Studio</h1>
+          <p>Crie fundos, animações e sons para temas de PlayStation 4.</p>
+          <div class="row hero-actions">
+            <button id="create" class="primary" data-icon="plus">Novo tema</button>
+            <button id="open-recent" data-icon="folder">Abrir projeto</button>
+            <button id="import-project" data-icon="upload">Importar projeto</button>
+          </div>
+        </div>
+      </div>
+      <section class="recent" id="recent-section">
+        <h2>Projetos recentes</h2>
+        <div id="recents"></div>
+      </section>
+    </section>
+    <button class="plain license-link" data-license data-icon="info">Licenças e componentes</button>
+  </main>
+  <main class="editor" id="editor" hidden>
+    <nav class="tools" id="tools" aria-label="Ferramentas"></nav>
+    <section class="stage" aria-label="Canvas e preview">
+      <div class="stagebar">
+        <div class="segments" id="views" aria-label="Tela simulada">
+          <button data-view="home" aria-pressed="true">Tela inicial</button>
+          <button data-view="function" aria-pressed="false">Menu superior</button>
+          <button data-view="apply" aria-pressed="false">Seleção de tema</button>
+        </div>
+        <button id="preview-mode" data-icon="eye" aria-pressed="false">Interface PS4</button>
+      </div>
+      <div class="viewport">
+        <div class="artboard" id="artboard">
+          <canvas id="canvas" width="960" height="540" aria-label="Preview do fundo. Use os controles de posição no painel para mover a imagem."></canvas>
+          <div id="canvas-empty" class="canvas-empty">
+            <span data-icon="image"></span>
+            <strong>Adicione um fundo</strong>
+            <button class="primary" id="canvas-import" data-icon="upload">Importar mídia</button>
+          </div>
+          <div id="guides" aria-hidden="true"></div>
+          <div id="screen-overlay" class="screen-overlay" hidden></div>
+        </div>
+      </div>
+      <div class="stage-footer">
+        <span id="canvas-label">Guias · 1920 × 1080</span>
+        <span id="contrast-note" aria-live="polite"></span>
+        <button class="plain" id="guide-button" data-icon="grid" aria-pressed="false">Guias</button>
+      </div>
+    </section>
+    <aside class="inspector" id="inspector" aria-label="Propriedades">
+      <div class="inspector-head">
+        <h2 id="panel-title">Fundo</h2>
+        <button class="plain drawer-close" id="close-panel" aria-label="Fechar painel" data-icon="close"></button>
+      </div>
+      <div class="inspector-content" id="properties"></div>
+    </aside>
+    <section id="timeline" class="timeline" aria-label="Timeline">
+      <div class="timeline-head">
+        <div class="row"><h2>Timeline</h2><span id="timeline-time" class="timecode">00:00.00</span></div>
+        <div class="row transport">
+          <button id="play" data-icon="play" aria-label="Reproduzir" title="Reproduzir"></button>
+          <button id="loop-play" data-icon="loop" aria-pressed="true">Loop</button>
+          <button id="loop-tool" data-icon="compare">Criar loop</button>
+        </div>
+      </div>
+      <div id="timeline-body"></div>
+    </section>
+    <footer class="statusbar">
+      <button class="plain status-label" id="raf-shortcut" data-icon="layers">Orçamento RAF</button>
+      <div id="raf-summary" aria-live="polite"></div>
+      <div id="quota"></div>
+      <button class="primary" id="export-button" data-icon="download">Exportar</button>
+    </footer>
+  </main>
+  <div id="notifications" role="status" aria-live="polite"></div>
+  <input id="media-picker" type="file" multiple hidden>
+  <input id="project-picker" type="file" accept=".zip,application/zip" hidden>
+  <dialog id="dialog" aria-labelledby="dialog-title">
+    <div class="dialog-header"><h2 id="dialog-title"></h2><button class="plain" id="close-dialog" data-icon="close" aria-label="Fechar"></button></div>
+    <div id="dialog-body"></div>
+  </dialog>
+</body>
+</html>
