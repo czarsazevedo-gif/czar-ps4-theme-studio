@@ -55,6 +55,7 @@ PY
 if [[ "$mode" == all || "$mode" == api ]]; then
   python tests/test_dxt1.py
   python -m unittest discover -s tests -p 'studio_api.py' -v
+  python -m unittest discover -s tests -p 'test_chunked_upload.py' -v
 fi
 if [[ "$mode" == all || "$mode" == ui ]]; then
   start_server "${CZAR_TEST_PORT:-8174}" 0
