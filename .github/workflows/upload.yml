@@ -1,0 +1,33 @@
+name: Upload resumivel - verificacao
+
+on:
+  pull_request:
+    paths:
+      - "app/studio/**"
+      - "app/static/studio/client.js"
+      - "tests/test_chunked_upload.py"
+      - "test.sh"
+      - ".github/workflows/upload.yml"
+  workflow_dispatch:
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Testes de upload e API
+        run: |
+          python tests/make_fixtures.py
+          python -m unittest discover -s tests -p 'test_chunked_upload.py' -v
+          python -m unittest discover -s tests -p 'studio_api.py' -v
+      - name: Sintaxe do cliente JavaScript
+        run: node --input-type=module --check < app/static/studio/client.js
