@@ -27,7 +27,7 @@ if (-not $?) {
 
 $url = "http://127.0.0.1:$Port"
 Write-Host ""
-Write-Host "  PS4 Theme Asset Creator" -ForegroundColor Cyan
+Write-Host "  PS4 Theme Asset Creator (legacy)" -ForegroundColor Cyan
 Write-Host "  $url" -ForegroundColor White
 Write-Host "  Ctrl+C para detener" -ForegroundColor DarkGray
 Write-Host ""
@@ -36,4 +36,5 @@ if (-not $NoBrowser) {
     Start-Job -ScriptBlock { Start-Sleep -Seconds 2; Start-Process $using:url } | Out-Null
 }
 
+$env:CZAR_LEGACY = "1"
 python -m uvicorn app.main:app --host 127.0.0.1 --port $Port

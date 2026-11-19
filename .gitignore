@@ -40,3 +40,6 @@ venv/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Artifacts of the tablet Playwright suite
+/tests/studio-shots/

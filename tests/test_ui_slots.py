@@ -1,4 +1,5 @@
 """UI de slots: rejillas, subida por hueco, aplicar a todos, empaquetado."""
+import os
 import sys
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -28,7 +29,7 @@ def pin_lang(pg, code="en"):
 
 
 with sync_playwright() as pw:
-    b = pw.chromium.launch()
+    b = pw.chromium.launch(executable_path=os.environ.get("CZAR_CHROMIUM"))
     page = b.new_page(viewport={"width": 1500, "height": 1100})
     errs = []
     page.on("console", lambda m: errs.append(m.text) if m.type == "error" else None)

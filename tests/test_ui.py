@@ -1,4 +1,5 @@
 """Maneja la UI real en Chromium: sube archivos, anima, cambia sliders, exporta."""
+import os
 import sys
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -25,7 +26,7 @@ def pin_lang(pg, code="en"):
 
 
 with sync_playwright() as pw:
-    browser = pw.chromium.launch()
+    browser = pw.chromium.launch(executable_path=os.environ.get("CZAR_CHROMIUM"))
     page = browser.new_page(viewport={"width": 1500, "height": 980})
     errors = []
     page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)

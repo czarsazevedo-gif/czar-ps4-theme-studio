@@ -118,7 +118,7 @@ textarea { min-height: 88px; resize: vertical; }
 #guides { display: none; position: absolute; inset: 8%; border: 1px dashed #e4e8ff9a; pointer-events: none; }
 #guides.on { display: block; }
 #guides::before, #guides::after { content: ""; position: absolute; background: #e4e8ff75; }
-#guides::before { width: 1px; height: 100%; left: 50%; } 
+#guides::before { width: 1px; height: 100%; left: 50%; }
 #guides::after { height: 1px; width: 100%; top: 50%; }
 .stage-footer { min-height: 52px; color: var(--muted); font-size: .78rem; }
 .inspector { grid-area: inspector; border-left: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
