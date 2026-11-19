@@ -254,7 +254,7 @@ const studio = {
     let first = null;
     let active;
     let stopped = false;
-    const cancel = button("Cancelar importação", () => { stopped = true; active?.cancel(); cancel.disabled = true; });
+    const cancel = button("Pausar importação", () => { stopped = true; active?.cancel(); cancel.disabled = true; });
     list.append(cancel);
     for (const file of files) {
       if (stopped || this.project !== current) break;

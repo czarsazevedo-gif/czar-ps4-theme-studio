@@ -18,7 +18,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
 from ..config import ANIMATED_SIZES, AUDIO_SLOTS, IMAGE_SLOTS, RAF_SIZE_LIMIT, max_frames_for
-from . import media, queue, storage
+from . import media, queue, storage, uploading
 from .schema import Model, Settings, Title, Track, VERSION, safe_name
 from .storage import StudioError
 
@@ -180,6 +180,61 @@ async def import_project(request: Request, owner: str = Depends(require_session)
             await stream_to(request, path, storage.PROJECT_QUOTA + 3 * storage.MANIFEST_LIMIT)
             project = await run_in_threadpool(storage.import_zip, owner, path, root)
             return project_view(project)
+
+
+
+class UploadStart(Model):
+    name: str
+    size: int
+    sha256: str
+
+
+@router.post("/projects/{ident}/uploads", status_code=201)
+def start_chunked_upload(ident: str, data: UploadStart, owner: str = Depends(require_session)):
+    name = safe_name(data.name)
+    return uploading.initiate(owner, ident, name, data.size, data.sha256)
+
+
+@router.get("/projects/{ident}/uploads/{upload_id}")
+def chunked_upload_status(ident: str, upload_id: str, owner: str = Depends(require_session)):
+    return uploading.status(owner, ident, upload_id)
+
+
+@router.put("/projects/{ident}/uploads/{upload_id}")
+async def chunked_upload_part(ident: str, upload_id: str, request: Request,
+                             owner: str = Depends(require_session)):
+    # Restrict the HTTP request BEFORE reading its body.
+    try:
+        offset = int(request.headers["x-upload-offset"])
+    except (KeyError, ValueError):
+        raise StudioError(422, "upload_offset", "Informe o deslocamento exato do bloco.") from None
+    if offset < 0:
+        raise StudioError(422, "upload_offset", "Deslocamento negativo.")
+    async with UPLOADS:
+        with tempfile.TemporaryDirectory(dir=temporary()) as stage:
+            block = Path(stage) / "chunk"
+            await stream_to(request, block, uploading.CHUNK_SIZE)
+            return await run_in_threadpool(uploading.append, owner, ident, upload_id, offset, block)
+
+
+@router.post("/projects/{ident}/uploads/{upload_id}/finalize", status_code=201)
+async def chunked_upload_finalize(ident: str, upload_id: str, owner: str = Depends(require_session)):
+    async with UPLOADS:
+        folder, state = await run_in_threadpool(uploading.reserve_finalize, owner, ident, upload_id)
+        try:
+            path = folder / state["asset"]
+            preview = folder / "preview.webp"
+            asset = await run_in_threadpool(media.inspect_asset, path, state["name"], preview)
+            return await run_in_threadpool(uploading.finish, owner, ident, folder, state, asset)
+        except BaseException:
+            await run_in_threadpool(uploading.release_finalize, owner, ident, upload_id)
+            raise
+
+
+@router.delete("/projects/{ident}/uploads/{upload_id}", status_code=204)
+def chunked_upload_delete(ident: str, upload_id: str, owner: str = Depends(require_session)):
+    uploading.remove(owner, ident, upload_id)
+    return Response(status_code=204)
 
 
 @router.get("/projects/{ident}")
