@@ -2,48 +2,13 @@
 
 import os
 import socket
-import subprocess
-import sys
 import tempfile
-import time
-from contextlib import contextmanager
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import urlopen
 
 from playwright.sync_api import expect, sync_playwright
+from browser_server import server
 
 HERE = Path(__file__).resolve().parent
-
-
-@contextmanager
-def server(root, port):
-    command = """
-import sys
-from pathlib import Path
-import uvicorn
-from app import projects
-from app.main import app
-projects.ROOT = Path(sys.argv[1])
-uvicorn.run(app, port=int(sys.argv[2]), access_log=False)
-"""
-    process = subprocess.Popen([sys.executable, "-c", command, root, str(port)], cwd=HERE.parent)
-    try:
-        base = f"http://127.0.0.1:{port}"
-        for _ in range(100):
-            try:
-                with urlopen(f"{base}/api/system", timeout=0.5):
-                    break
-            except (URLError, TimeoutError):
-                if process.poll() is not None:
-                    raise RuntimeError("Uvicorn encerrou durante a inicialização.")
-                time.sleep(0.1)
-        else:
-            raise RuntimeError("Uvicorn não respondeu.")
-        yield base
-    finally:
-        process.terminate()
-        process.wait(timeout=15)
 
 
 def name_dialog(page, button, name):

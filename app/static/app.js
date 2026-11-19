@@ -256,14 +256,20 @@ function updateTiming() {
 }
 
 async function loadBitmaps(urls) {
-  anim.bitmaps.forEach((b) => b.close?.());
-  anim.bitmaps = await Promise.all(
+  const results = await Promise.allSettled(
     urls.map(async (url) => {
       const response = await fetch(Projects.mediaUrl(url));
       if (!response.ok) throw new Error("Não foi possível carregar os quadros da animação.");
       return createImageBitmap(await response.blob());
     })
   );
+  const failed = results.find((result) => result.status === "rejected");
+  if (failed) {
+    results.forEach((result) => { if (result.status === "fulfilled") result.value.close?.(); });
+    throw failed.reason;
+  }
+  anim.bitmaps.forEach((bitmap) => bitmap.close?.());
+  anim.bitmaps = results.map((result) => result.value);
 }
 
 function applyAnimatedPayload(data) {
@@ -524,12 +530,16 @@ async function uploadSlot(slotId, file) {
     const d = await api(`/api/slot/${encodeURIComponent(slotId)}/upload`, {
       method: "POST", body: fd,
     });
-    slots.chosen[slotId] = d.job_id;
-    paintSlot(slotId, Projects.mediaUrl(d.preview));
-    guardarSesion();
+    applySlotPayload(d);
   } catch (err) {
     toast(err.message);
   }
+}
+
+function applySlotPayload(data) {
+  slots.chosen[data.slot] = data.job_id;
+  paintSlot(data.slot, Projects.mediaUrl(data.preview));
+  guardarSesion();
 }
 
 function clearSlot(slotId) {
@@ -639,15 +649,53 @@ async function uploadSfx(slotId, file, row) {
   info.textContent = "convirtiendo…";
   try {
     const d = await api(`/api/audio/${slotId}/upload`, { method: "POST", body: fd });
-    sfx.chosen[slotId] = d.job_id;
-    guardarSesion();
-    info.textContent = `${d.name} → ${d.codec}, ${d.duration}s, ${fmtBytes(d.bytes)}`;
-    info.className = "bgm-info on";
-    row.querySelector(".sfx-clear").hidden = false;
+    applySfxPayload(d, row);
   } catch (err) {
     info.textContent = t("snd.none.sfx");
     info.className = "bgm-info";
     toast(err.message);
+  }
+}
+
+function applySfxPayload(data, row) {
+  sfx.chosen[data.slot] = data.job_id;
+  guardarSesion();
+  if (!row) return;
+  const info = row.querySelector(".bgm-info");
+  info.textContent = `${data.name} → ${data.codec}, ${data.duration}s, ${fmtBytes(data.bytes)}`;
+  info.className = "bgm-info on";
+  row.querySelector(".sfx-clear").hidden = false;
+}
+
+async function useLibraryAsset(id, slot) {
+  const animated = slot === "animated";
+  if (animated) setAnimBusy(true);
+  try {
+    const data = await api(`/api/library/${id}/apply`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slot, size: $("anim-size").value, frames: anim.frameCount }),
+    });
+    if (animated) {
+      await loadBitmaps(data.frames);
+      player.pause();
+      $("bgmode-animated").checked = true;
+      $("anim-drop").hidden = true;
+      $("anim-workspace").hidden = false;
+      $("anim-result").hidden = true;
+      applyAnimatedPayload(data);
+      if ($("panel-backgrounds").classList.contains("is-active")) player.start();
+    } else if (slot === "bgm") {
+      paintBgm(data);
+    } else if (sfx.catalog.some((spec) => spec.id === slot)) {
+      applySfxPayload(data, document.querySelector(`#sfx-rows [data-slot="${slot}"]`));
+    } else {
+      applySlotPayload(data);
+    }
+    refreshChecklist();
+    renderTree();
+    renderPreview();
+  } finally {
+    if (animated) setAnimBusy(false);
   }
 }
 
@@ -672,6 +720,7 @@ function pintarSfxRows() {
   sfx.catalog.filter((x) => x.convert).forEach((spec) => {
     const row = document.createElement("div");
     row.className = "sfx-row";
+    row.dataset.slot = spec.id;
     row.innerHTML = `
       <span class="sfx-name">${lbl(spec.label)}</span>
       <label class="btn btn-ghost">${t("snd.pick")}<input type="file" accept="audio/*" hidden></label>
@@ -1401,6 +1450,7 @@ async function boot() {
   // with whatever survives from the previous session.
   if (!Projects.id) await restaurarSesion();
   await Projects.boot();
+  Library.boot();
 }
 
 /* ------------------------------------------------------------ listeners */

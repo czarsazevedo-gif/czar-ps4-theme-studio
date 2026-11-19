@@ -1,0 +1,47 @@
+.media-library {
+  padding: 0 clamp(12px, 3vw, 32px) 8px;
+  border-bottom: 1px solid #313845;
+}
+.media-library summary { cursor: pointer; padding: 12px 0; min-height: 44px; font-weight: 600; }
+.library-tools, .library-actions { display: flex; flex-wrap: wrap; gap: 12px; }
+.library-tools label { flex: 1 1 160px; display: grid; gap: 4px; }
+.library-actions { align-items: end; margin: 12px 0; }
+.library-files, .library-destination { display: grid; gap: 4px; margin: 8px 0; }
+.media-library .select, .media-library .btn, #library-asset :is(.select, .btn) { min-height: 44px; }
+.library-files input { max-width: 100%; }
+.library-files input::file-selector-button { min-height: 44px; }
+.library-queue, .library-items { list-style: none; margin: 8px 0; padding: 0; }
+.library-queue { max-height: 12rem; overflow: auto; }
+.library-queue:empty { display: none; }
+.library-queue li { display: grid; gap: 4px; margin: 8px 0; overflow-wrap: anywhere; }
+.library-queue progress { width: min(100%, 30rem); }
+.library-items { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(155px, 100%), 1fr)); gap: 8px; }
+.library-card {
+  display: grid;
+  width: 100%;
+  min-height: 48px;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid #394454;
+  border-radius: 8px;
+  background: #1a202b;
+  color: #f5f7fc;
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.library-card img, .library-placeholder {
+  width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 4px; background: #252d3a;
+}
+.library-placeholder { display: grid; place-items: center; }
+.library-items.is-list { grid-template-columns: 1fr; }
+.is-list .library-card { grid-template-columns: 72px minmax(0, 1fr); align-items: center; }
+.library-card small { display: block; }
+#library-asset {
+  width: min(92vw, 640px); max-height: 88dvh; overflow: auto;
+  background: #1a202b; color: #f5f7fc; border: 1px solid #394454; border-radius: 10px;
+}
+#library-asset::backdrop { background: #000a; }
+.library-asset-head { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
+.library-asset-head h2 { overflow-wrap: anywhere; }
+#library-preview :is(img, video, audio) { display: block; max-width: 100%; max-height: 38dvh; margin: 8px auto; }

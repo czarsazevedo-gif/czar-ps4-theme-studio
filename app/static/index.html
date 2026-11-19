@@ -6,6 +6,7 @@
   <title>Czar PS4 Theme Studio</title>
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/static/projects.css">
+  <link rel="stylesheet" href="/static/library.css">
   <script src="/static/i18n.js"></script>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎮</text></svg>">
 </head>
@@ -64,6 +65,37 @@
     </form>
   </dialog>
 </section>
+
+<details class="media-library" id="media-library">
+  <summary>Biblioteca de mídia</summary>
+  <div class="library-tools">
+    <label>Buscar por nome <input id="library-search" class="select" type="search"></label>
+    <label>Categoria
+      <select id="library-kind" class="select">
+        <option value="">Todas</option><option value="image">Imagens</option>
+        <option value="video">Vídeos</option><option value="animation">Animações</option>
+        <option value="audio">Áudio</option>
+      </select>
+    </label>
+    <label>Ordenar
+      <select id="library-sort" class="select">
+        <option value="recent">Mais recentes</option><option value="oldest">Mais antigas</option>
+        <option value="name">Nome</option><option value="size">Maior tamanho</option>
+      </select>
+    </label>
+    <label>Visualização
+      <select id="library-view" class="select"><option value="grid">Grade</option><option value="list">Lista</option></select>
+    </label>
+  </div>
+  <div class="library-actions">
+    <label class="library-files">Importar arquivos <input id="library-files" type="file" multiple></label>
+    <button id="library-cancel" class="btn btn-ghost" hidden>Interromper fila</button>
+  </div>
+  <ul id="library-queue" class="library-queue" aria-label="Progresso das importações"></ul>
+  <p id="library-status" role="status"></p>
+  <ul id="library-items" class="library-items" aria-label="Mídias"></ul>
+  <button id="library-more" class="btn btn-ghost" hidden>Mostrar mais</button>
+</details>
 
 <nav class="tabs" role="tablist">
   <button class="tab is-active" data-tab="backgrounds" role="tab" data-i18n="tab.backgrounds"></button>
@@ -403,7 +435,21 @@
 
 <div id="toast" class="toast" hidden></div>
 
+<dialog id="library-asset" aria-labelledby="library-title">
+  <div class="library-asset-head">
+    <h2 id="library-title"></h2>
+    <form method="dialog"><button type="submit" class="btn btn-ghost">Fechar</button></form>
+  </div>
+  <div id="library-preview"></div>
+  <p id="library-info"></p>
+  <a id="library-original" class="btn btn-ghost" download>Baixar original</a>
+  <label class="library-destination">Destino no projeto <select id="library-target" class="select"></select></label>
+  <button id="library-apply" class="btn btn-primary" disabled>Usar no projeto</button>
+  <p id="library-apply-status" role="status"></p>
+</dialog>
+
 <script src="/static/projects.js"></script>
+<script src="/static/library.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
