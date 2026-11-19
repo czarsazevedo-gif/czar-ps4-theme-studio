@@ -47,9 +47,15 @@ class ChunkedUploadTests(unittest.TestCase):
         self.assertEqual(wrong.json()["details"]["offset"], split)
         self.assertEqual(self.client.get(endpoint).json()["offset"], split)
         # Simulate client refresh and resume at persisted server offset.
-        rest = self.client.put(endpoint, content=data[split:],
-                               headers={**self.auth, "x-upload-offset": str(split)})
-        self.assertEqual(rest.status_code, 200, rest.text)
+        # Resume across multiple correctly bounded chunks (each <= 512 KiB).
+        position = split
+        while position < len(data):
+            part = data[position:position + 512 * 1024]
+            rest = self.client.put(endpoint, content=part,
+                                   headers={**self.auth, "x-upload-offset": str(position)})
+            self.assertEqual(rest.status_code, 200, rest.text)
+            position = rest.json()["offset"]
+        self.assertEqual(position, len(data))
         out = self.client.post(endpoint + "/finalize", headers=self.auth)
         self.assertEqual(out.status_code, 201, out.text)
         asset = out.json()
