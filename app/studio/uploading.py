@@ -67,6 +67,17 @@ def initiate(owner: str, project_id: str, name: str, size: int, checksum: str) -
                     pending.append(row)
             except (OSError, ValueError):
                 continue
+        # A lost creation acknowledgment must not allocate duplicate sessions.
+        for pending_row in pending:
+            if (pending_row.get("project") == project_id and
+                pending_row.get("name") == name and pending_row.get("size") == size and
+                pending_row.get("sha256") == checksum and not pending_row.get("finalizing")):
+                try:
+                    folder, resumed = locate(owner, project_id, pending_row["id"])
+                    return {"id": resumed["id"], "size": size, "offset": resumed["offset"],
+                            "chunkSize": CHUNK_SIZE, "name": name, "sha256": checksum}
+                except StudioError:
+                    pass
         if len(pending) >= MAX_PENDING or sum(r["size"] for r in pending) + size > storage.PROJECT_QUOTA:
             raise StudioError(413, "pending_quota", "Muitos uploads pendentes. Conclua os anteriores ou espere 24 horas.")
         key = storage.new_id()
