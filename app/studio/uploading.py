@@ -48,7 +48,9 @@ def _cleanup(base: Path) -> None:
             pass
 
 
-def initiate(owner: str, project_id: str, name: str, size: int) -> dict:
+def initiate(owner: str, project_id: str, name: str, size: int, checksum: str) -> dict:
+    if not re.fullmatch(r"[a-f0-9]{64}", checksum):
+        raise StudioError(422, "upload_checksum", "SHA-256 inválido.")
     with storage.LOCK:
         _, project = storage.load(owner, project_id)
         if not 0 < size <= storage.UPLOAD_LIMIT:
@@ -72,11 +74,11 @@ def initiate(owner: str, project_id: str, name: str, size: int) -> dict:
         folder.mkdir(mode=0o700)
         asset_id = storage.new_id()
         row = {"id": key, "asset": asset_id, "owner": owner, "project": project_id,
-               "name": name, "size": size, "offset": 0, "created": time.time(),
+               "name": name, "size": size, "sha256": checksum, "offset": 0, "created": time.time(),
                "finalizing": False}
         (folder / asset_id).touch(mode=0o600)
         atomic_json(folder / "meta.json", row)
-        return {"id": key, "size": size, "offset": 0, "chunkSize": CHUNK_SIZE, "name": name}
+        return {"id": key, "size": size, "offset": 0, "chunkSize": CHUNK_SIZE, "name": name, "sha256": checksum}
 
 
 def locate(owner: str, project_id: str, key: str) -> tuple[Path, dict]:
@@ -103,7 +105,7 @@ def locate(owner: str, project_id: str, key: str) -> tuple[Path, dict]:
 def status(owner: str, project_id: str, key: str) -> dict:
     with storage.LOCK:
         _, row = locate(owner, project_id, key)
-        return {k: row[k] for k in ("id", "offset", "size", "name")} | {"chunkSize": CHUNK_SIZE}
+        return {k: row[k] for k in ("id", "offset", "size", "name")} | {"chunkSize": CHUNK_SIZE, "sha256": row["sha256"]}
 
 
 def append(owner: str, project_id: str, key: str, offset: int, block: Path) -> dict:
@@ -148,6 +150,8 @@ def finish(owner: str, project_id: str, folder: Path, row: dict, asset) -> dict:
         current_folder, current = locate(owner, project_id, row["id"])
         if current_folder != folder or not current["finalizing"]:
             raise StudioError(409, "upload_invalid", "O estado do upload mudou.")
+        if asset.sha256 != current["sha256"]:
+            raise StudioError(422, "upload_checksum", "O vídeo recebido não corresponde ao original. Reenvie o arquivo.")
         root, project = storage.load(owner, project_id)
         if len(project.assets) >= storage.MAX_ASSETS or (
             sum(a.bytes for a in project.assets.values()) + asset.bytes > storage.PROJECT_QUOTA):
