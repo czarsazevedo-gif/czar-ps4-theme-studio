@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/static/projects.css">
   <link rel="stylesheet" href="/static/library.css">
+  <link rel="stylesheet" href="/static/compositor.css">
   <script src="/static/i18n.js"></script>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎮</text></svg>">
 </head>
@@ -100,12 +101,88 @@
 <nav class="tabs" role="tablist">
   <button class="tab is-active" data-tab="backgrounds" role="tab" data-i18n="tab.backgrounds"></button>
   <button class="tab" data-tab="icons" role="tab" data-i18n="tab.icons"></button>
+  <button class="tab" data-tab="compositor" role="tab">Compor</button>
   <button class="tab" data-tab="sounds" role="tab" data-i18n="tab.sounds"></button>
   <button class="tab" data-tab="preview" role="tab" data-i18n="tab.preview"></button>
   <button class="tab" data-tab="package" role="tab" data-i18n="tab.package"></button>
 </nav>
 
 <main>
+
+  <section class="panel" id="panel-compositor" aria-label="Editar composição">
+    <p id="comp-no-project">Abra ou crie um projeto para editar camadas.</p>
+    <div id="comp-editor" hidden>
+      <div class="comp-toolbar">
+        <label>Superfície <select id="comp-target" class="select"></select></label>
+        <label class="comp-upload">Importar camada <input type="file" id="comp-files" multiple></label>
+        <button class="btn btn-ghost" id="comp-library">Escolher da biblioteca</button>
+        <button class="btn btn-ghost" id="comp-undo">Desfazer</button>
+        <button class="btn btn-ghost" id="comp-redo">Refazer</button>
+        <button class="btn btn-ghost" id="comp-ps4">Prévia PS4</button>
+      </div>
+      <div class="comp-layout">
+        <div class="comp-stage">
+          <div class="comp-view">
+            <canvas id="comp-canvas" aria-label="Canvas de composição. Use também os controles numéricos."></canvas>
+          </div>
+          <div class="comp-toolbar">
+            <button class="btn btn-ghost" id="comp-pan" aria-pressed="false">Mover vista</button>
+            <button class="btn btn-ghost" id="comp-minus" aria-label="Reduzir zoom">−</button>
+            <button class="btn btn-ghost" id="comp-zoom">100%</button>
+            <button class="btn btn-ghost" id="comp-plus" aria-label="Aumentar zoom">+</button>
+            <label><input type="checkbox" id="comp-snap" checked> Encaixar nas guias</label>
+          </div>
+          <p id="comp-hint" class="dim"></p>
+          <p id="comp-status" role="status"></p>
+        </div>
+        <details class="comp-inspector" open>
+          <summary>Camadas e ajustes</summary>
+          <label><input id="comp-base" type="checkbox"> Usar imagem do slot como base</label>
+          <ol id="comp-layers" aria-label="Camadas, da frente para trás"></ol>
+          <fieldset id="comp-properties" disabled>
+            <legend>Camada selecionada</legend>
+            <div class="comp-numbers">
+              <label>Centro X <input data-field="x" type="number" inputmode="decimal" step="any"></label>
+              <label>Centro Y <input data-field="y" type="number" inputmode="decimal" step="any"></label>
+              <label>Largura <input data-field="width" type="number" inputmode="decimal" min="1" step="any"></label>
+              <label>Altura <input data-field="height" type="number" inputmode="decimal" min="1" step="any"></label>
+              <label>Rotação (°) <input data-field="angle" type="number" inputmode="decimal" step="any"></label>
+              <label>Opacidade (%) <input data-field="opacity" type="number" inputmode="decimal" min="0" max="100" step="any"></label>
+            </div>
+            <label><input id="comp-proportion" type="checkbox" checked> Preservar proporção ao redimensionar</label>
+            <label>Enquadramento
+              <select id="comp-fit" class="select">
+                <option value="contain">Ajustar sem corte</option>
+                <option value="cover">Preencher com recorte central</option>
+                <option value="stretch">Esticar até as bordas</option>
+              </select>
+            </label>
+            <div class="comp-toolbar" id="comp-align">
+              <button class="btn btn-ghost" data-action="fit">Encaixar</button>
+              <button class="btn btn-ghost" data-action="fill">Preencher</button>
+              <button class="btn btn-ghost" data-action="natural">Ajustar à proporção</button>
+              <button class="btn btn-ghost" data-action="left">Esquerda</button>
+              <button class="btn btn-ghost" data-action="center-x">Centro horizontal</button>
+              <button class="btn btn-ghost" data-action="right">Direita</button>
+              <button class="btn btn-ghost" data-action="top">Topo</button>
+              <button class="btn btn-ghost" data-action="center-y">Centro vertical</button>
+              <button class="btn btn-ghost" data-action="bottom">Base</button>
+              <button class="btn btn-ghost" data-action="distribute-x">Distribuir na horizontal</button>
+              <button class="btn btn-ghost" data-action="distribute-y">Distribuir na vertical</button>
+            </div>
+          </fieldset>
+          <div class="comp-toolbar" id="comp-layer-actions">
+            <button class="btn btn-ghost" data-action="front">Trazer à frente</button>
+            <button class="btn btn-ghost" data-action="back">Levar para trás</button>
+            <button class="btn btn-ghost" data-action="duplicate">Duplicar</button>
+            <button class="btn btn-ghost" data-action="visibility">Ocultar</button>
+            <button class="btn btn-ghost" data-action="lock">Bloquear</button>
+            <button class="btn btn-ghost" data-action="remove">Excluir camada</button>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
 
   <!-- ================= FONDO (estático o animado) ================= -->
   <section class="panel is-active" id="panel-backgrounds">
@@ -285,6 +362,8 @@
 
   <!-- ================= VISTA PREVIA ================= -->
   <section class="panel" id="panel-preview">
+    <p id="comp-preview-status" role="status" hidden></p>
+    <button id="comp-preview-retry" class="btn btn-ghost" hidden>Renderizar novamente</button>
     <p class="panel-lead" data-i18n="pv.lead"></p>
 
     <div class="mode-switch" role="radiogroup" data-i18n-attr="aria-label:pv.aria">
@@ -426,6 +505,7 @@
         <p class="ctl-note" data-i18n-html="pkg.fixed.note"></p>
 
         <button id="pkg-build" class="btn btn-primary btn-block" data-i18n="pkg.build"></button>
+        <button id="pkg-assets" class="btn btn-ghost btn-block" hidden>Exportar recursos do tema (ZIP)</button>
         <p class="ctl-note" id="pkg-hint"></p>
       </aside>
     </div>
@@ -445,11 +525,13 @@
   <a id="library-original" class="btn btn-ghost" download>Baixar original</a>
   <label class="library-destination">Destino no projeto <select id="library-target" class="select"></select></label>
   <button id="library-apply" class="btn btn-primary" disabled>Usar no projeto</button>
+  <button id="library-layer" class="btn btn-ghost" hidden>Adicionar como camada</button>
   <p id="library-apply-status" role="status"></p>
 </dialog>
 
 <script src="/static/projects.js"></script>
 <script src="/static/library.js"></script>
+<script src="/static/compositor.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

@@ -1,0 +1,37 @@
+.comp-toolbar { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 8px 0; }
+.comp-toolbar label, .comp-inspector label { display: grid; gap: 4px; }
+.comp-toolbar label:has(input[type="checkbox"]), .comp-inspector label:has(input[type="checkbox"]) {
+  display: flex; align-items: center; min-height: 44px; gap: 8px;
+}
+.comp-toolbar :is(.btn, select), #comp-properties :is(input, select), .comp-layer {
+  min-height: 44px;
+  touch-action: manipulation;
+}
+.comp-upload input { max-width: 100%; }
+.comp-upload input::file-selector-button { min-height: 44px; }
+.comp-layout {
+  display: grid; gap: 16px; align-items: start;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 330px);
+}
+.comp-view {
+  display: flex; justify-content: center;
+  overflow: hidden; background: #151b26;
+}
+#comp-canvas {
+  display: block; max-width: 100%; max-height: min(60dvh, 700px);
+  width: auto; height: auto; aspect-ratio: auto;
+  touch-action: none; user-select: none;
+  background: conic-gradient(#323b49 25%, #242c38 0 50%, #323b49 0 75%, #242c38 0) 0 0 / 22px 22px;
+}
+.comp-inspector { min-width: 0; padding: 10px; border: 1px solid #394454; border-radius: 8px; }
+.comp-inspector summary { cursor: pointer; padding-block: 10px; min-height: 44px; }
+#comp-layers { list-style: none; margin: 8px 0; padding: 0; max-height: 200px; overflow: auto; }
+.comp-layer { width: 100%; text-align: left; overflow-wrap: anywhere; white-space: normal; }
+.comp-layer[aria-pressed="true"], #comp-pan[aria-pressed="true"] { outline: 2px solid #78c9ff; outline-offset: -2px; }
+#comp-properties { padding: 8px; margin: 8px 0; min-width: 0; border: 1px solid #394454; }
+.comp-numbers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.comp-numbers input, #comp-fit { width: 100%; }
+.comp-numbers input { color: #f5f7fc; background: #202837; border: 1px solid #596477; border-radius: 6px; padding: 4px 8px; }
+#comp-ps4, #comp-status, #comp-preview-status { overflow-wrap: anywhere; }
+@media (max-width: 900px) { .comp-layout { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 760px) { .tabs { flex-wrap: wrap; } }

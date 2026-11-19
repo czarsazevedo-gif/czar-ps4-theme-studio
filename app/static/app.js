@@ -81,10 +81,14 @@ document.querySelectorAll(".tab").forEach((tab) => {
     $(`panel-${tab.dataset.tab}`).classList.add("is-active");
     // Pause what is not visible: each player burns CPU in its own tab.
     if (tab.dataset.tab !== "backgrounds") player.pause();
-    if (tab.dataset.tab !== "preview") pvPlayer.stop();
+    if (tab.dataset.tab !== "preview") {
+      pvPlayer.stop();
+      Compositor.leavePreview();
+    }
     // These three depend on what was done in the other tabs.
     if (tab.dataset.tab === "package") { refreshChecklist(); renderTree(); }
     if (tab.dataset.tab === "preview") renderPreview();
+    if (tab.dataset.tab === "compositor") Compositor.activate();
   });
 });
 
@@ -363,6 +367,7 @@ async function animatedExport() {
   fd.append("frames", String(anim.frameCount));
   fd.append("wait_seconds", String(anim.wait));
   fd.append("backend", $("anim-backend").value || sys.default_backend);
+  appendComposition(fd);
 
   try {
     const r = await api(`/api/animated/${anim.jobId}/export`, { method: "POST", body: fd });
@@ -815,6 +820,7 @@ const PKG_CAMPOS = ["pkg-title", "pkg-title-id", "pkg-content-id", "pkg-themecol
 
 let sesionTimer = null;
 function captureEditorState() {
+  const composition = Projects.id ? Compositor.capture() : null;
   return {
     slots: { ...slots.chosen },
     bgm: bgm.jobId,
@@ -827,6 +833,7 @@ function captureEditorState() {
       backend: $("anim-backend").value,
     },
     campos: Object.fromEntries(PKG_CAMPOS.map((id) => [id, $(id).value])),
+    ...(composition && { composition }),
   };
 }
 
@@ -865,6 +872,7 @@ async function restaurarSesion() {
 
 async function restoreEditorState(d, project = false) {
   if (!d) return 0;
+  if (project) Compositor.restore(d.composition);
 
   PKG_CAMPOS.forEach((id) => {
     if ($(id) && d.campos?.[id] != null) $(id).value = d.campos[id];
@@ -980,6 +988,8 @@ const pvView = () =>
  *  one; the mock-up has to do the same or it would show a black gap that does
  *  not exist on the console. */
 function slotImage(slotId) {
+  const composition = Compositor.previewReady() ? Compositor.previewImage(slotId) : null;
+  if (composition) return composition;
   const visto = new Set();
   let id = slotId;
   while (id && !visto.has(id)) {
@@ -999,7 +1009,8 @@ const pvPlayer = {
   rafId: 0, index: 0, acc: 0, lastTs: 0, on: false,
 
   start() {
-    if (this.on || !anim.bitmaps.length) return;
+    if (this.on || document.hidden || !$("panel-preview").classList.contains("is-active") ||
+        !(Compositor.previewFrameList() || anim.bitmaps).length) return;
     this.on = true; this.lastTs = 0;
     this.rafId = requestAnimationFrame(pvPlayer.tick);
   },
@@ -1013,12 +1024,15 @@ const pvPlayer = {
     const dt = Math.min(ts - pvPlayer.lastTs, 250);
     pvPlayer.lastTs = ts;
     const per = anim.wait * 1000;
+    const frames = Compositor.previewFrameList() || anim.bitmaps;
+    if (!frames.length) { pvPlayer.stop(); return; }
+    pvPlayer.index %= frames.length;
     pvPlayer.acc += dt;
     while (pvPlayer.acc >= per) {
       pvPlayer.acc -= per;
-      pvPlayer.index = (pvPlayer.index + 1) % anim.bitmaps.length;
+      pvPlayer.index = (pvPlayer.index + 1) % frames.length;
     }
-    const bmp = anim.bitmaps[pvPlayer.index];
+    const bmp = frames[pvPlayer.index];
     const cv = $("pv-canvas");
     if (bmp && cv) {
       if (anim.size && cv.width !== anim.size[0]) [cv.width, cv.height] = anim.size;
@@ -1031,6 +1045,16 @@ const pvPlayer = {
 function renderPreview() {
   const stage = $("pv-stage");
   if (!stage || !slots.catalog.length) return;
+  if ($("panel-preview").classList.contains("is-active") &&
+      Compositor.previewNeeded() && !Compositor.previewReady()) {
+    stage.hidden = true;
+    pvPlayer.stop();
+    Compositor.refreshPreview();
+    return;
+  }
+  stage.hidden = false;
+  $("comp-preview-status").hidden = true;
+  $("comp-preview-retry").hidden = true;
   const vista = pvView();
   const animado = animActive();
 
@@ -1082,7 +1106,7 @@ function renderPreview() {
   // --- function icons ---
   const fns = slots.catalog.filter((x) => x.group === "function_icon");
   const glifo = (spec) => {
-    const u = slots.chosen[spec.id] ? Projects.mediaUrl(`/api/slot/${slots.chosen[spec.id]}/preview`) : null;
+    const u = slotImage(spec.id);
     return { url: u, propio: Boolean(u) };
   };
 
@@ -1115,7 +1139,7 @@ function renderPreview() {
   $("pv-user").textContent = ($("pkg-title")?.value || t("misc.myTheme")).slice(0, 22);
 
   // --- pie ---
-  const propios = fns.filter((x) => slots.chosen[x.id]).length;
+  const propios = fns.filter((x) => slots.chosen[x.id] || Compositor.has(x.id)).length;
   if (!hayFondo) {
     $("pv-note").textContent = t("pv.note.empty");
   } else if (vista === "apply") {
@@ -1151,9 +1175,9 @@ const argbToHex = (argb) => "#" + argb.replace("#", "").slice(2).toLowerCase();
 /** Flags which assets are ready. Recomputed on entering the tab because the
  *  other tabs are edited independently. */
 function refreshChecklist() {
-  const count = (g) => slots.catalog.filter((x) => x.group === g && slots.chosen[x.id]).length;
+  const count = (g) => slots.catalog.filter((x) => x.group === g && (slots.chosen[x.id] || Compositor.has(x.id))).length;
   const fondos = count("background"), fn = count("function_icon"), ct = count("content_icon");
-  const home = Boolean(slots.chosen.home);
+  const home = Boolean(slots.chosen.home || Compositor.has("home"));
   const nSfx = Object.keys(sfx.chosen).length;
   const rows = [
     // Named differently per mode, like its slot in the Background tab.
@@ -1179,10 +1203,12 @@ function refreshChecklist() {
       </li>`)
     .join("");
 
-  $("pkg-build").disabled = !slots.chosen.home || !sys.pkg_tools;
+  $("pkg-build").disabled = !home || !sys.pkg_tools;
+  $("pkg-assets").hidden = !Projects.id;
+  $("pkg-assets").disabled = !home;
   $("pkg-hint").textContent = t(
     !sys.pkg_tools ? "pkg.hint.noTools"
-      : slots.chosen.home ? "pkg.hint.ready" : "pkg.hint.needHome");
+      : home ? "pkg.hint.ready" : "pkg.hint.needHome");
 }
 
 /** Content tree, built from the slot catalogue.
@@ -1230,8 +1256,16 @@ async function syncContentId() {
   } catch { /* mientras se escribe puede quedar a medias, no molestar */ }
 }
 
-async function packageBuild() {
-  const btn = $("pkg-build");
+function appendComposition(fd) {
+  if (!Projects.id) return;
+  fd.append("composition", JSON.stringify(Compositor.capture() || { version: 1, surfaces: {} }));
+  fd.append("composition_mode", bgMode());
+  fd.append("animation_size", $("anim-size").value);
+}
+
+async function packageBuild(assetsOnly = false) {
+  assetsOnly = assetsOnly === true;
+  const btn = $(assetsOnly ? "pkg-assets" : "pkg-build");
   const original = btn.textContent;
   btn.disabled = true;
   btn.textContent = "Empaquetando…";
@@ -1258,9 +1292,21 @@ async function packageBuild() {
   fd.append("fontcolor", hexToArgb($("pkg-fontcolor").value));
   fd.append("fontshadowcolor", hexToArgb($("pkg-fontshadow").value));
   fd.append("focuscolor", hexToArgb($("pkg-focuscolor").value));
+  appendComposition(fd);
+  if (assetsOnly) fd.append("artifacts_only", "true");
 
   try {
     const r = await api("/api/package/build", { method: "POST", body: fd });
+    if (assetsOnly) {
+      const link = document.createElement("a");
+      link.className = "dl-btn";
+      link.href = Projects.mediaUrl(r.download);
+      link.download = "recursos-tema.zip";
+      link.textContent = `Baixar recursos do tema · ${fmtBytes(r.bytes)}`;
+      $("pkg-result").replaceChildren(link);
+      $("pkg-result").hidden = false;
+      return;
+    }
     const rows = r.included
       .map((i) => `<div class="result-row"><span>${i.asset}</span><b>${fmtBytes(i.bytes)}</b></div>`)
       .join("");
@@ -1335,6 +1381,7 @@ async function bootPackage() {
   $("pkg-title-id").addEventListener("input", syncContentId);
   $("pkg-content-id").addEventListener("input", () => { pkg.contentIdTouched = true; });
   $("pkg-build").addEventListener("click", packageBuild);
+  $("pkg-assets").addEventListener("click", () => packageBuild(true));
 }
 
 
@@ -1451,6 +1498,7 @@ async function boot() {
   if (!Projects.id) await restaurarSesion();
   await Projects.boot();
   Library.boot();
+  Compositor.boot();
 }
 
 /* ------------------------------------------------------------ listeners */
@@ -1510,6 +1558,11 @@ document.addEventListener("keydown", (e) => {
     player.pause();
     player.seek((player.index - 1 + anim.bitmaps.length) % anim.bitmaps.length);
   }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { player.pause(); pvPlayer.stop(); }
+  else if ($("panel-preview").classList.contains("is-active")) renderPreview();
 });
 
 boot();

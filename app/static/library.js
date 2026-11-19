@@ -85,7 +85,7 @@ const Library = (() => {
         status.textContent = "Verificando e salvando no servidor…";
       };
       xhr.onload = () => {
-        if (xhr.status === 201 || xhr.status === 200) resolve(xhr.status);
+        if (xhr.status === 201 || xhr.status === 200) resolve({ code: xhr.status, asset: xhr.response });
         else reject(new Error(typeof xhr.response?.detail === "string"
           ? xhr.response.detail : `O servidor recusou o arquivo (HTTP ${xhr.status}).`));
       };
@@ -97,7 +97,7 @@ const Library = (() => {
     });
   }
 
-  async function importFiles(files) {
+  async function importFiles(files, onAsset) {
     if (importing || !files.length) return;
     importing = true;
     stopQueue = false;
@@ -125,9 +125,13 @@ const Library = (() => {
           continue;
         }
         try {
-          const code = await transfer(file, meter, status);
+          const { code, asset } = await transfer(file, meter, status);
           meter.value = 1;
           status.textContent = code === 201 ? "Disponível na biblioteca" : "Este conteúdo já está na biblioteca";
+          if (onAsset) {
+            try { onAsset(asset); }
+            catch (err) { status.textContent += ` · ${err.message}`; }
+          }
         } catch (err) {
           meter.hidden = true;
           status.textContent = err.message;
@@ -185,6 +189,7 @@ const Library = (() => {
       }
     }
     get("apply").disabled = !target.options.length;
+    get("layer").hidden = !Projects.id || !Compositor.supported(item);
     target.disabled = !target.options.length;
     get("apply-status").textContent = Projects.id
       ? (target.disabled ? "Nenhum destino compatível." : "") : "Abra um projeto para usar esta mídia.";
@@ -199,6 +204,7 @@ const Library = (() => {
     const closeButton = get("asset").querySelector('button[type="submit"]');
     closeButton.disabled = true;
     get("apply").disabled = true;
+    get("layer").disabled = true;
     target.disabled = true;
     get("apply-status").textContent = "Processando para o projeto…";
     try {
@@ -208,6 +214,7 @@ const Library = (() => {
       get("apply-status").textContent = err.message;
     } finally {
       get("apply").disabled = false;
+      get("layer").disabled = false;
       target.disabled = false;
       closeButton.disabled = false;
       applying = false;
@@ -232,9 +239,17 @@ const Library = (() => {
     };
     get("cancel").onclick = () => { stopQueue = true; upload?.abort(); };
     get("apply").onclick = applyAsset;
+    get("layer").onclick = () => {
+      try {
+        Compositor.add(selected);
+        get("asset").close();
+        document.getElementById("media-library").open = false;
+        document.querySelector('.tab[data-tab="compositor"]').click();
+      } catch (err) { get("apply-status").textContent = err.message; }
+    };
     get("asset").addEventListener("close", () => get("preview").replaceChildren());
     get("asset").addEventListener("cancel", (event) => { if (applying) event.preventDefault(); });
   }
 
-  return { boot };
+  return { boot, importFiles };
 })();
