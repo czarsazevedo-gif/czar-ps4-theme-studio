@@ -122,13 +122,17 @@ def project_path(request: Request, project: str) -> Path:
 async def scope_jobs(request: Request, call_next):
     """Use the existing media endpoints with a private project directory."""
     project = request.query_params.get("project")
-    protected = project is not None or request.url.path.startswith("/api/projects")
+    path = request.url.path
+    library_apply = path.startswith("/api/library/") and path.endswith("/apply")
+    protected = project is not None or path.startswith(("/api/projects", "/api/library"))
     if protected and request.method in {"POST", "PUT"}:
         if not valid_origin(request):
             return JSONResponse({"detail": "Origem da solicitação não autorizada."}, status_code=403)
-    if project is None or not request.url.path.startswith(
+    if library_apply and project is None:
+        return JSONResponse({"detail": "Abra um projeto antes de aplicar a mídia."}, status_code=400)
+    if project is None or not (library_apply or path.startswith(
         ("/api/animated/", "/api/slot/", "/api/audio/", "/api/convert/", "/api/package/")
-    ):
+    )):
         return await call_next(request)
     try:
         root = project_path(request, project)

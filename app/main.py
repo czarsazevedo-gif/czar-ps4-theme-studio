@@ -11,11 +11,13 @@ import json
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import at9, jobs, mdx, media, pkg, projects, raf, theme, theme_xml, vag
+from pydantic import BaseModel, ConfigDict
+
+from . import at9, jobs, library, mdx, media, pkg, projects, raf, theme, theme_xml, vag
 from .config import (
     ANIMATED_FRAME_BYTES,
     ANIMATED_SIZE,
@@ -30,6 +32,7 @@ from .config import (
     ICON_SIZE,
     IMAGE_EXTS,
     MAX_FRAMES,
+    MAX_UPLOAD_BYTES,
     PIC1_SIZE,
     PKG_CATEGORIES,
     PKG_DEFAULTS,
@@ -53,9 +56,7 @@ from .media import MediaError
 app = FastAPI(title="PS4 Theme Asset Creator", docs_url=None, redoc_url=None)
 app.middleware("http")(projects.scope_jobs)
 app.include_router(projects.router)
-
-#: Upload cap. A source video can be large; the result never is.
-MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+app.include_router(library.router)
 
 #: The UI used to allow going over the cap "so the red bar could be seen".
 #: That let you assemble a theme the console rejects with CE-38196-7, so it no
@@ -229,6 +230,10 @@ async def animated_upload(
 ) -> dict:
     data = await _read_upload(file, VIDEO_EXTS)
     job = jobs.create("animated", file.filename or "source", data)
+    return _prepare_animated_upload(job, frames, size)
+
+
+def _prepare_animated_upload(job: jobs.Job, frames: int, size: str) -> dict:
     sz = _parse_size(size)
     return _build_animated_preview(job, _clamp_frames(frames, sz), sz)
 
@@ -373,6 +378,10 @@ async def slot_upload(slot_id: str, file: UploadFile = File(...)) -> dict:
 
     data = await _read_upload(file, IMAGE_EXTS)
     job = jobs.create("slot", file.filename or "source", data)
+    return _prepare_slot_upload(job, slot_id, spec)
+
+
+def _prepare_slot_upload(job: jobs.Job, slot_id: str, spec: dict) -> dict:
     job.meta["slot"] = slot_id
     job.save()
 
@@ -426,14 +435,20 @@ async def audio_upload(slot_id: str, file: UploadFile = File(...),
     spec = AUDIO_SLOTS.get(slot_id)
     if spec is None:
         raise HTTPException(404, f"Unknown audio slot: {slot_id}")
+    filename = file.filename or ""
+    data = await _read_upload(file, _audio_upload_extensions(filename, spec))
+    job = jobs.create("audio", filename or "source", data)
+    return _prepare_audio_upload(job, slot_id, spec, gain_db)
 
+
+def _audio_upload_extensions(filename: str, spec: dict) -> set[str]:
     # With at9tool around, the music slot takes ordinary audio too.
     allowed = spec["exts"] or SOUND_EXTS
     if not spec["convert"]:
         if at9.available():
             allowed = SOUND_EXTS
         elif (
-            (suffix := Path(file.filename or "").suffix.lower()) in SOUND_EXTS
+            (suffix := Path(filename).suffix.lower()) in SOUND_EXTS
             and suffix not in allowed
         ):
             # Valid audio, we just cannot convert it: better to say so.
@@ -443,11 +458,55 @@ async def audio_upload(slot_id: str, file: UploadFile = File(...),
                 "Convert it first, or drop at9tool.exe in tools/ and it will be "
                 "done automatically.",
             )
-    data = await _read_upload(file, allowed)
-    job = jobs.create("audio", file.filename or "source", data)
+    return allowed
+
+
+def _prepare_audio_upload(job: jobs.Job, slot_id: str, spec: dict, gain_db: float) -> dict:
     job.meta["slot"] = slot_id
 
     return _procesar_audio(job, spec, _clamp_gain(gain_db))
+
+
+class LibraryUse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    slot: str
+    frames: int = 12
+    size: str = ""
+
+
+@app.post("/api/library/{ident}/apply")
+def apply_library_asset(request: Request, ident: str, selection: LibraryUse) -> dict:
+    """Reuse the canonical preparation steps with an authorized, linked source."""
+    if jobs.project_workspace.get() is None:
+        raise HTTPException(400, "Abra um projeto para usar a mídia.")
+    asset, source = library.get_asset(request, ident)
+    slot = selection.slot
+    if slot == "animated":
+        kind, allowed = "animated", VIDEO_EXTS if asset.kind in {"video", "animation"} else set()
+    elif slot in IMAGE_SLOTS:
+        kind, allowed = "slot", IMAGE_EXTS if asset.kind in {"image", "animation"} else set()
+    elif slot in AUDIO_SLOTS:
+        kind = "audio"
+        spec = AUDIO_SLOTS[slot]
+        if slot == "bgm" and asset.kind == "audio" and asset.codec != "atrac9" and not at9.available():
+            raise HTTPException(415, "A música do menu precisa de ATRAC9 (.at9) neste servidor.")
+        allowed = (SOUND_EXTS if at9.available() and slot == "bgm" else spec["exts"] or SOUND_EXTS
+                   ) if asset.kind == "audio" else set()
+    else:
+        raise HTTPException(404, "Destino inválido para a mídia.")
+    if asset.extension not in allowed:
+        raise HTTPException(415, "O formato da mídia não é compatível com este destino.")
+    try:
+        with jobs.from_library(kind, asset.originalName, source) as job:
+            if kind == "animated":
+                return _prepare_animated_upload(job, selection.frames, selection.size)
+            if kind == "slot":
+                return _prepare_slot_upload(job, slot, IMAGE_SLOTS[slot])
+            return _prepare_audio_upload(job, slot, AUDIO_SLOTS[slot], 0.0)
+    except (MediaError, HTTPException) as exc:
+        raise HTTPException(422, "O processador não conseguiu preparar esta mídia para o destino.") from exc
+    except OSError as exc:
+        raise library.storage_error() from exc
 
 
 def _procesar_audio(job: jobs.Job, spec: dict, gain_db: float = 0.0) -> dict:

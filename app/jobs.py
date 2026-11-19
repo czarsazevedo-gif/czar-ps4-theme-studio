@@ -8,9 +8,12 @@ que cambiar la cantidad de frames o el wait no obliga a volver a subir nada.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import time
 import uuid
 from contextvars import ContextVar
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -70,6 +73,13 @@ def _safe_suffix(filename: str) -> str:
 
 
 def create(kind: str, filename: str, data: bytes) -> Job:
+    job = _new_job(kind, filename, _safe_suffix(filename))
+    job.source.write_bytes(data)
+    job.save()
+    return job
+
+
+def _new_job(kind: str, filename: str, suffix: str) -> Job:
     workspace = project_workspace.get() or WORKSPACE
     workspace.mkdir(parents=True, exist_ok=True)
 
@@ -77,14 +87,24 @@ def create(kind: str, filename: str, data: bytes) -> Job:
     root = workspace / f"{kind}-{job_id}"
     root.mkdir(parents=True)
 
-    source = root / f"source{_safe_suffix(filename)}"
-    source.write_bytes(data)
-
-    job = Job(id=job_id, kind=kind, root=root, source=source, original_name=filename)
+    job = Job(id=job_id, kind=kind, root=root, source=root / f"source{suffix}", original_name=filename)
     job.preview_dir.mkdir(exist_ok=True)
     job.out_dir.mkdir(exist_ok=True)
-    job.save()
     return job
+
+
+@contextmanager
+def from_library(kind: str, filename: str, source: Path):
+    """Give the canonical processor an independent job with a read-only original."""
+    job = _new_job(kind, filename, _safe_suffix(source.name))
+    try:
+        os.link(source, job.source)
+        job.save()
+        yield job
+    except BaseException:
+        # Only this newly created job is rolled back. The library link survives.
+        shutil.rmtree(job.root, ignore_errors=True)
+        raise
 
 
 def load(kind: str, job_id: str) -> Job | None:
