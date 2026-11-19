@@ -116,6 +116,7 @@ export function upload(path, file, progress) {
         }
         progress(offset / file.size);
       }
+      progress(1); // Transfer complete; server now analyzes and verifies the source.
       const finished = await retry(() => jsonRequest(path + "/uploads/" + session.id + "/finalize", "POST"));
       localStorage.removeItem(pendingKey);
       progress(1);
