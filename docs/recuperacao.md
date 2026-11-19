@@ -21,4 +21,8 @@ Para repetir em um Codespace de teste, inicie o editor, gere as fixtures com `py
 
 ## Aceitação pendente
 
+Na bancada, a porta 8000 já estava ocupada por outro serviço. O ensaio HTTP usou 18080 e a verificação final da interface usou 18081. A suíte de preview passou nas três telas, incluindo geometria e restauração de sessão. Em Chromium com toque emulado a 1480 × 924 e 924 × 1480, o editor abriu em pt-BR, importou a captura PNG e exibiu a tela inicial.
+
+A tentativa de criar um Codespace da branch pelo GitHub CLI foi recusada na verificação de permissão da integração. O encaminhamento da porta e sua visibilidade efetiva ainda precisam ser observados no Codespace do proprietário.
+
 No Chrome do Galaxy Tab S10 Ultra, abra a URL privada da porta 8000. Selecione os mesmos arquivos que falharam, registre nome, dimensões, duração e resultado do upload. Confira as três telas, exporte o RAF e registre o resultado no console quando disponível. A aprovação depende desse ensaio no ambiente de destino. PKG real e conversão ATRAC9 externa também dependem de ferramentas e arquivos adequados.
