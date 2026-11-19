@@ -15,7 +15,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import at9, jobs, mdx, media, pkg, raf, theme, theme_xml, vag
+from . import at9, jobs, mdx, media, pkg, projects, raf, theme, theme_xml, vag
 from .config import (
     ANIMATED_FRAME_BYTES,
     ANIMATED_SIZE,
@@ -51,6 +51,8 @@ from .dds import DEFAULT_BACKEND, available_backends, encode_frame, encode_seque
 from .media import MediaError
 
 app = FastAPI(title="PS4 Theme Asset Creator", docs_url=None, redoc_url=None)
+app.middleware("http")(projects.scope_jobs)
+app.include_router(projects.router)
 
 #: Upload cap. A source video can be large; the result never is.
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024

@@ -1,0 +1,25 @@
+.project-bar {
+  padding: 12px clamp(12px, 3vw, 32px);
+  border-bottom: 1px solid #313845;
+}
+
+.project-fields, .project-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.project-fields label {
+  flex: 1 1 230px;
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.project-bar :is(.btn, .select) { min-height: 44px; }
+.project-bar .select { width: 100%; }
+.project-actions { margin-top: 8px; }
+.project-bar p { margin: 4px 0 0; }
+.project-bar p:empty { display: none; }
+#project-dialog { max-width: calc(100vw - 32px); background: #1a202b; color: #f5f7fc; }
+#project-dialog::backdrop { background: #000a; }

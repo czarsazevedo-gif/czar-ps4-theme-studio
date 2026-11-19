@@ -10,12 +10,14 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import WORKSPACE as DATA_ROOT
 
 WORKSPACE = DATA_ROOT / "recovery"
+project_workspace: ContextVar[Path | None] = ContextVar("project_workspace", default=None)
 
 
 @dataclass
@@ -68,10 +70,11 @@ def _safe_suffix(filename: str) -> str:
 
 
 def create(kind: str, filename: str, data: bytes) -> Job:
-    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    workspace = project_workspace.get() or WORKSPACE
+    workspace.mkdir(parents=True, exist_ok=True)
 
     job_id = uuid.uuid4().hex[:12]
-    root = WORKSPACE / f"{kind}-{job_id}"
+    root = workspace / f"{kind}-{job_id}"
     root.mkdir(parents=True)
 
     source = root / f"source{_safe_suffix(filename)}"
@@ -93,7 +96,7 @@ def load(kind: str, job_id: str) -> Job | None:
     if not job_id or len(job_id) > 32 or not all(c in "0123456789abcdef" for c in job_id):
         return None
 
-    root = WORKSPACE / f"{kind}-{job_id}"
+    root = (project_workspace.get() or WORKSPACE) / f"{kind}-{job_id}"
     meta_path = root / "job.json"
     if not meta_path.is_file():
         return None
@@ -103,7 +106,10 @@ def load(kind: str, job_id: str) -> Job | None:
     except (OSError, json.JSONDecodeError):
         return None
 
-    source = root / str(raw.get("source", ""))
+    source_name = str(raw.get("source", ""))
+    if not source_name.startswith("source.") or Path(source_name).name != source_name:
+        return None
+    source = root / source_name
     if not source.is_file():
         return None
 

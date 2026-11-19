@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Czar PS4 Theme Studio</title>
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/projects.css">
   <script src="/static/i18n.js"></script>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎮</text></svg>">
 </head>
@@ -33,6 +34,36 @@
     </select>
   </div>
 </header>
+
+<section class="project-bar" aria-label="Projetos">
+  <div class="project-fields">
+    <label for="project-list">Projetos
+      <select id="project-list" class="select"></select>
+    </label>
+    <label for="project-name">Nome do projeto ativo
+      <input id="project-name" class="select" maxlength="100" placeholder="Sem projeto aberto" disabled>
+    </label>
+  </div>
+  <div class="project-actions">
+    <button id="project-new" class="btn btn-ghost" disabled>Novo</button>
+    <button id="project-open" class="btn btn-ghost" disabled>Abrir</button>
+    <button id="project-save" class="btn btn-ghost" disabled>Salvar</button>
+    <button id="project-copy" class="btn btn-ghost" disabled>Duplicar</button>
+    <button id="project-close" class="btn btn-ghost" disabled>Fechar</button>
+  </div>
+  <p id="project-updated" class="dim"></p>
+  <p id="project-status" role="status" aria-live="polite">Carregando projetos…</p>
+  <dialog id="project-dialog">
+    <form method="dialog">
+      <label for="project-dialog-name">Nome do projeto</label>
+      <input id="project-dialog-name" class="select" maxlength="100" required>
+      <div class="project-actions">
+        <button value="cancel" formnovalidate class="btn btn-ghost">Cancelar</button>
+        <button value="confirm" class="btn btn-primary">Confirmar</button>
+      </div>
+    </form>
+  </dialog>
+</section>
 
 <nav class="tabs" role="tablist">
   <button class="tab is-active" data-tab="backgrounds" role="tab" data-i18n="tab.backgrounds"></button>
@@ -372,6 +403,7 @@
 
 <div id="toast" class="toast" hidden></div>
 
+<script src="/static/projects.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

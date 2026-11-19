@@ -35,7 +35,7 @@ function toast(msg, kind = "error") {
 }
 
 async function api(url, options) {
-  const res = await fetch(url, options);
+  const res = await Projects.fetchMedia(url, options);
   let body = null;
   try { body = await res.json(); } catch { /* respuesta sin json */ }
   if (!res.ok) {
@@ -258,14 +258,17 @@ function updateTiming() {
 async function loadBitmaps(urls) {
   anim.bitmaps.forEach((b) => b.close?.());
   anim.bitmaps = await Promise.all(
-    urls.map((u) => fetch(u).then((r) => r.blob()).then(createImageBitmap))
+    urls.map(async (url) => {
+      const response = await fetch(Projects.mediaUrl(url));
+      if (!response.ok) throw new Error("Não foi possível carregar os quadros da animação.");
+      return createImageBitmap(await response.blob());
+    })
   );
 }
 
 function applyAnimatedPayload(data) {
   anim.jobId = data.job_id;
   syncRafOverlap();
-  guardarSesion();
   anim.frameCount = data.budget.frames;
   anim.size = data.budget.size;
 
@@ -283,6 +286,7 @@ function applyAnimatedPayload(data) {
   player.seek(0);
   updateBudget();
   updateTiming();
+  guardarSesion();
 }
 
 function setAnimBusy(busy) {
@@ -366,7 +370,7 @@ async function animatedExport() {
         <div class="result-row"><span>encoder</span><b>${r.backend}</b></div>
       </div>
       <pre>${r.index_xml.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]))}</pre>
-      <a class="dl-btn" href="${r.download}" download>${t("bg.export")} background.raf.zip</a>`;
+      <a class="dl-btn" href="${Projects.mediaUrl(r.download)}" download>${t("bg.export")} background.raf.zip</a>`;
     toast("Exportado correctamente.", "ok");
   } catch (err) {
     toast(err.message);
@@ -521,7 +525,7 @@ async function uploadSlot(slotId, file) {
       method: "POST", body: fd,
     });
     slots.chosen[slotId] = d.job_id;
-    paintSlot(slotId, d.preview);
+    paintSlot(slotId, Projects.mediaUrl(d.preview));
     guardarSesion();
   } catch (err) {
     toast(err.message);
@@ -578,6 +582,7 @@ function paintBgm(d) {
     info.className = "bgm-info";
     $("bgm-clear").hidden = true;
     $("bgm-gain-row").hidden = true;
+    guardarSesion();
   }
 }
 
@@ -682,6 +687,7 @@ function pintarSfxRows() {
       row.querySelector(".bgm-info").textContent = t("snd.none.sfx");
       row.querySelector(".bgm-info").className = "bgm-info";
       row.querySelector(".sfx-clear").hidden = true;
+      guardarSesion();
     });
     if (sfx.chosen[spec.id]) {
       // Redraw with something already uploaded: keep the state, do not reset.
@@ -759,25 +765,32 @@ const PKG_CAMPOS = ["pkg-title", "pkg-title-id", "pkg-content-id", "pkg-themecol
                     "pkg-fontcolor", "pkg-fontshadow", "pkg-focuscolor"];
 
 let sesionTimer = null;
+function captureEditorState() {
+  return {
+    slots: { ...slots.chosen },
+    bgm: bgm.jobId,
+    bgmGain: bgm.gain,
+    sfx: { ...sfx.chosen },
+    bgMode: bgMode(),
+    contentIdTouched: pkg.contentIdTouched,
+    anim: {
+      jobId: anim.jobId, frames: anim.frameCount, wait: anim.wait, size: currentSize().size,
+      backend: $("anim-backend").value,
+    },
+    campos: Object.fromEntries(PKG_CAMPOS.map((id) => [id, $(id).value])),
+  };
+}
+
 function guardarSesion() {
+  if (Projects.id) {
+    Projects.changed();
+    return;
+  }
   // Debounced: writing on every keystroke of the title adds nothing.
   clearTimeout(sesionTimer);
   sesionTimer = setTimeout(() => {
     try {
-      const campos = {};
-      PKG_CAMPOS.forEach((id) => { if ($(id)) campos[id] = $(id).value; });
-      localStorage.setItem(SESION_KEY, JSON.stringify({
-        slots: slots.chosen,
-        bgm: bgm.jobId,
-        bgmGain: bgm.gain,
-        sfx: sfx.chosen,
-        bgMode: bgMode(),
-        contentIdTouched: pkg.contentIdTouched,
-        anim: anim.jobId
-          ? { jobId: anim.jobId, frames: anim.frameCount, wait: anim.wait, size: anim.size }
-          : null,
-        campos,
-      }));
+      localStorage.setItem(SESION_KEY, JSON.stringify(captureEditorState()));
     } catch { /* cuota llena o navegacion privada: no vale la pena molestar */ }
   }, 400);
 }
@@ -798,7 +811,11 @@ async function jobVive(url) {
 async function restaurarSesion() {
   let d = null;
   try { d = JSON.parse(localStorage.getItem(SESION_KEY) || "null"); } catch { return; }
-  if (!d) return;
+  await restoreEditorState(d);
+}
+
+async function restoreEditorState(d, project = false) {
+  if (!d) return 0;
 
   PKG_CAMPOS.forEach((id) => {
     if ($(id) && d.campos?.[id] != null) $(id).value = d.campos[id];
@@ -811,7 +828,7 @@ async function restaurarSesion() {
 
   let vivos = 0, perdidos = 0;
   for (const [slotId, jobId] of Object.entries(d.slots || {})) {
-    const url = `/api/slot/${jobId}/preview`;
+    const url = Projects.mediaUrl(`/api/slot/${jobId}/preview`);
     if (await jobVive(url)) {
       slots.chosen[slotId] = jobId;
       paintSlot(slotId, url);
@@ -822,7 +839,13 @@ async function restaurarSesion() {
   if (d.bgm) {
     try {
       // paintBgm already knows how to draw name, loudness and volume.
-      paintBgm(await api(`/api/audio/${d.bgm}/info`));
+      let audio = await api(`/api/audio/${d.bgm}/info`);
+      if (project && Math.abs(audio.gain_db - d.bgmGain) > 0.01) {
+        const body = new FormData();
+        body.append("gain_db", String(d.bgmGain));
+        audio = await api(`/api/audio/${d.bgm}/gain`, { method: "POST", body });
+      }
+      paintBgm(audio);
       vivos++;
     } catch { perdidos++; }
   }
@@ -844,6 +867,32 @@ async function restaurarSesion() {
   }
 
   if (d.bgMode === "animated") $("bgmode-animated").checked = true;
+  if (project && d.anim) {
+    const { size, wait, frames, backend, jobId } = d.anim;
+    $("anim-size").value = sizeValue({ size });
+    $("anim-frames").max = String(currentSize().max_frames);
+    anim.frameCount = frames;
+    anim.wait = wait;
+    $("anim-wait").value = String(wait);
+    $("anim-wait-out").textContent = wait.toFixed(2);
+    if (sys.backends.includes(backend)) $("anim-backend").value = backend;
+    syncSizeUi();
+    updateTiming();
+    if (jobId) {
+      const body = new FormData();
+      body.append("size", sizeValue({ size }));
+      body.append("frames", String(frames));
+      try {
+        const data = await api(`/api/animated/${jobId}/frames`, { method: "POST", body });
+        await loadBitmaps(data.frames);
+        $("anim-drop").hidden = true;
+        $("anim-workspace").hidden = false;
+        applyAnimatedPayload(data);
+        player.draw();
+        vivos++;
+      } catch { perdidos++; }
+    }
+  }
   syncRafOverlap();
 
   if (vivos) {
@@ -852,6 +901,9 @@ async function restaurarSesion() {
   }
   refreshChecklist();
   renderTree();
+  $("pkg-themecolor").dispatchEvent(new Event("change"));
+  renderPreview();
+  return perdidos;
 }
 
 /* ================================================== VISTA PREVIA
@@ -883,7 +935,7 @@ function slotImage(slotId) {
   let id = slotId;
   while (id && !visto.has(id)) {
     visto.add(id);
-    if (slots.chosen[id]) return `/api/slot/${slots.chosen[id]}/preview`;
+    if (slots.chosen[id]) return Projects.mediaUrl(`/api/slot/${slots.chosen[id]}/preview`);
     id = slots.catalog.find((x) => x.id === id)?.fallback;
   }
   return null;
@@ -981,7 +1033,7 @@ function renderPreview() {
   // --- function icons ---
   const fns = slots.catalog.filter((x) => x.group === "function_icon");
   const glifo = (spec) => {
-    const u = slots.chosen[spec.id] ? `/api/slot/${slots.chosen[spec.id]}/preview` : null;
+    const u = slots.chosen[spec.id] ? Projects.mediaUrl(`/api/slot/${slots.chosen[spec.id]}/preview`) : null;
     return { url: u, propio: Boolean(u) };
   };
 
@@ -1117,11 +1169,15 @@ function renderTree() {
 async function syncContentId() {
   if (pkg.contentIdTouched) return;
   const titleId = $("pkg-title-id").value.trim().toUpperCase();
+  const title = $("pkg-title").value;
   if (!/^[A-Z]{4}[0-9]{5}$/.test(titleId)) return;
   try {
-    const q = new URLSearchParams({ title_id: titleId, title: $("pkg-title").value });
+    const q = new URLSearchParams({ title_id: titleId, title });
     const d = await api(`/api/package/content-id?${q}`);
+    if (pkg.contentIdTouched || $("pkg-title").value !== title ||
+        $("pkg-title-id").value.trim().toUpperCase() !== titleId) return;
     $("pkg-content-id").value = d.content_id;
+    guardarSesion();
   } catch { /* mientras se escribe puede quedar a medias, no molestar */ }
 }
 
@@ -1172,7 +1228,7 @@ async function packageBuild() {
       <div class="result-rows">${rows}</div>
       <div class="log">${steps}</div>
       <p class="card-note"><code>${r.pkg_name}</code></p>
-      <a class="dl-btn" style="margin-top:14px" href="${r.download}" download>${t("pkg.download")}</a>`;
+      <a class="dl-btn" style="margin-top:14px" href="${Projects.mediaUrl(r.download)}" download>${t("pkg.download")}</a>`;
     toast(t("pkg.result.ok", { size: fmtBytes(r.pkg_bytes), s: r.elapsed }), "ok");
   } catch (err) {
     toast(err.message);
@@ -1267,6 +1323,7 @@ document.addEventListener("langchange", relocalizarTodo);
 /* ================================================== arranque */
 
 async function boot() {
+  if (Projects.id) document.querySelector("main").inert = true;
   applyI18n();
   try {
     sys = await api("/api/system");
@@ -1297,7 +1354,12 @@ async function boot() {
     .map((x) => `<option value="${sizeValue(x)}">${
       t("bg.size.opt", { label: x.label, max: x.max_frames })}</option>`)
     .join("");
-  sizeSel.addEventListener("change", () => { syncSizeUi(); animatedReframe(); });
+  sizeSel.addEventListener("change", () => {
+    syncSizeUi();
+    if (anim.jobId) animatedReframe();
+    else guardarSesion();
+  });
+  sel.addEventListener("change", guardarSesion);
   syncSizeUi();
 
   const wt = $("anim-wait");
@@ -1337,7 +1399,8 @@ async function boot() {
 
   // Last: it needs the grids and the fields already in place to redraw them
   // with whatever survives from the previous session.
-  await restaurarSesion();
+  if (!Projects.id) await restaurarSesion();
+  await Projects.boot();
 }
 
 /* ------------------------------------------------------------ listeners */
@@ -1352,7 +1415,10 @@ $("anim-frames").addEventListener("input", (e) => {
   updateBudget();
   updateTiming();
 });
-$("anim-frames").addEventListener("change", animatedReframe);
+$("anim-frames").addEventListener("change", () => {
+  if (anim.jobId) animatedReframe();
+  else guardarSesion();
+});
 
 // Volume means re-encoding the whole .at9, so it applies on release, like the
 // frames do.
@@ -1367,6 +1433,7 @@ $("anim-wait").addEventListener("input", (e) => {
   anim.wait = Number(e.target.value);
   $("anim-wait-out").textContent = anim.wait.toFixed(2);
   updateTiming();
+  guardarSesion();
 });
 
 $("anim-play").addEventListener("click", () => player.toggle());
