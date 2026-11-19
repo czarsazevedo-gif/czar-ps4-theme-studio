@@ -34,6 +34,8 @@ export function upload(path, file, progress) {
   const chunkSize = 512 * 1024;
   let aborted = false;
   const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  // A cryptographic digest prevents accidentally resuming a different file
+  // with the same name, length and lastModified timestamp.
   const jsonRequest = async (endpoint, method, json) => {
     const response = await fetch(base + endpoint, {
       method, credentials: "same-origin", signal: controller.signal,
@@ -63,11 +65,14 @@ export function upload(path, file, progress) {
   const promise = (async () => {
     let session = null;
     try {
+      const bytes = await file.arrayBuffer();
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      const checksum = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
       const saved = localStorage.getItem(pendingKey);
       if (saved) {
         try {
           session = await jsonRequest(path + "/uploads/" + saved, "GET");
-          if (session.size !== file.size || session.name !== file.name) throw Error("Arquivo divergente");
+          if (session.size !== file.size || session.name !== file.name || session.sha256 !== checksum) throw Error("Arquivo divergente");
         } catch (error) {
           if (error.name === "AbortError") throw error;
           if (error.status === 404 || error.message === "Arquivo divergente") localStorage.removeItem(pendingKey);
@@ -76,7 +81,7 @@ export function upload(path, file, progress) {
         }
       }
       if (!session) {
-        session = await retry(() => jsonRequest(path + "/uploads", "POST", { name: file.name, size: file.size }));
+        session = await retry(() => jsonRequest(path + "/uploads", "POST", { name: file.name, size: file.size, sha256: checksum }));
         localStorage.setItem(pendingKey, session.id);
       }
       let offset = session.offset;
