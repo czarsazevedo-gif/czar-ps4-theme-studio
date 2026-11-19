@@ -37,6 +37,26 @@ do navegador identifica o proprietário. Cookies apagados, outros perfis ou outr
 domínio exigem importar um ZIP para recuperar o projeto nesses ambientes. Codespaces
 pode apagar seu armazenamento quando um Codespace for excluído.
 
+## Upload retomável no tablet
+
+A partir da correção 0.1.1, os arquivos são enviados em blocos de **512 KiB**, com
+até cinco tentativas por requisição em erros temporários. O navegador calcula
+o **SHA-256 do arquivo original** e o servidor verifica a integridade após
+reconstruí-lo. O upload não modifica nem recomprime os vídeos.
+
+Se a conexão cair ou você tocar em **Pausar importação**, abra o mesmo projeto,
+escolha **o mesmo arquivo no tablet** (nome, tamanho e data de modificação)
+e o envio continuará do deslocamento confirmado pelo servidor. Sessões
+incompletas expiram após 24 horas. O limite continua sendo 128 MiB por
+arquivo e 512 MiB por projeto. Somente a importação está sendo alterada;
+a exportação RAF ainda depende de seus próprios limites.
+
+Para testar as rotas e a retomada:
+```bash
+python tests/make_fixtures.py
+python -m unittest discover -s tests -p 'test_chunked_upload.py' -v
+```
+
 ## Mídia e formatos
 
 Aceita PNG, JPEG, WebP, BMP e GIF, além de MP4/MOV modernamente encapsulados, WebM,
