@@ -25,10 +25,43 @@ export async function connect() {
 }
 export const urlFor = (path) => base + path;
 
+/** Project ZIP imports retain their existing single-request endpoint.
+ * Media files use resumable chunks below.
+ */
+function uploadProjectZip(path, file, progress) {
+  const xhr = new XMLHttpRequest();
+  const promise = new Promise((resolve, reject) => {
+    xhr.open("POST", base + path, true);
+    if (token) xhr.setRequestHeader("x-czar-token", token);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total) progress(event.loaded / event.total);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          progress(1);
+          resolve(JSON.parse(xhr.responseText));
+        } catch {
+          reject(new Error("O servidor respondeu com um projeto inválido."));
+        }
+      } else {
+        let data = {};
+        try { data = JSON.parse(xhr.responseText); } catch { /* HTTP error without JSON */ }
+        reject(new Error(data.message || ("Servidor respondeu HTTP " + xhr.status)));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Falha de rede ao importar projeto ZIP."));
+    xhr.onabort = () => reject(new Error("Importação de projeto cancelada."));
+    xhr.send(file);
+  });
+  return { promise, cancel: () => xhr.abort() };
+}
+
 /** Chunked upload persists its session ID across refreshes.
  * Re-select the same File on the tablet to resume, with no recompression.
  */
 export function upload(path, file, progress) {
+  if (path === "/projects/import") return uploadProjectZip(path, file, progress);
   const controller = new AbortController();
   const pendingKey = "czar.upload." + path + ":" + file.name + ":" + file.size + ":" + file.lastModified;
   const chunkSize = 512 * 1024;
