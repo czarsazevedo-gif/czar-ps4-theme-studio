@@ -186,12 +186,13 @@ async def import_project(request: Request, owner: str = Depends(require_session)
 class UploadStart(Model):
     name: str
     size: int
+    sha256: str
 
 
 @router.post("/projects/{ident}/uploads", status_code=201)
 def start_chunked_upload(ident: str, data: UploadStart, owner: str = Depends(require_session)):
     name = safe_name(data.name)
-    return uploading.initiate(owner, ident, name, data.size)
+    return uploading.initiate(owner, ident, name, data.size, data.sha256)
 
 
 @router.get("/projects/{ident}/uploads/{upload_id}")
