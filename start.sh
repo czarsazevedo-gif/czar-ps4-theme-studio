@@ -5,6 +5,12 @@ for tool in python ffmpeg ffprobe; do
   command -v "$tool" >/dev/null || { echo "Dependência ausente: $tool" >&2; exit 1; }
 done
 python -c 'import fastapi, multipart, numpy, PIL, uvicorn, cv2, scipy, skimage' || { echo "Instale requirements.txt no Codespace: python -m pip install -r requirements.txt" >&2; exit 1; }
+if [[ "${CZAR_SKIP_FORGE_TOOLS:-0}" != "1" ]] && [[ -x ./scripts/install_forge_tools.sh ]]; then
+  if [[ ! -x ./tools/bin/psgfx-at9 || ! -x ./tools/bin/liborbispkg/pkgtool ]]; then
+    echo "Instalando ferramentas nativas CZAR FORGE (ATRAC9 + PKG Forge)..."
+    ./scripts/install_forge_tools.sh all
+  fi
+fi
 port="${CZAR_PORT:-8000}"
 echo "Czar PS4 Theme Studio · abra a porta privada $port no painel Portas."
 exec python -m uvicorn app.main:app --host 0.0.0.0 --port "$port"
