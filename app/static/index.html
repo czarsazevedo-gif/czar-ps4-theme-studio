@@ -521,12 +521,66 @@
     <p class="ctl-note" id="pv-note"></p>
   </section>
 
-  <!-- ================= EMPAQUETAR ================= -->
+  <!-- ================= EMPAQUETAR / CZAR FORGE ================= -->
   <section class="panel" id="panel-package">
     <div id="pkg-missing" class="notice notice-warn" data-i18n="pkg.missing" hidden></div>
 
+    <div class="card forge-hero">
+      <div class="forge-hero-head">
+        <div>
+          <h2 class="card-title" style="margin:0">CZAR FORGE — Forja de Tema PS4</h2>
+          <p class="card-note" style="margin:4px 0 0">Valide o projeto salvo, exporte os recursos canônicos ou gere um pacote <code>.pkg</code> (<code>pkg_ps4_theme · IRO_TAG=2 · CATEGORY=ac</code>) inspecionado de forma independente.</p>
+        </div>
+        <span id="forge-status-badge" class="forge-badge is-ready" data-state="PRONTO" role="status">PRONTO</span>
+      </div>
+
+      <div class="forge-summary-grid" id="forge-summary-grid" aria-label="Resumo do tema">
+        <div class="forge-stat" data-card="media"><span>Mídias do tema</span><b id="forge-sum-media">—</b></div>
+        <div class="forge-stat" data-card="animated"><span>Fundo animado</span><b id="forge-sum-animated">—</b></div>
+        <div class="forge-stat" data-card="icons"><span>Ícones</span><b id="forge-sum-icons">—</b></div>
+        <div class="forge-stat" data-card="music"><span>Música</span><b id="forge-sum-music">—</b></div>
+        <div class="forge-stat" data-card="sfx"><span>Efeitos</span><b id="forge-sum-sfx">—</b></div>
+        <div class="forge-stat" data-card="validation"><span>Validação</span><b id="forge-sum-validation">Não executada</b></div>
+        <div class="forge-stat" data-card="bundle"><span>Exportação</span><b id="forge-sum-bundle">Pronto</b></div>
+        <div class="forge-stat" data-card="pkg"><span>PKG</span><b id="forge-sum-pkg">Não gerado</b></div>
+      </div>
+
+      <div class="forge-actions">
+        <button id="forge-btn-validate" type="button" class="btn btn-ghost forge-touch-btn">VALIDAR MEU TEMA</button>
+        <button id="forge-btn-bundle" type="button" class="btn btn-ghost forge-touch-btn">EXPORTAR RECURSOS</button>
+        <button id="forge-btn-pkg" type="button" class="btn btn-primary forge-touch-btn">GERAR PKG</button>
+        <a id="forge-btn-download-pkg" class="btn btn-ghost forge-touch-btn is-disabled" aria-disabled="true" download>BAIXAR PKG</a>
+        <button id="forge-btn-report" type="button" class="btn btn-ghost forge-touch-btn" disabled>VER RELATÓRIO</button>
+      </div>
+
+      <div id="forge-progress-box" class="forge-progress-box" hidden>
+        <div class="forge-progress-head">
+          <span id="forge-progress-stage">Preparando…</span>
+          <b id="forge-progress-pct">0%</b>
+        </div>
+        <progress id="forge-progress-bar" max="100" value="0"></progress>
+        <div class="forge-progress-foot">
+          <span id="forge-progress-elapsed" class="dim">0.0s</span>
+          <button id="forge-btn-cancel-pkg" type="button" class="btn btn-ghost">Cancelar empacotamento</button>
+        </div>
+      </div>
+
+      <p class="ctl-note" id="forge-physical-note" style="margin:10px 0 0">
+        <b>Nota de compatibilidade física:</b> a validação automatizada em Linux comprova estrutura, metadados, <code>IRO_TAG=2</code>, digests e hashes; a instalação real permanece <b>PENDENTE DE TESTE FÍSICO</b> no PS4 Slim (firmware 12.52).
+      </p>
+    </div>
+
     <div class="workspace">
       <div class="stage-col">
+
+        <div id="forge-validation-box" class="card" hidden></div>
+
+        <div id="pkg-result" class="card" hidden></div>
+
+        <div id="forge-history-card" class="card" hidden>
+          <h2 class="card-title">Pacotes gerados neste projeto</h2>
+          <div id="forge-history-list" class="forge-history-list"></div>
+        </div>
 
         <div class="card">
           <h2 class="card-title" data-i18n="pkg.assets"></h2>
@@ -539,8 +593,6 @@
           <p class="card-note" style="margin-top:0" data-i18n="pkg.contents.note"></p>
           <div class="tree" id="pkg-tree"></div>
         </div>
-
-        <div id="pkg-result" class="card" hidden></div>
       </div>
 
       <aside class="controls">
@@ -597,6 +649,14 @@
 </main>
 
 <div id="toast" class="toast" hidden></div>
+
+<dialog id="forge-report-dialog" class="forge-dialog" aria-labelledby="forge-report-title">
+  <div class="library-asset-head">
+    <h2 id="forge-report-title">Relatório Técnico — CZAR FORGE</h2>
+    <form method="dialog"><button type="submit" class="btn btn-ghost">Fechar</button></form>
+  </div>
+  <div id="forge-report-body" class="forge-report-body"></div>
+</dialog>
 
 <dialog id="library-asset" aria-labelledby="library-title">
   <div class="library-asset-head">

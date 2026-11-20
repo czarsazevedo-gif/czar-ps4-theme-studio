@@ -197,5 +197,14 @@ const Projects = (() => {
     event.returnValue = "";
   });
 
-  return { id, boot, changed, mediaUrl, fetchMedia };
+  async function flush() {
+    if (!id || !manifest) return true;
+    changed();
+    while (pending || saving) {
+      if (!await save()) return false;
+    }
+    return true;
+  }
+
+  return { id, boot, changed, flush, mediaUrl, fetchMedia };
 })();

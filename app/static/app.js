@@ -86,7 +86,7 @@ document.querySelectorAll(".tab").forEach((tab) => {
       Compositor.leavePreview();
     }
     // These three depend on what was done in the other tabs.
-    if (tab.dataset.tab === "package") { refreshChecklist(); renderTree(); }
+    if (tab.dataset.tab === "package") { refreshChecklist(); renderTree(); forgeLoadHistory(); }
     if (tab.dataset.tab === "preview") renderPreview();
     if (tab.dataset.tab === "compositor") Compositor.activate();
   });
@@ -1396,12 +1396,463 @@ function refreshChecklist() {
       </li>`)
     .join("");
 
-  $("pkg-build").disabled = !home || !sys.pkg_tools;
+  $("pkg-build").disabled = !home || !sys.pkg_tools || forgeState.busy;
   $("pkg-assets").hidden = !Projects.id;
-  $("pkg-assets").disabled = !home;
+  $("pkg-assets").disabled = !home || forgeState.busy;
   $("pkg-hint").textContent = t(
     !sys.pkg_tools ? "pkg.hint.noTools"
       : home ? "pkg.hint.ready" : "pkg.hint.needHome");
+
+  forgeRefreshSummary({ home, fondos, fn, ct, nSfx });
+}
+
+/* ================= CZAR FORGE — VALIDAÇÃO, BUNDLE E PKG ================= */
+
+const forgeState = {
+  busy: false,
+  activeTaskId: null,
+  pollTimer: null,
+  lastValidation: null,
+  lastBundle: null,
+  lastPkg: null,
+  history: [],
+};
+
+function forgeEsc(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function forgeSetStatus(state) {
+  const badge = $("forge-status-badge");
+  if (!badge) return;
+  const clsMap = {
+    "PRONTO": "is-ready",
+    "PROCESSANDO": "is-busy",
+    "VALIDANDO": "is-busy",
+    "CONCLUÍDO": "is-ok",
+    "FALHOU": "is-fail",
+    "PENDENTE DE TESTE FÍSICO": "is-pending",
+  };
+  badge.textContent = state;
+  badge.dataset.state = state;
+  badge.className = `forge-badge ${clsMap[state] || "is-ready"}`;
+}
+
+function forgeSetCard(cardName, text, tone = "") {
+  const el = $(`forge-sum-${cardName}`);
+  if (!el) return;
+  el.textContent = text;
+  const box = el.closest(".forge-stat");
+  if (box) {
+    box.classList.remove("is-ok", "is-warn", "is-fail");
+    if (tone) box.classList.add(tone);
+  }
+}
+
+function forgeRefreshSummary(counts) {
+  if (!$("forge-summary-grid")) return;
+  const home = counts.home;
+  forgeSetCard("media", home ? `${counts.fondos} fundo(s)` : "Falta imagem inicial", home ? "is-ok" : "is-warn");
+  forgeSetCard(
+    "animated",
+    animActive() ? `${anim.frameCount} quadros · ${anim.wait.toFixed(2)}s` : (bgMode() === "animated" ? "Aguardando vídeo" : "Estático"),
+    animActive() ? "is-ok" : "",
+  );
+  forgeSetCard("icons", `${counts.fn}/9 func · ${counts.ct}/10 cont`, (counts.fn || counts.ct) ? "is-ok" : "");
+  forgeSetCard("music", bgm.jobId ? "ATRAC9 144 kbps" : "Sem música", bgm.jobId ? "is-ok" : "");
+  forgeSetCard("sfx", counts.nSfx ? `${counts.nSfx}/3 VAG` : "Padrão PS4", counts.nSfx ? "is-ok" : "");
+
+  if (forgeState.lastValidation) {
+    const v = forgeState.lastValidation;
+    const fc = (v.files || []).length;
+    forgeSetCard(
+      "validation",
+      v.valid ? `Aprovado (${fc} arq.)` : `${(v.errors || []).length} erro(s)`,
+      v.valid ? "is-ok" : "is-fail",
+    );
+  } else {
+    forgeSetCard("validation", "Não executada", "");
+  }
+
+  if (forgeState.lastBundle) {
+    forgeSetCard("bundle", `ZIP · ${fmtBytes(forgeState.lastBundle.bytes)}`, "is-ok");
+  } else {
+    forgeSetCard("bundle", home ? "Pronto para exportar" : "Aguardando tema", "");
+  }
+
+  if (forgeState.lastPkg) {
+    const pr = forgeState.lastPkg.pkg_report;
+    const valid = pr?.structure_validated;
+    forgeSetCard(
+      "pkg",
+      valid ? `${fmtBytes(forgeState.lastPkg.pkg_bytes)} · Validado` : "Falhou",
+      valid ? "is-ok" : "is-fail",
+    );
+  } else {
+    forgeSetCard("pkg", sys.pkg_tools ? "Pronto para gerar" : "Empacotador ausente", sys.pkg_tools ? "" : "is-warn");
+  }
+
+  const busy = forgeState.busy;
+  if ($("forge-btn-validate")) $("forge-btn-validate").disabled = !home || busy;
+  if ($("forge-btn-bundle")) $("forge-btn-bundle").disabled = !home || busy;
+  if ($("forge-btn-pkg")) $("forge-btn-pkg").disabled = !home || !sys.pkg_tools || busy;
+
+  const dl = $("forge-btn-download-pkg");
+  const rep = $("forge-btn-report");
+  const hasPkg = Boolean(forgeState.lastPkg && forgeState.lastPkg.download);
+  if (dl) {
+    if (hasPkg && !busy) {
+      dl.href = Projects.mediaUrl(forgeState.lastPkg.download);
+      dl.download = forgeState.lastPkg.pkg_name || "tema-ps4.pkg";
+      dl.classList.remove("is-disabled");
+      dl.removeAttribute("aria-disabled");
+    } else {
+      dl.removeAttribute("href");
+      dl.classList.add("is-disabled");
+      dl.setAttribute("aria-disabled", "true");
+    }
+  }
+  if (rep) rep.disabled = (!hasPkg && !forgeState.lastValidation) || busy;
+}
+
+function forgeBuildFormData(useSaved) {
+  const fd = new FormData();
+  fd.append("use_saved_project", useSaved ? "true" : "false");
+  fd.append("title", $("pkg-title").value.trim());
+  fd.append("title_id", $("pkg-title-id").value.trim().toUpperCase());
+  fd.append("content_id", $("pkg-content-id").value.trim().toUpperCase());
+  fd.append("category", pkg.defaults?.defaults?.category || "ac");
+  fd.append("passcode", pkg.defaults?.defaults?.passcode || "0".repeat(32));
+  fd.append("mode", pkg.defaults?.defaults?.mode || "theme");
+  fd.append("slots", JSON.stringify(slots.chosen));
+  fd.append("animated_job", animActive() ? anim.jobId : "");
+  fd.append("audio_job", bgm.jobId || "");
+  fd.append("sfx", JSON.stringify(sfx.chosen));
+  fd.append("frames", String(anim.frameCount));
+  fd.append("wait_seconds", String(anim.wait));
+  fd.append("backend", $("anim-backend").value || sys.default_backend);
+  fd.append("themecolor", $("pkg-themecolor").value);
+  fd.append("fontcolor", hexToArgb($("pkg-fontcolor").value));
+  fd.append("fontshadowcolor", hexToArgb($("pkg-fontshadow").value));
+  fd.append("focuscolor", hexToArgb($("pkg-focuscolor").value));
+  appendComposition(fd);
+  return fd;
+}
+
+async function forgeEnsureSaved() {
+  if (!Projects.id) return true;
+  const ok = await Projects.flush();
+  if (!ok) {
+    toast("Não foi possível salvar o projeto antes da operação. Resolva o conflito e tente novamente.");
+  }
+  return ok;
+}
+
+function forgeRenderValidation(report) {
+  const box = $("forge-validation-box");
+  if (!box || !report) return;
+  const files = report.files || [];
+  const totalBytes = files.reduce((acc, f) => acc + (f.bytes || 0), 0);
+  const items = (report.checks || []).map((it) => {
+    const ok = it.status === "pass" || it.status === "ok";
+    const cls = ok ? "is-ok" : it.status === "warn" ? "is-warn" : "is-fail";
+    const mark = ok ? "✓" : it.status === "warn" ? "!" : "✕";
+    return `<li class="forge-val-item ${cls}">
+      <span><b>${mark} ${forgeEsc(it.label || it.category)}</b> — ${forgeEsc(it.detail || "")}</span>
+      <code class="dim">${forgeEsc(it.path || "")}</code>
+    </li>`;
+  }).join("");
+  const errs = (report.errors || []).map((e) => `<li>${forgeEsc(e)}</li>`).join("");
+  const warns = (report.warnings || []).map((w) => `<li>${forgeEsc(w)}</li>`).join("");
+  box.hidden = false;
+  box.innerHTML = `
+    <h2 class="card-title">${report.valid ? "Validação do tema aprovada" : "Validação encontrou problemas"} · ${files.length} arquivos (${fmtBytes(totalBytes)})</h2>
+    ${errs ? `<div class="notice notice-warn"><b>Erros:</b><ul>${errs}</ul></div>` : ""}
+    ${warns ? `<p class="card-note"><b>Avisos:</b> <ul>${warns}</ul></p>` : ""}
+    <ul class="forge-val-list">${items}</ul>
+  `;
+}
+
+async function forgeValidateTheme() {
+  if (forgeState.busy) return;
+  if (!(await forgeEnsureSaved())) return;
+  forgeState.busy = true;
+  forgeSetStatus("VALIDANDO");
+  refreshChecklist();
+  try {
+    const fd = forgeBuildFormData(Boolean(Projects.id));
+    const res = await api("/api/forge/validate", { method: "POST", body: fd });
+    const report = res.report || res;
+    forgeState.lastValidation = report;
+    forgeRenderValidation(report);
+    forgeSetStatus(report.valid ? "CONCLUÍDO" : "FALHOU");
+    toast(report.valid ? "Tema validado com sucesso." : `Validação falhou (${(report.errors || []).length} erro(s)).`, report.valid ? "ok" : "");
+  } catch (err) {
+    forgeSetStatus("FALHOU");
+    toast(err.message);
+  } finally {
+    forgeState.busy = false;
+    refreshChecklist();
+  }
+}
+
+async function forgeExportBundle() {
+  if (forgeState.busy) return;
+  if (!(await forgeEnsureSaved())) return;
+  forgeState.busy = true;
+  forgeSetStatus("PROCESSANDO");
+  refreshChecklist();
+  try {
+    const fd = forgeBuildFormData(Boolean(Projects.id));
+    const r = await api("/api/forge/bundle/export", { method: "POST", body: fd });
+    forgeState.lastBundle = r;
+    if (r.report) {
+      forgeState.lastValidation = r.report;
+      forgeRenderValidation(r.report);
+    }
+    const dlUrl = Projects.mediaUrl(r.download);
+    const fname = r.filename || "tema-bundle.zip";
+    $("pkg-result").hidden = false;
+    $("pkg-result").innerHTML = `
+      <h2 class="card-title">Bundle validado pronto · ${fmtBytes(r.bytes)}</h2>
+      <p class="card-note">Contém <code>Image0/</code>, <code>Sc0/param.sfo</code> (<code>IRO_TAG=2 · CATEGORY=ac</code>), <code>Sc0/icon0.png</code>, <code>Sc0/pic1.png</code>, <code>theme.gp4</code> e <code>forge-bundle-report.json</code>.</p>
+      <a class="dl-btn" style="margin-top:10px" href="${dlUrl}" download="${forgeEsc(fname)}">Baixar recursos validados (ZIP)</a>`;
+    forgeSetStatus("CONCLUÍDO");
+    toast(`Bundle exportado (${fmtBytes(r.bytes)}).`, "ok");
+  } catch (err) {
+    forgeSetStatus("FALHOU");
+    toast(err.message);
+  } finally {
+    forgeState.busy = false;
+    refreshChecklist();
+  }
+}
+
+function forgeRenderPkgResult(record) {
+  const pr = record.pkg_report || {};
+  const valid = Boolean(pr.structure_validated);
+  const dlUrl = Projects.mediaUrl(record.download || `/api/forge/pkg/${record.pkg_id}/download`);
+  $("pkg-result").hidden = false;
+  $("pkg-result").innerHTML = `
+    <h2 class="card-title">${valid ? "PKG PS4 construído e validado" : "PKG com falha de validação"} · ${fmtBytes(record.pkg_bytes || pr.pkg_bytes || 0)}</h2>
+    <div class="forge-report-kv">
+      <div><span>Arquivo</span><code>${forgeEsc(record.pkg_name || "")}</code></div>
+      <div><span>Tipo / Volume</span><b>${forgeEsc(pr.volume_type || "pkg_ps4_theme")}</b></div>
+      <div><span>IRO_TAG</span><b>cabeçalho 0x98 = ${forgeEsc(pr.iro_tag_header)} · SFO = ${forgeEsc(pr.iro_tag_sfo)}</b></div>
+      <div><span>CATEGORY</span><b>${forgeEsc(pr.category || "ac")}</b></div>
+      <div><span>bgmhome_loud</span><b>${pr.bgmhome_loud ? `${forgeEsc(pr.bgmhome_loud)} LKFS` : "Não aplicável (sem música)"}</b></div>
+      <div><span>Compatibilidade física</span><b>PENDENTE DE TESTE FÍSICO (PS4 Slim 12.52)</b></div>
+    </div>
+    <div class="forge-actions" style="margin-top:12px">
+      <a class="dl-btn" href="${dlUrl}" download="${forgeEsc(record.pkg_name || "tema-ps4.pkg")}">BAIXAR PKG</a>
+      <button type="button" class="btn btn-ghost" onclick="forgeOpenReport('${forgeEsc(record.pkg_id || "")}')">VER RELATÓRIO COMPLETO</button>
+    </div>`;
+}
+
+async function forgePollPkg(taskId) {
+  try {
+    const d = await api(`/api/forge/pkg/jobs/${encodeURIComponent(taskId)}`);
+    if ($("forge-progress-stage")) $("forge-progress-stage").textContent = d.stage || "Processando…";
+    if ($("forge-progress-pct")) $("forge-progress-pct").textContent = `${d.percent ?? 0}%`;
+    if ($("forge-progress-bar")) $("forge-progress-bar").value = d.percent ?? 0;
+    if ($("forge-progress-elapsed")) $("forge-progress-elapsed").textContent = `${(d.elapsed ?? 0).toFixed(1)}s`;
+
+    if (d.status === "queued" || d.status === "running") {
+      if ((d.percent ?? 0) >= 70 || (d.stage || "").toLowerCase().includes("validando")) {
+        forgeSetStatus("VALIDANDO");
+      } else {
+        forgeSetStatus("PROCESSANDO");
+      }
+      forgeState.pollTimer = setTimeout(() => forgePollPkg(taskId), 400);
+      return;
+    }
+
+    forgeState.busy = false;
+    forgeState.activeTaskId = null;
+    if ($("forge-progress-box")) $("forge-progress-box").hidden = true;
+
+    if (d.status === "completed") {
+      forgeState.lastPkg = d;
+      if (d.bundle_report) {
+        forgeState.lastValidation = d.bundle_report;
+        forgeRenderValidation(d.bundle_report);
+      }
+      forgeRenderPkgResult(d);
+      forgeSetStatus("PENDENTE DE TESTE FÍSICO");
+      toast(`PKG pronto (${fmtBytes(d.pkg_bytes || 0)}) · Pendente de teste físico no PS4.`, "ok");
+      await forgeLoadHistory();
+    } else if (d.status === "cancelled") {
+      forgeSetStatus("PRONTO");
+      toast("Empacotamento PKG cancelado.");
+    } else {
+      forgeSetStatus("FALHOU");
+      $("pkg-result").hidden = false;
+      $("pkg-result").innerHTML = `<h2 class="card-title">Falha ao gerar PKG</h2><p class="card-note">${forgeEsc(d.error || "Erro desconhecido.")}</p>`;
+      toast(d.error || "Falha ao gerar PKG.");
+    }
+    refreshChecklist();
+  } catch (err) {
+    forgeState.busy = false;
+    forgeState.activeTaskId = null;
+    if ($("forge-progress-box")) $("forge-progress-box").hidden = true;
+    forgeSetStatus("FALHOU");
+    toast(err.message);
+    refreshChecklist();
+  }
+}
+
+async function forgeBuildPkg() {
+  if (forgeState.busy) return;
+  if (!(await forgeEnsureSaved())) return;
+  forgeState.busy = true;
+  forgeSetStatus("PROCESSANDO");
+  if ($("forge-progress-box")) {
+    $("forge-progress-box").hidden = false;
+    $("forge-progress-stage").textContent = "Iniciando empacotamento PKG…";
+    $("forge-progress-pct").textContent = "5%";
+    $("forge-progress-bar").value = 5;
+    $("forge-progress-elapsed").textContent = "0.0s";
+  }
+  refreshChecklist();
+  try {
+    const fd = forgeBuildFormData(Boolean(Projects.id));
+    const launch = await api("/api/forge/pkg/build", { method: "POST", body: fd });
+    forgeState.activeTaskId = launch.task_id;
+    forgePollPkg(launch.task_id);
+  } catch (err) {
+    forgeState.busy = false;
+    if ($("forge-progress-box")) $("forge-progress-box").hidden = true;
+    forgeSetStatus("FALHOU");
+    toast(err.message);
+    refreshChecklist();
+  }
+}
+
+async function forgeCancelPkg() {
+  if (!forgeState.activeTaskId) return;
+  try {
+    await api(`/api/forge/pkg/jobs/${encodeURIComponent(forgeState.activeTaskId)}/cancel`, { method: "POST" });
+    toast("Solicitação de cancelamento enviada.");
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+async function forgeLoadHistory() {
+  if (!$("forge-history-card")) return;
+  try {
+    const d = await api("/api/forge/pkg/history");
+    const items = d.items || [];
+    forgeState.history = items;
+    if (!items.length) {
+      $("forge-history-card").hidden = true;
+      return;
+    }
+    $("forge-history-card").hidden = false;
+    $("forge-history-list").innerHTML = items.map((it) => `
+      <div class="forge-history-row">
+        <div>
+          <b><code>${forgeEsc(it.pkg_name)}</code></b>
+          <div class="dim" style="font-size:12px">
+            ${fmtBytes(it.pkg_bytes || 0)} · IRO_TAG ${forgeEsc(it.iro_tag_header)}/${forgeEsc(it.iro_tag_sfo)} · CATEGORY ${forgeEsc(it.category || "ac")} · ${it.structure_validated ? "Validado" : "Falhou"} · Pendente de teste físico
+          </div>
+        </div>
+        <div class="forge-history-actions">
+          <a class="btn btn-ghost" href="${Projects.mediaUrl(it.download)}" download="${forgeEsc(it.pkg_name)}">Baixar</a>
+          <button type="button" class="btn btn-ghost" onclick="forgeOpenReport('${forgeEsc(it.pkg_id)}')">Relatório</button>
+        </div>
+      </div>`).join("");
+
+    if (!forgeState.lastPkg && items[0]?.pkg_id) {
+      try {
+        const rep = await api(`/api/forge/pkg/${encodeURIComponent(items[0].pkg_id)}/report`);
+        forgeState.lastPkg = {
+          ...rep,
+          download: items[0].download,
+          report_url: items[0].report_url,
+        };
+        if (rep.bundle_report) forgeState.lastValidation = rep.bundle_report;
+        if (rep.pkg_report?.structure_validated && !forgeState.busy) {
+          forgeSetStatus("PENDENTE DE TESTE FÍSICO");
+        }
+        refreshChecklist();
+      } catch { /* ignore transient history report fetch */ }
+    }
+  } catch { /* standalone or uninitialized workspace */ }
+}
+
+async function forgeOpenReport(pkgId = "") {
+  const dlg = $("forge-report-dialog");
+  const body = $("forge-report-body");
+  if (!dlg || !body) return;
+
+  let record = forgeState.lastPkg;
+  if (pkgId && (!record || record.pkg_id !== pkgId)) {
+    try {
+      record = await api(`/api/forge/pkg/${encodeURIComponent(pkgId)}/report`);
+    } catch (err) {
+      toast(err.message);
+      return;
+    }
+  }
+
+  const pr = record?.pkg_report;
+  const br = record?.bundle_report || forgeState.lastValidation;
+  const parts = [];
+
+  if (pr) {
+    const rows = (pr.files || []).map((f) => `
+      <tr>
+        <td><code>${forgeEsc(f.partition || "")}</code></td>
+        <td><code>${forgeEsc(f.path)}</code></td>
+        <td>${fmtBytes(f.bytes || 0)}</td>
+        <td><code>${forgeEsc((f.sha256 || "").slice(0, 16))}…</code></td>
+      </tr>`).join("");
+    parts.push(`
+      <div class="forge-report-kv">
+        <div><span>PKG CRIADO</span><b>${pr.pkg_created ? "Sim" : "Não"}</b></div>
+        <div><span>ESTRUTURA VALIDADA</span><b>${pr.structure_validated ? "Sim" : "Não"}</b></div>
+        <div><span>TIPO DE TEMA</span><b>${forgeEsc(pr.volume_type)}</b></div>
+        <div><span>CONTENT_ID</span><code>${forgeEsc(pr.content_id)}</code></div>
+        <div><span>TITLE_ID</span><code>${forgeEsc(pr.title_id)}</code></div>
+        <div><span>IRO_TAG</span><b>Cabeçalho 0x98 = ${forgeEsc(pr.iro_tag_header)} · SFO = ${forgeEsc(pr.iro_tag_sfo)}</b></div>
+        <div><span>CATEGORY</span><b>${forgeEsc(pr.category)}</b></div>
+        <div><span>bgmhome_loud</span><b>${pr.bgmhome_loud ? `${forgeEsc(pr.bgmhome_loud)} LKFS` : "Não aplicável"}</b></div>
+        <div><span>SHA-256 do PKG</span><code>${forgeEsc(pr.pkg_sha256 || "")}</code></div>
+        <div><span>Extração ↔ Bundle (SHA-256)</span><b>${pr.extracted_match ? "100% correspondente" : "Divergente / não extraído"}</b></div>
+        <div><span>Builder / Validador</span><code>${forgeEsc(pr.builder_backend)} / ${forgeEsc(pr.validator_backend)}</code></div>
+        <div><span>COMPATIBILIDADE FÍSICA</span><b>PENDENTE DE TESTE FÍSICO (PS4 Slim 12.52)</b></div>
+      </div>
+      ${(pr.errors || []).length ? `<div class="notice notice-warn"><b>Erros PKG:</b> ${(pr.errors || []).map(forgeEsc).join("; ")}</div>` : ""}
+      ${(pr.warnings || []).length ? `<p class="card-note"><b>Avisos PKG:</b> ${(pr.warnings || []).map(forgeEsc).join("; ")}</p>` : ""}
+      <h3 style="margin:6px 0 0">Arquivos e hashes verificados (${(pr.files || []).length})</h3>
+      <table class="forge-files-table">
+        <thead><tr><th>Partição</th><th>Caminho</th><th>Tamanho</th><th>SHA-256</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `);
+  }
+
+  if (br) {
+    const bFiles = br.files || [];
+    parts.push(`
+      <h3 style="margin:8px 0 0">Validação do Bundle (${br.valid ? "Aprovado" : "Com erros"} · ${bFiles.length} arquivos)</h3>
+      <ul class="forge-val-list">${(br.checks || []).map((it) => {
+        const ok = it.status === "pass" || it.status === "ok";
+        return `<li class="forge-val-item ${ok ? "is-ok" : it.status === "warn" ? "is-warn" : "is-fail"}">
+          <span><b>${forgeEsc(it.label || it.category)}</b> — ${forgeEsc(it.detail || "")}</span>
+          <code>${forgeEsc(it.path || "")}</code>
+        </li>`;
+      }).join("")}</ul>
+    `);
+  }
+
+  body.innerHTML = parts.join("") || `<p class="card-note">Nenhum relatório disponível ainda. Clique em "VALIDAR MEU TEMA" ou "GERAR PKG".</p>`;
+  dlg.showModal();
 }
 
 /** Content tree, built from the slot catalogue.
@@ -1464,73 +1915,10 @@ function appendComposition(fd) {
 
 async function packageBuild(assetsOnly = false) {
   assetsOnly = assetsOnly === true;
-  const btn = $(assetsOnly ? "pkg-assets" : "pkg-build");
-  const original = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = "Empaquetando…";
-  $("pkg-result").hidden = true;
-
-  const fd = new FormData();
-  fd.append("title", $("pkg-title").value.trim());
-  fd.append("title_id", $("pkg-title-id").value.trim().toUpperCase());
-  fd.append("content_id", $("pkg-content-id").value.trim().toUpperCase());
-  fd.append("category", pkg.defaults.defaults.category);
-  // Fixed at 32 zeros: it encrypts the package and does not travel inside it,
-  // so the installer has to take it for granted. See the Package tab note.
-  fd.append("passcode", pkg.defaults.defaults.passcode);
-  fd.append("mode", pkg.defaults.defaults.mode);
-  fd.append("slots", JSON.stringify(slots.chosen));
-  // Only goes into the package when the chosen mode is animated.
-  fd.append("animated_job", animActive() ? anim.jobId : "");
-  fd.append("audio_job", bgm.jobId || "");
-  fd.append("sfx", JSON.stringify(sfx.chosen));
-  fd.append("frames", String(anim.frameCount));
-  fd.append("wait_seconds", String(anim.wait));
-  fd.append("backend", $("anim-backend").value || sys.default_backend);
-  fd.append("themecolor", $("pkg-themecolor").value);
-  fd.append("fontcolor", hexToArgb($("pkg-fontcolor").value));
-  fd.append("fontshadowcolor", hexToArgb($("pkg-fontshadow").value));
-  fd.append("focuscolor", hexToArgb($("pkg-focuscolor").value));
-  appendComposition(fd);
-  if (assetsOnly) fd.append("artifacts_only", "true");
-
-  try {
-    const r = await api("/api/package/build", { method: "POST", body: fd });
-    if (assetsOnly) {
-      const link = document.createElement("a");
-      link.className = "dl-btn";
-      link.href = Projects.mediaUrl(r.download);
-      link.download = "recursos-tema.zip";
-      link.textContent = `Baixar recursos do tema · ${fmtBytes(r.bytes)}`;
-      $("pkg-result").replaceChildren(link);
-      $("pkg-result").hidden = false;
-      return;
-    }
-    const rows = r.included
-      .map((i) => `<div class="result-row"><span>${i.asset}</span><b>${fmtBytes(i.bytes)}</b></div>`)
-      .join("");
-    // The subcommand says more than the exe name, which repeats every time.
-    const steps = r.log
-      .map((s) => {
-        const parts = s.cmd.split(" ");
-        return `<div class="log-step"><b>${s.label}</b><span>${parts[1] || parts[0]}</span><span class="secs">${s.seconds}s</span></div>`;
-      })
-      .join("");
-    $("pkg-result").hidden = false;
-    $("pkg-result").innerHTML = `
-      <h2 class="card-title">${t("pkg.result.ok", { size: fmtBytes(r.pkg_bytes), s: r.elapsed })}</h2>
-      <div class="result-rows">${rows}</div>
-      <div class="log">${steps}</div>
-      <p class="card-note"><code>${r.pkg_name}</code></p>
-      <a class="dl-btn" style="margin-top:14px" href="${Projects.mediaUrl(r.download)}" download>${t("pkg.download")}</a>`;
-    toast(t("pkg.result.ok", { size: fmtBytes(r.pkg_bytes), s: r.elapsed }), "ok");
-  } catch (err) {
-    toast(err.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = original;
-    refreshChecklist();
+  if (assetsOnly) {
+    return forgeExportBundle();
   }
+  return forgeBuildPkg();
 }
 
 async function bootPackage() {
@@ -1579,8 +1967,13 @@ async function bootPackage() {
   $("pkg-title").addEventListener("input", syncContentId);
   $("pkg-title-id").addEventListener("input", syncContentId);
   $("pkg-content-id").addEventListener("input", () => { pkg.contentIdTouched = true; });
-  $("pkg-build").addEventListener("click", packageBuild);
-  $("pkg-assets").addEventListener("click", () => packageBuild(true));
+  $("pkg-build").addEventListener("click", () => forgeBuildPkg());
+  $("pkg-assets").addEventListener("click", () => forgeExportBundle());
+  $("forge-btn-validate")?.addEventListener("click", () => forgeValidateTheme());
+  $("forge-btn-bundle")?.addEventListener("click", () => forgeExportBundle());
+  $("forge-btn-pkg")?.addEventListener("click", () => forgeBuildPkg());
+  $("forge-btn-report")?.addEventListener("click", () => forgeOpenReport());
+  $("forge-btn-cancel-pkg")?.addEventListener("click", () => forgeCancelPkg());
 }
 
 
@@ -1698,6 +2091,7 @@ async function boot() {
   await Projects.boot();
   Library.boot();
   Compositor.boot();
+  forgeLoadHistory();
 }
 
 /* ------------------------------------------------------------ listeners */
