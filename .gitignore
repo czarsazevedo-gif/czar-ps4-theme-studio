@@ -26,6 +26,10 @@
 /tools/*.exe
 /tools/*.dll
 /tools/ext/
+/tools/bin/
+/tools/src/
+/tools/dotnet/
+
 
 # --- Python ---------------------------------------------------------------
 __pycache__/
