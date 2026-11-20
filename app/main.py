@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict
 from . import at9, compositor, jobs, library, mdx, media, ouroboros, pkg, projects, raf, theme, theme_xml, vag
 from .forge import audio_router as forge_audio
 from .forge import bundle_service as forge_bundle
+from .forge import pkg_forge, pkg_router as forge_pkg, sfo as forge_sfo
 from .forge.audio_validation import measure_loudness, validate_at9
 from .config import (
     ANIMATED_FRAME_BYTES,
@@ -69,6 +70,7 @@ app.include_router(compositor.router)
 app.include_router(ouroboros.router)
 app.include_router(forge_audio.router)
 app.include_router(forge_bundle.router)
+app.include_router(forge_pkg.router)
 
 #: The UI used to allow going over the cap "so the red bar could be seen".
 #: That let you assemble a theme the console rejects with CE-38196-7, so it no
@@ -164,7 +166,8 @@ def system_info() -> dict:
         "ffmpeg": bool(media.FFMPEG),
         "ffprobe": bool(media.FFPROBE),
         "magick": bool(media.MAGICK),
-        "pkg_tools": pkg.tools_available(),
+        "pkg_tools": pkg.tools_available() or pkg_forge.pkg_forge_info()["available"],
+        "pkg_forge": pkg_forge.pkg_forge_info(),
         "at9tool": at9.available(),
         "at9_encoder": at9.encoder_info(),
         "min_gain_db": MIN_GAIN_DB,
@@ -1222,8 +1225,10 @@ def _collect_theme_assets(
 
 @app.get("/api/package/defaults")
 def package_defaults() -> dict:
+    forge_info = pkg_forge.pkg_forge_info()
     return {
-        "available": pkg.tools_available(),
+        "available": pkg.tools_available() or forge_info["available"],
+        "pkg_forge": forge_info,
         "tools_dir": str(pkg.PKG_TOOLS_DIR),
         "defaults": {
             "title": "Mi Tema",
@@ -1361,6 +1366,7 @@ async def package_build(
             mode=mode.strip().lower(),
             bgm_loudness=bgm_loudness,
         )
+        meta.validate()
     except pkg.PackageError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -1370,6 +1376,8 @@ async def package_build(
     content_dir.mkdir(parents=True, exist_ok=True)
 
     started = time.time()
+    pkg_report_dict = None
+    log_steps: list[dict] = []
     try:
         included = _collect_theme_assets(
             slot_jobs, theme_settings, content_dir, audio_job=audio_job,
@@ -1391,13 +1399,40 @@ async def package_build(
                 "download": f"/api/package/{build_job.id}/assets",
                 "included": included, "bytes": archive.stat().st_size,
             }
-        pkg_path, log = pkg.build_package(work_dir, content_dir, meta)
-    except (pkg.PackageError, theme_xml.ThemeXmlError) as exc:
+        if pkg.tools_available():
+            pkg_path, log = pkg.build_package(work_dir, content_dir, meta)
+            log_steps = log.steps
+        elif pkg_forge.pkg_forge_info()["available"]:
+            sce_sys = content_dir / "sce_sys"
+            sce_sys.mkdir(parents=True, exist_ok=True)
+            (sce_sys / "param.sfo").write_bytes(forge_sfo.build_param_sfo_bytes(meta))
+            targets = sorted(
+                p.relative_to(content_dir).as_posix()
+                for p in content_dir.rglob("*") if p.is_file()
+            )
+            gp4_path = work_dir / "theme.gp4"
+            gp4_path.write_text(pkg.build_gp4(meta, targets, content_dir.name), encoding="utf-8")
+            pkg_path, _b_rep, p_rep, forge_steps = pkg_forge.build_and_validate_theme_pkg(
+                content_dir, gp4_path, meta, work_dir / "pkg"
+            )
+            pkg_report_dict = p_rep.model_dump()
+            log_steps = [
+                {"label": s["label"], "cmd": s["label"], "output": s["detail"], "seconds": s["seconds"]}
+                for s in forge_steps
+            ]
+        else:
+            raise pkg.PackageError(
+                "Empacotador PKG não encontrado. Execute ./scripts/install_forge_tools.sh pkg "
+                "para instalar o empacotador nativo Linux."
+            )
+    except (pkg.PackageError, pkg_forge.PkgForgeError, theme_xml.ThemeXmlError) as exc:
         raise HTTPException(422, str(exc)) from exc
     except OSError as exc:
         raise HTTPException(503, "Não foi possível gravar os recursos do tema.") from exc
 
     build_job.meta["pkg"] = pkg_path.name
+    if pkg_report_dict is not None:
+        build_job.meta["pkg_report"] = pkg_report_dict
     build_job.save()
 
     return {
@@ -1412,7 +1447,8 @@ async def package_build(
         "mode": meta.mode,
         "volume_type": meta.profile["volume_type"],
         "iro_tag": meta.profile["iro_tag"],
-        "log": log.steps,
+        "log": log_steps,
+        "pkg_report": pkg_report_dict,
     }
 
 
