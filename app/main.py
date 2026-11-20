@@ -191,9 +191,19 @@ def system_info() -> dict:
 def _build_animated_preview(job: jobs.Job, frame_count: int,
                             size: tuple[int, int] = ANIMATED_SIZE) -> dict:
     info = media.probe(job.source)
-    frames = media.extract_preview_frames(
-        job.source, job.preview_dir, frame_count, size, info.duration
+    deluxe = job.meta.get("deluxe")
+    reuse_deluxe = (
+        isinstance(deluxe, dict)
+        and deluxe.get("frames") == frame_count
+        and list(deluxe.get("size") or []) == list(size)
+        and all((job.preview_dir / f"{i:02d}.webp").is_file() for i in range(frame_count))
     )
+    if reuse_deluxe:
+        frames = [job.preview_dir / f"{i:02d}.webp" for i in range(frame_count)]
+    else:
+        frames = media.extract_preview_frames(
+            job.source, job.preview_dir, frame_count, size, info.duration
+        )
     job.meta["size"] = list(size)
 
     job.meta.update(
@@ -202,7 +212,7 @@ def _build_animated_preview(job: jobs.Job, frame_count: int,
             "duration": info.duration,
             "source_size": [info.width, info.height],
             "codec": info.codec,
-            "fps_used": media.extraction_fps(frame_count, info.duration),
+            "fps_used": (1.0 / float(deluxe["wait"])) if reuse_deluxe else media.extraction_fps(frame_count, info.duration),
         }
     )
     job.save()
@@ -327,18 +337,61 @@ def _write_raf_export(job, destination, frame_count, size, wait, backend, overla
             stale.unlink()
     raf_dir.mkdir(parents=True, exist_ok=True)
 
-    info = media.probe(job.source)
     total_bytes = 0
     written = 0
-
-    frames_in = media.iter_raw_frames(job.source, frame_count, size, info.duration)
     names: list[str] = []
-    for index, blob in encode_sequence(compositor.compose_frames(frames_in, overlay), backend):
-        name = theme.frame_name(index)
-        (raf_dir / name).write_bytes(blob)
-        names.append(name)
-        total_bytes += len(blob)
-        written += 1
+
+    deluxe = job.meta.get("deluxe")
+    deluxe_match = (
+        isinstance(deluxe, dict)
+        and deluxe.get("frames") == frame_count
+        and list(deluxe.get("size") or []) == list(size)
+    )
+    dds_dir = job.root / "deluxe_dds"
+    png_dir = job.root / "deluxe_frames"
+
+    if (
+        deluxe_match
+        and overlay is None
+        and backend == DEFAULT_BACKEND
+        and dds_dir.is_dir()
+        and all((dds_dir / theme.frame_name(i)).is_file() for i in range(frame_count))
+    ):
+        for index in range(frame_count):
+            name = theme.frame_name(index)
+            blob = (dds_dir / name).read_bytes()
+            (raf_dir / name).write_bytes(blob)
+            names.append(name)
+            total_bytes += len(blob)
+            written += 1
+    elif (
+        deluxe_match
+        and png_dir.is_dir()
+        and all((png_dir / f"{i:02d}.png").is_file() for i in range(frame_count))
+    ):
+        from PIL import Image
+        import numpy as np
+
+        def _deluxe_rgba():
+            for index in range(frame_count):
+                with Image.open(png_dir / f"{index:02d}.png") as im:
+                    yield np.asarray(im.convert("RGBA"))
+
+        for index, blob in encode_sequence(compositor.compose_frames(_deluxe_rgba(), overlay), backend):
+            name = theme.frame_name(index)
+            (raf_dir / name).write_bytes(blob)
+            names.append(name)
+            total_bytes += len(blob)
+            written += 1
+    else:
+        info = media.probe(job.source)
+        frames_in = media.iter_raw_frames(job.source, frame_count, size, info.duration)
+        for index, blob in encode_sequence(compositor.compose_frames(frames_in, overlay), backend):
+            name = theme.frame_name(index)
+            (raf_dir / name).write_bytes(blob)
+            names.append(name)
+            total_bytes += len(blob)
+            written += 1
 
     if written != frame_count:
         raise HTTPException(500, f"Expected {frame_count} frames but wrote {written}.")

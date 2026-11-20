@@ -3,86 +3,199 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Diagnóstico de loops · Czar PS4 Theme Studio</title>
+    <title>Ouroboros Cinematic Deluxe · Czar PS4 Theme Studio</title>
     <link rel="stylesheet" href="/static/style.css" />
     <link rel="stylesheet" href="/static/ouroboros.css" />
   </head>
   <body>
     <main class="diagnostic">
-      <header>
+      <header class="dlx-header">
         <a id="back" href="/">Voltar ao editor</a>
-        <h1>Diagnóstico de loops</h1>
+        <h1>Ouroboros Cinematic Deluxe</h1>
       </header>
+
       <section>
-        <label
-          >Projeto
-          <select id="project"></select></label
-        ><label
-          >Vídeo importado
-          <select id="video"></select></label
-        ><button id="run" disabled>Analisar movimento e ciclos</button
-        ><button hidden id="cancel">Cancelar</button><progress hidden id="progress" max="100"></progress>
+        <h2>1. Fonte e Diagnóstico</h2>
+        <div class="dlx-row">
+          <label>Projeto <select id="project"></select></label>
+          <label>Vídeo importado <select id="video"></select></label>
+        </div>
+        <div class="dlx-actions">
+          <button id="run" disabled>Analisar movimento e ciclos</button>
+          <button id="deluxe-analyze" disabled class="dlx-primary">Diagnóstico Supreme (A–E)</button>
+          <button hidden id="cancel">Cancelar</button>
+        </div>
+        <progress hidden id="progress" max="100"></progress>
         <p role="status" id="status"></p>
       </section>
+
+      <section hidden id="player">
+        <h2>Prévia dos DDS decodificados (10 ciclos)</h2>
+        <canvas id="player-canvas" aria-label="Quadro do candidato"></canvas>
+        <p id="measurement"></p>
+        <p id="dlx-telemetry" class="dlx-muted"></p>
+        <div class="dlx-actions">
+          <button id="play">Reproduzir</button>
+          <button id="seam">Inspecionar último → primeiro</button>
+          <button id="step">Próximo quadro</button>
+          <button hidden id="dlx-apply" class="dlx-primary">Aplicar ao tema do projeto</button>
+        </div>
+        <p role="status" id="dlx-apply-status"></p>
+        <div hidden id="artifacts">
+          <details id="dlx-compare-details">
+            <summary>Comparar com a fonte (Antes / Depois / Diferenças)</summary>
+            <div class="dlx-compare-grid">
+              <figure>
+                <figcaption>Vídeo original</figcaption>
+                <video id="original" controls playsinline preload="none" width="320" aria-label="Vídeo original"></video>
+              </figure>
+              <figure>
+                <figcaption>Primeiro quadro da fonte</figcaption>
+                <img id="reference" width="320" alt="Primeiro quadro da fonte" />
+              </figure>
+              <figure hidden id="dlx-diff-fig">
+                <figcaption>Mapa de diferenças reais</figcaption>
+                <img id="dlx-diff-img" width="320" alt="Mapa de diferenças após DDS" />
+              </figure>
+            </div>
+            <div id="dlx-metrics-table"></div>
+          </details>
+          <a id="download">Baixar background.raf.zip</a>
+        </div>
+        <output id="counter"></output>
+      </section>
+
+      <section hidden id="deluxe-diag">
+        <h2>Sentinela Supreme (Níveis A–E) e Círculo Supreme</h2>
+        <p id="deluxe-summary"></p>
+        <div id="deluxe-categories" class="dlx-cards"></div>
+        <details>
+          <summary>Relatório completo Sentinela Supreme</summary>
+          <pre id="deluxe-details"></pre>
+        </details>
+      </section>
+
+      <section id="deluxe-studio">
+        <h2>2. Timeline, Calibração Temporal e Render Deluxe</h2>
+        <div class="dlx-timeline-box">
+          <div class="dlx-row">
+            <label>Início (s) <input id="dlx-start" type="number" min="0" step="0.05" value="0" /></label>
+            <label>Fim (s) <input id="dlx-end" type="number" min="0.1" step="0.05" value="1.0" /></label>
+            <label>Zoom temporal <input id="dlx-zoom" type="range" min="1" max="8" step="0.5" value="1" /></label>
+          </div>
+          <p id="dlx-timeline-read" class="dlx-muted"></p>
+          <div class="dlx-actions">
+            <button id="dlx-calibrate" disabled>Calibrar cadência (25–150 ms)</button>
+          </div>
+          <div id="dlx-cal-recs" class="dlx-cards"></div>
+        </div>
+
+        <div class="dlx-row">
+          <label>Estratégia
+            <select id="dlx-mode">
+              <option value="reconstruct_auto" selected>Reconstrução automática (6 níveis)</option>
+              <option value="natural">Corte natural (sem reconstrução)</option>
+              <option value="photometric">Harmonização fotométrica (Lab)</option>
+              <option value="motion_comp">Compensação de fluxo (frente/trás)</option>
+              <option value="content_bridge">Ponte de peças de transição do conteúdo</option>
+              <option value="genesis_2d">Gênesis Supreme 2D (advecção unidirecional)</option>
+              <option value="regional">Edição regional (máscaras abaixo)</option>
+            </select>
+          </label>
+          <label>Resolução RAF
+            <select id="dlx-res">
+              <option value="0">1280×720 (até 13q)</option>
+              <option value="1">960×540 (até 24q)</option>
+              <option value="2" selected>640×360 (até 48q)</option>
+            </select>
+          </label>
+          <label>Quadros <input id="dlx-frames" type="number" min="4" max="48" value="16" /></label>
+          <label>Espera wait (s) <input id="dlx-wait" type="number" min="0.02" max="5" step="0.001" value="0.067" /></label>
+          <label>Velocidade <input id="dlx-speed" type="number" min="0.25" max="2.5" step="0.05" value="1.0" /></label>
+        </div>
+        <div class="dlx-checks">
+          <label class="dlx-inline"><input id="dlx-finish-toggle" type="checkbox" checked /> Aplicar Ouroboros Deluxe Finish + validação pós-DDS</label>
+          <label class="dlx-inline"><input id="dlx-stab-toggle" type="checkbox" /> Estabilizar câmera móvel</label>
+        </div>
+        <div class="dlx-actions">
+          <button id="dlx-render" disabled class="dlx-primary">Renderizar loop Deluxe + validar DDS</button>
+        </div>
+      </section>
+
+      <section id="deluxe-editor">
+        <h2>3. Cinematic Content Editor · Edição Regional por Toque</h2>
+        <p class="dlx-muted">Desenhe regiões sobre o quadro de referência para proteger áreas estáticas, animar trechos ou remover objetos transitórios.</p>
+        <div class="dlx-row">
+          <label>Ferramenta
+            <select id="dlx-tool">
+              <option value="rect" selected>Retângulo</option>
+              <option value="ellipse">Elipse</option>
+              <option value="brush">Pincel (toque livre)</option>
+            </select>
+          </label>
+          <label>Ação na região
+            <select id="dlx-strategy">
+              <option value="protect" selected>Proteger região (estática)</option>
+              <option value="animate">Animar região (fluxo unidirecional)</option>
+              <option value="remove_transient">Remover objeto transitório</option>
+              <option value="fix_seam">Corrigir costura local</option>
+              <option value="adjust_motion">Ajustar movimento</option>
+            </select>
+          </label>
+          <label>Suavização borda (px) <input id="dlx-feather" type="number" min="0" max="32" value="6" /></label>
+          <label>Velocidade região <input id="dlx-reg-speed" type="number" min="0.1" max="3" step="0.1" value="1.0" /></label>
+        </div>
+        <div class="dlx-actions">
+          <button id="dlx-undo" disabled>Desfazer</button>
+          <button id="dlx-redo" disabled>Refazer</button>
+          <button id="dlx-clear-regions">Limpar regiões</button>
+          <button id="dlx-save-recipe" disabled>Salvar receita no projeto</button>
+        </div>
+        <div class="dlx-editor-stage">
+          <canvas id="dlx-region-canvas" width="640" height="360" aria-label="Editor de máscaras regionais"></canvas>
+        </div>
+        <ul id="dlx-region-list" class="dlx-region-list"></ul>
+        <p role="status" id="dlx-recipe-status"></p>
+      </section>
+
       <section>
-        <h2>Gênesis · síntese circular</h2>
-        <label
-          >Eixo da translação
+        <h2>Gênesis V1 · síntese circular por faixas</h2>
+        <label>Eixo da translação
           <select id="axis">
             <option value="horizontal">Horizontal</option>
             <option value="vertical">Vertical</option>
-          </select></label
-        >
-        <label
-          >Resolução
+          </select>
+        </label>
+        <label>Resolução
           <select id="output">
             <option>1280×720</option>
             <option>960×540</option>
             <option selected>640×360</option>
-          </select></label
-        >
-        <label
-          >Velocidade relativa à fonte
+          </select>
+        </label>
+        <label>Velocidade relativa à fonte
           <select id="rate">
             <option>0.5</option>
             <option selected>1</option>
             <option>2</option>
-          </select></label
-        >
+          </select>
+        </label>
         <button id="synthesize">Sintetizar faixas periódicas</button>
       </section>
+
       <section hidden id="diag">
-        <h2>Sentinela</h2>
+        <h2>Sentinela (Fundação)</h2>
         <p id="summary"></p>
         <details>
           <summary>Indicadores da fonte</summary>
           <pre id="details"></pre>
         </details>
       </section>
+
       <section hidden id="results">
-        <h2>Círculo</h2>
-        <p>
-          Classificação por amostras da fonte. Escolha um trecho para conferir os DDS na resolução de saída.
-        </p>
+        <h2>Círculo (Fundação)</h2>
+        <p>Classificação por amostras da fonte. Escolha um trecho para conferir os DDS na resolução de saída.</p>
         <div id="groups"></div>
-      </section>
-      <section hidden id="player">
-        <h2>Prévia dos DDS decodificados</h2>
-        <canvas aria-label="Quadro do candidato"></canvas>
-        <p id="measurement"></p>
-        <div>
-          <button id="play">Reproduzir</button><button id="seam">Inspecionar último → primeiro</button
-          ><button id="step">Próximo quadro</button>
-        </div>
-        <div hidden id="artifacts">
-          <details>
-            <summary>Comparar com a fonte</summary>
-            <video id="original" controls playsinline preload="none" width="320" aria-label="Vídeo original"></video>
-            <img id="reference" width="320" alt="Primeiro quadro da fonte" />
-          </details>
-          <a id="download">Baixar background.raf.zip</a>
-        </div>
-        <output id="counter"></output>
       </section>
     </main>
     <script src="/static/ouroboros.js"></script>

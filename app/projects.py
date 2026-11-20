@@ -254,6 +254,15 @@ def copy_jobs(source: Path, destination: Path, state: Editor) -> None:
         (target / "preview").mkdir()
         if job.kind == "slot":
             shutil.copyfile(job.preview_dir / "preview.webp", target / "preview" / "preview.webp")
+        if job.kind == "animated" and job.meta.get("deluxe"):
+            for sub in ("preview", "deluxe_frames", "deluxe_dds"):
+                src_sub = job.root / sub
+                if src_sub.is_dir():
+                    dst_sub = target / sub
+                    dst_sub.mkdir(exist_ok=True)
+                    for item_p in src_sub.iterdir():
+                        if item_p.is_file():
+                            shutil.copyfile(item_p, dst_sub / item_p.name)
         if job.kind == "audio" and job.meta.get("converted"):
             name = job.meta["converted"]
             shutil.copyfile(job.out_dir / name, target / "out" / name)

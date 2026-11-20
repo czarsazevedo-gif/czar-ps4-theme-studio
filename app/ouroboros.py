@@ -125,14 +125,26 @@ def healthy(folder, key, check):
         header = json.loads((folder / "report.json").read_bytes())
         if header["key"] != key or header["version"] != VERSION:
             return False
-        if header["type"] == "analysis":
+        kind = header.get("type")
+        if kind == "analysis":
             return len(header["groups"]) == 3 and "sentinela" in header
+        if kind == "deluxe_analysis":
+            return len(header["groups"]) == 3 and "sentinela" in header and "categories" in header
+        if kind == "deluxe_calibrate":
+            return "recommendations" in header and "configurations" in header
         count = header["frames"]
         if not 1 <= count <= 48:
             return False
         names = [f"{i:02d}.webp" for i in range(count)]
-        if header["type"] == "genesis":
+        if kind == "genesis":
             names.extend(["source.png", "background.raf.zip"])
+        elif kind == "deluxe_render":
+            names.extend(["source.png", "diff.png", "background.raf.zip"])
+            for i in range(count):
+                if not (folder / "deluxe_dds" / f"{i:02d}.dds").is_file():
+                    return False
+                if not (folder / "deluxe_frames" / f"{i:02d}.png").is_file():
+                    return False
         for name in names:
             check()
             if media.digest(folder / name, check) != header["files"][name]:
@@ -159,6 +171,9 @@ def execute(task, calculate):
                 if data["type"] == "genesis":
                     for name in ("source.png", "background.raf.zip"):
                         data["files"][name] = media.digest(stage / name, task.check)
+                elif data["type"] == "deluxe_render":
+                    for name in ("source.png", "diff.png", "background.raf.zip"):
+                        data["files"][name] = media.digest(stage / name, task.check)
                 (stage / "report.json").write_text(json.dumps(data, allow_nan=False), encoding="utf-8")
                 with lock:
                     task.check()
@@ -168,6 +183,11 @@ def execute(task, calculate):
                         # Readers see complete files from the same immutable recipe.
                         for name in data.get("files", {}):
                             (stage / name).replace(dest / name)
+                        for sub in ("deluxe_dds", "deluxe_frames"):
+                            if (stage / sub).is_dir():
+                                (dest / sub).mkdir(exist_ok=True)
+                                for item_p in (stage / sub).iterdir():
+                                    item_p.replace(dest / sub / item_p.name)
                         (stage / "report.json").replace(dest / "report.json")
         with lock:
             task.check()
@@ -323,3 +343,8 @@ def genesis_source(request: Request, kind: Literal["animated", "library"], ident
     if not mime:
         raise HTTPException(415, "Use o quadro de referência para comparar este formato.")
     return FileResponse(path, media_type=mime, headers={"X-Content-Type-Options": "nosniff"})
+
+
+from .deluxe.router import router as _deluxe_router  # noqa: E402
+
+router.include_router(_deluxe_router)

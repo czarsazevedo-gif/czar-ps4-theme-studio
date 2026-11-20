@@ -1,26 +1,28 @@
 .diagnostic {
-  width: min(100%, 1050px);
+  width: min(100%, 1120px);
   margin: auto;
-  padding: clamp(12px, 3vw, 32px);
+  padding: clamp(12px, 3vw, 28px);
   color: var(--txt);
+  box-sizing: border-box;
 }
 .diagnostic section {
   background: var(--bg-raised);
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 1rem;
-  margin: 0.8rem 0;
+  margin: 0.85rem 0;
 }
 .diagnostic h1,
 .diagnostic h2,
 .diagnostic h3 {
-  margin: 0.2em 0;
+  margin: 0.2em 0 0.45em;
 }
 .diagnostic a {
   color: #9dddff;
 }
 .diagnostic button,
 .diagnostic select,
+.diagnostic input[type="number"],
 .diagnostic summary,
 .diagnostic header a {
   display: inline-flex;
@@ -34,23 +36,44 @@
   color: var(--txt);
   font: inherit;
   max-width: 100%;
+  box-sizing: border-box;
+}
+.diagnostic button.dlx-primary {
+  background: #1463a8;
+  border-color: #3da0f5;
+  color: #fff;
+  font-weight: 600;
 }
 .diagnostic label,
 .diagnostic output {
   display: block;
+}
+.diagnostic label.dlx-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 44px;
+  margin-right: 1rem;
 }
 .diagnostic canvas {
   display: block;
   width: 100%;
   aspect-ratio: 16/9;
   background: black;
+  border-radius: 8px;
+}
+#dlx-region-canvas {
+  touch-action: none;
+  cursor: crosshair;
+  border: 1px solid var(--line);
 }
 .diagnostic pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 .diagnostic button:focus-visible,
-.diagnostic select:focus-visible {
+.diagnostic select:focus-visible,
+.diagnostic input:focus-visible {
   outline: 3px solid #65c2ff;
 }
 .diagnostic button:disabled {
@@ -66,4 +89,95 @@
 .diagnostic progress {
   width: 100%;
   accent-color: var(--accent);
+}
+.dlx-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+.dlx-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: flex-end;
+  margin-bottom: 0.5rem;
+}
+.dlx-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0.45rem 0;
+}
+.dlx-checks {
+  margin: 0.45rem 0;
+}
+.dlx-muted {
+  opacity: 0.85;
+  font-size: 0.92rem;
+}
+.dlx-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.65rem;
+  margin: 0.6rem 0;
+}
+.dlx-card {
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.7rem;
+}
+.dlx-card h4 {
+  margin: 0 0 0.35rem;
+  font-size: 0.95rem;
+  color: #9dddff;
+}
+.dlx-card p {
+  margin: 0.2rem 0;
+  font-size: 0.88rem;
+}
+.dlx-compare-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 0.6rem 0;
+}
+.dlx-compare-grid figure {
+  margin: 0;
+  max-width: 100%;
+}
+.dlx-compare-grid img,
+.dlx-compare-grid video {
+  max-width: 100%;
+  border-radius: 6px;
+}
+.dlx-region-list {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+.dlx-region-list li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.3rem 0.6rem;
+}
+.dlx-metrics-tbl {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.86rem;
+  margin-top: 0.5rem;
+}
+.dlx-metrics-tbl th,
+.dlx-metrics-tbl td {
+  border: 1px solid var(--line);
+  padding: 0.35rem 0.5rem;
+  text-align: left;
 }
