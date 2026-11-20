@@ -2,6 +2,13 @@
 const Projects = (() => {
   const id = new URLSearchParams(location.search).get("project");
   const get = (name) => document.getElementById(`project-${name}`);
+  const diagnostic = document.getElementById("ouroboros-link");
+  if (id) diagnostic.href = `/static/ouroboros.html?project=${encodeURIComponent(id)}`;
+  diagnostic.addEventListener("click", (event) => {
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    navigate(() => { location.assign(diagnostic.href); });
+  });
   const path = id ? `/api/projects/${encodeURIComponent(id)}` : null;
   const draftKey = `czar.project.draft.v1.${id}`;
   let manifest = null;

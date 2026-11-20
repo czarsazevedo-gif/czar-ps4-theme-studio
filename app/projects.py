@@ -126,14 +126,14 @@ async def scope_jobs(request: Request, call_next):
     project = request.query_params.get("project")
     path = request.url.path
     library_apply = path.startswith("/api/library/") and path.endswith("/apply")
-    compositor = path.startswith("/api/composition/")
-    protected = project is not None or compositor or path.startswith(("/api/projects", "/api/library"))
+    project_tool = path.startswith(("/api/composition/", "/api/ouroboros/"))
+    protected = project is not None or project_tool or path.startswith(("/api/projects", "/api/library"))
     if protected and request.method in {"POST", "PUT"}:
         if not valid_origin(request):
             return JSONResponse({"detail": "Origem da solicitação não autorizada."}, status_code=403)
-    if (library_apply or compositor) and project is None:
+    if (library_apply or project_tool) and project is None:
         return JSONResponse({"detail": "Abra um projeto antes de aplicar a mídia."}, status_code=400)
-    if project is None or not (library_apply or compositor or path.startswith(
+    if project is None or not (library_apply or project_tool or path.startswith(
         ("/api/animated/", "/api/slot/", "/api/audio/", "/api/convert/", "/api/package/")
     )):
         return await call_next(request)

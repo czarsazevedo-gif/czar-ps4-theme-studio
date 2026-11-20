@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Diagnóstico de loops · Czar PS4 Theme Studio</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/ouroboros.css" />
+  </head>
+  <body>
+    <main class="diagnostic">
+      <header>
+        <a id="back" href="/">Voltar ao editor</a>
+        <h1>Diagnóstico de loops</h1>
+      </header>
+      <section>
+        <label
+          >Projeto
+          <select id="project"></select></label
+        ><label
+          >Vídeo importado
+          <select id="video"></select></label
+        ><button id="run" disabled>Analisar movimento e ciclos</button
+        ><button hidden id="cancel">Cancelar</button><progress hidden id="progress" max="100"></progress>
+        <p role="status" id="status"></p>
+      </section>
+      <section hidden id="diag">
+        <h2>Sentinela</h2>
+        <p id="summary"></p>
+        <details>
+          <summary>Indicadores da fonte</summary>
+          <pre id="details"></pre>
+        </details>
+      </section>
+      <section hidden id="results">
+        <h2>Círculo</h2>
+        <p>
+          Classificação por amostras da fonte. Escolha um trecho para conferir os DDS na resolução de saída.
+        </p>
+        <div id="groups"></div>
+      </section>
+      <section hidden id="player">
+        <h2>Prévia dos DDS decodificados</h2>
+        <canvas aria-label="Quadro do candidato"></canvas>
+        <p id="measurement"></p>
+        <div>
+          <button id="play">Reproduzir</button><button id="seam">Inspecionar último → primeiro</button
+          ><button id="step">Próximo quadro</button>
+        </div>
+        <output id="counter"></output>
+      </section>
+    </main>
+    <script src="/static/ouroboros.js"></script>
+  </body>
+</html>

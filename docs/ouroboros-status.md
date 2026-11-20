@@ -10,4 +10,25 @@ O protótipo implementava leitura por FFmpeg, amostragem parcial, classificaçã
 
 ## Sentinela
 
-O checkpoint ARCA da fundação é `d4e4283`. A leitura limitada do protótipo foi reaproveitada e o detector passou a usar NumPy e Pillow já presentes. Os dois testes da Sentinela passaram, incluindo as 12 fixtures e o arquivo flower.mp4. O próximo checkpoint é a busca independente por resolução e sua interface compacta. [Método e ensaios](ouroboros-sentinela.md)
+O checkpoint ARCA da fundação é `d4e4283`. A leitura limitada do protótipo foi reaproveitada e o detector passou a usar NumPy e Pillow já presentes. Os dois testes da Sentinela passaram, incluindo as 12 fixtures e o arquivo flower.mp4. O checkpoint da Sentinela é `d5e9701`. [Método e ensaios](ouroboros-sentinela.md)
+
+## Círculo e regressões
+
+O checkpoint **Círculo** da branch `feature/studio-infinite-motion-v1` contém a busca por orçamento, o diagnóstico privado e os testes da fundação. A base de comparação é `8a9ef7f2ca990cea2ed01439285a90f0770876ea`. O repositório de publicação é `czarsazevedo-gif/czar-ps4-theme-studio`. Para localizar o commit pelo nome e confirmar o HEAD do checkout, use `git log -4 --oneline`. [Implementação, métricas e roteiro no Galaxy](ouroboros-circulo.md)
+
+| Verificação em Linux | Resultado observado |
+| --- | --- |
+| Execução conjunta de Sentinela, Círculo, API, equivalência, projetos, biblioteca e compositor | 22 testes passaram em 63,7 s, com flower.mp4 habilitado |
+| Equivalência com o código da base Git | 6 ZIPs, 3 resoluções com e sem overlay, hashes iguais em todas as 30 entradas descompactadas |
+| Círculo | 3 candidatos por resolução na fixture de 20 s e em flower.mp4. O último candidato de 360p da fixture termina em 20,0 s |
+| Recuperação de erro | O cache detectou um WebP truncado, preservou o relatório existente durante falha simulada de disco e recuperou os mesmos bytes na nova tentativa |
+| Isolamento | Recusa de acesso de outra sessão ou projeto, recusa de origem externa, ID inválido e fonte ausente. Cancelamento liberou a área temporária |
+| Pipeline aberto | Smoke HTTP com ZIP RAF, DDS, MDX e XML, conversor WAV/VAG e script DXT1 executados |
+| Chromium com toque | Diagnóstico em 1480×924 e 924×1480, dez voltas, inspeção da junção, passo por quadro, retorno ao editor e cache após reiniciar o Uvicorn |
+| Outras seis suítes de navegador | Projetos, biblioteca, compositor, três telas de preview, fluxo geral de RAF e slots passaram |
+
+Os testes HTTP da bancada usaram a porta isolada 18088 e os testes de reinício usaram portas efêmeras. A configuração do Codespace continua na porta privada 8000. As partes legadas que exigem PKG proprietário e a conversão ATRAC9 ficaram fora da execução. A fundação usa FFmpeg, FFprobe, NumPy e Pillow sem dependências de execução novas.
+
+A revisão encontrou três situações que poderiam distorcer o diagnóstico. A classificação descartou evidência de movimento causada pelo par de um corte abrupto. A busca passou a penalizar janelas imóveis, incluir o limite final da gravação e informar falhas de leitura separadamente da inadequação do material. Uma prévia truncada passou a ser verificada e refeita sob a mesma chave.
+
+A próxima evidência necessária é a observação da junção pelo proprietário no Chrome físico. Lua e Coroa foram representadas por sinais sintéticos. O teste físico 3.3, a integração em branches anteriores e a aceitação da fase 3.4 seguem pendentes.

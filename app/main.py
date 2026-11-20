@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from pydantic import BaseModel, ConfigDict
 
-from . import at9, compositor, jobs, library, mdx, media, pkg, projects, raf, theme, theme_xml, vag
+from . import at9, compositor, jobs, library, mdx, media, ouroboros, pkg, projects, raf, theme, theme_xml, vag
 from .config import (
     ANIMATED_FRAME_BYTES,
     ANIMATED_SIZE,
@@ -61,6 +61,7 @@ app.middleware("http")(projects.scope_jobs)
 app.include_router(projects.router)
 app.include_router(library.router)
 app.include_router(compositor.router)
+app.include_router(ouroboros.router)
 
 #: The UI used to allow going over the cap "so the red bar could be seen".
 #: That let you assemble a theme the console rejects with CE-38196-7, so it no
