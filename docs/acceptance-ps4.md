@@ -4,7 +4,10 @@
 >
 > Testes executados em Linux (GitHub Codespaces), validação binária/criptográfica de PKG, extração de `Image0` e decodificação ATRAC9 via FFmpeg **NÃO substituem o teste físico no console PS4**.
 >
-> Todo pacote `.pkg` gerado pelo **CZAR FORGE** permanece explicitamente no estado **`PENDENTE DE TESTE FÍSICO`** até que o proprietário conclua este roteiro diretamente no **PS4 Slim (firmware 12.52)**.
+> Todo pacote `.pkg` gerado pelo **CZAR FORGE** distingue explicitamente três estágios:
+> 1. **`PACOTE GERADO`** (arquivo `.pkg` produzido; extração completa de `Image0` não executada),
+> 2. **`PACOTE VALIDADO ESTRUTURALMENTE`** (cabeçalho binário `IRO_TAG=2`, `CATEGORY=ac`, `Sc0`, `Image0` extraído e SHA-256 100% conferido contra o bundle em Linux),
+> 3. **`PACOTE TESTADO NO PS4`** (apenas após o proprietário concluir este roteiro no **PS4 Slim — firmware 12.52**; nunca marcado automaticamente).
 
 ---
 
@@ -12,8 +15,8 @@
 
 1. Abrir o projeto no Czar PS4 Theme Studio na porta **8000 (Privada)** do Codespace.
 2. Na aba **Empacotar (CZAR FORGE)**, clicar em **VALIDAR MEU TEMA** e confirmar que todas as verificações estão aprovadas (`0 erros`).
-3. Clicar em **GERAR PKG** e aguardar a conclusão com status **`PENDENTE DE TESTE FÍSICO`**.
-4. Clicar em **VER RELATÓRIO** e registrar:
+3. Clicar em **GERAR PKG** e aguardar a conclusão com status **`PACOTE VALIDADO ESTRUTURALMENTE`** e **`PACOTE TESTADO NO PS4: Pendente (PS4 Slim 12.52)`**.
+4. Clicar em **VER RELATÓRIO COMPLETO** e registrar:
    - `CONTENT_ID` e `TITLE_ID`
    - `TIPO DE TEMA: pkg_ps4_theme`
    - `IRO_TAG: cabeçalho 0x98 = 2 · SFO = 2`
@@ -26,7 +29,21 @@
 
 ---
 
+## 1B. Checklist de Aceitação Física no Galaxy Tab S10 Ultra (Chrome Android · Toque e S Pen)
+
+> **Status atual: `PENDENTE DE TESTE FÍSICO NO TABLET`** (validado em Chromium headless com toque emulado em `1480×924` e `924×1480`, sem substituir o aparelho físico).
+
+- [ ] **Paisagem (`1480×924`) e Retrato (`924×1480`)**: alternar orientação girando o tablet; confirmar ausência de rolagem horizontal indesejada, sobreposição de texto ou botões cortados nas 6 abas e no Ouroboros Deluxe.
+- [ ] **Toque com o dedo e precisão com S Pen**: abrir o guia **COMO ESCOLHER UM VÍDEO PARA UM LOOP PERFEITO**, operar sliders de quadros/wait/ganho, desenhar máscaras regionais no Ouroboros Deluxe e mover/redimensionar/rotacionar camadas no Compositor sem perda de foco ou disparo duplo.
+- [ ] **Importação e diagnóstico não-bloqueante**: importar vídeo real do armazenamento do tablet, confirmar que o diagnóstico automático de 21 campos roda em segundo plano sem travar o player e pode ser cancelado sem afetar o vídeo.
+- [ ] **Prévia de áudio no Chrome Android**: reproduzir música ATRAC9 decodificada, prévia de costura do loop e efeitos sonoros VAG diretamente no tablet.
+- [ ] **Download e persistência após recarregar aba**: baixar `background.raf.zip` e `.pkg` no Chrome Android; recarregar a página e confirmar que o projeto salvo e o histórico de PKGs reaparecem intactos.
+
+---
+
 ## 2. Checklist de Teste Físico no PS4 Slim (Firmware 12.52)
+
+> **Status atual: `PENDENTE DE TESTE FÍSICO NO CONSOLE`**
 
 Marque cada item durante a execução real no console:
 

@@ -88,7 +88,10 @@ class Compatibility(unittest.TestCase):
             old.mkdir()
             archive = subprocess.check_output(["git", "archive", BASE, "app"], cwd=REPO, timeout=15)
             with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-                tar.extractall(old, filter="data")
+                if hasattr(tarfile, "data_filter"):
+                    tar.extractall(old, filter="data")
+                else:
+                    tar.extractall(old)
 
             def run(tree):
                 return json.loads(
