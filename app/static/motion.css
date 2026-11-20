@@ -1,0 +1,233 @@
+#panel-motion {
+  container-type: inline-size;
+}
+.motion-heading,
+.motion-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+.motion-heading {
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+.motion-heading h2,
+.motion-finish h3 {
+  margin: 0;
+}
+.motion-heading p,
+#motion-status {
+  margin: 0.25rem 0;
+  color: var(--txt-dim);
+  overflow-wrap: anywhere;
+}
+.motion-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(270px, 32%);
+  gap: 1rem;
+  align-items: start;
+}
+.motion-monitor,
+.motion-inspector,
+.motion-finish {
+  min-width: 0;
+  padding: clamp(0.7rem, 1.4vw, 1.25rem);
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.motion-monitor,
+.motion-inspector,
+.motion-finish {
+  display: grid;
+  gap: 0.75rem;
+}
+.motion-screen {
+  position: relative;
+  aspect-ratio: 16/9;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 8px;
+  background: #050a0f;
+}
+.motion-screen canvas,
+.motion-screen video,
+.motion-screen img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+#motion-placeholder {
+  position: absolute;
+  text-align: center;
+  padding: 1rem;
+  color: var(--txt-dim);
+}
+#panel-motion button,
+#panel-motion select,
+#panel-motion input:not([type="checkbox"]),
+#panel-motion summary,
+#panel-motion a.btn {
+  min-height: 46px;
+}
+#panel-motion button:not(.btn),
+#panel-motion select,
+#panel-motion input[type="number"] {
+  font: inherit;
+  color: var(--txt);
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.45rem 0.7rem;
+}
+#panel-motion button:not(:disabled),
+#panel-motion summary {
+  cursor: pointer;
+}
+#panel-motion :disabled {
+  opacity: 0.55;
+}
+#panel-motion label {
+  color: var(--txt-dim);
+}
+.motion-inspector label,
+.motion-fields label,
+.motion-monitor > label {
+  display: grid;
+  gap: 0.25rem;
+}
+.motion-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+.motion-fields input,
+.motion-fields select {
+  width: 100%;
+  min-width: 0;
+}
+.motion-budget {
+  padding: 0.75rem;
+  border-left: 3px solid var(--accent);
+  background: var(--bg-sunken);
+}
+#panel-motion progress,
+#motion-budget {
+  display: block;
+  width: 100%;
+  accent-color: var(--accent);
+}
+.motion-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  touch-action: pan-x;
+}
+#motion-strip {
+  display: flex;
+  gap: 4px;
+  width: max-content;
+}
+#motion-strip button {
+  flex: none;
+  width: var(--thumb, 84px);
+  padding: 3px;
+  font-size: 0.78rem;
+  text-align: left;
+}
+#motion-strip img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16/9;
+}
+#motion-strip button[data-in="true"] {
+  border-bottom: 3px solid var(--accent);
+}
+#motion-strip button[aria-current="true"] {
+  outline: 2px solid var(--txt);
+  outline-offset: -3px;
+}
+#motion-candidates {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 0.45rem;
+}
+#motion-candidates button {
+  text-align: left;
+}
+#motion-candidates [aria-pressed="true"] {
+  border-color: var(--accent) !important;
+}
+#motion-cursor {
+  width: 100%;
+  accent-color: var(--accent);
+  touch-action: pan-x;
+}
+#motion-turns,
+#motion-position {
+  font-variant-numeric: tabular-nums;
+}
+.motion-finish {
+  margin: 1rem 0;
+}
+#motion-measures {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
+  gap: 0.65rem;
+}
+#motion-measures p {
+  margin: 0;
+  padding: 0.6rem;
+  background: var(--bg-sunken);
+  border-radius: 6px;
+}
+#panel-motion :focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+@container (max-width:760px) {
+  .motion-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+#motion-axis {
+  height: 18px;
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+#motion-selection,
+#motion-playhead,
+#motion-points i {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+#motion-selection {
+  background: #155a85;
+  border-inline: 2px solid #61b7ed;
+}
+#motion-playhead {
+  width: 2px;
+  background: white;
+}
+#motion-points i {
+  height: 5px;
+  width: 3px;
+  background: var(--warn);
+}
+@media (orientation: portrait) and (max-width: 1050px) {
+  .motion-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.motion-row label:has(input[type="checkbox"]),
+.motion-inspector label:has(input[type="checkbox"]) {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 46px;
+}

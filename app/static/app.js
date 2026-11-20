@@ -89,6 +89,8 @@ document.querySelectorAll(".tab").forEach((tab) => {
     if (tab.dataset.tab === "package") { refreshChecklist(); renderTree(); }
     if (tab.dataset.tab === "preview") renderPreview();
     if (tab.dataset.tab === "compositor") Compositor.activate();
+    if (tab.dataset.tab === "motion") Motion.activate();
+    else Motion.leave();
   });
 });
 
@@ -278,6 +280,7 @@ async function loadBitmaps(urls) {
 
 function applyAnimatedPayload(data) {
   anim.jobId = data.job_id;
+  Motion.sourceChanged(data);
   syncRafOverlap();
   anim.frameCount = data.budget.frames;
   anim.size = data.budget.size;
@@ -397,6 +400,7 @@ function resetAnimated() {
   anim.bitmaps.forEach((b) => b.close?.());
   anim.bitmaps = [];
   anim.jobId = null;
+  Motion.sourceChanged(null);
   syncRafOverlap();
   guardarSesion();
   $("anim-drop").hidden = false;
@@ -821,6 +825,7 @@ const PKG_CAMPOS = ["pkg-title", "pkg-title-id", "pkg-content-id", "pkg-themecol
 let sesionTimer = null;
 function captureEditorState() {
   const composition = Projects.id ? Compositor.capture() : null;
+  const motion = Projects.id ? Motion.capture() : null;
   return {
     slots: { ...slots.chosen },
     bgm: bgm.jobId,
@@ -834,6 +839,7 @@ function captureEditorState() {
     },
     campos: Object.fromEntries(PKG_CAMPOS.map((id) => [id, $(id).value])),
     ...(composition && { composition }),
+    ...(motion && { motion }),
   };
 }
 
@@ -873,6 +879,7 @@ async function restaurarSesion() {
 async function restoreEditorState(d, project = false) {
   if (!d) return 0;
   if (project) Compositor.restore(d.composition);
+  if (project) Motion.restore(d.motion);
 
   PKG_CAMPOS.forEach((id) => {
     if ($(id) && d.campos?.[id] != null) $(id).value = d.campos[id];
@@ -1023,7 +1030,7 @@ const pvPlayer = {
     if (!pvPlayer.lastTs) pvPlayer.lastTs = ts;
     const dt = Math.min(ts - pvPlayer.lastTs, 250);
     pvPlayer.lastTs = ts;
-    const per = anim.wait * 1000;
+    const per = (Motion.activeKey() ? Motion.wait() || anim.wait : anim.wait) * 1000;
     const frames = Compositor.previewFrameList() || anim.bitmaps;
     if (!frames.length) { pvPlayer.stop(); return; }
     pvPlayer.index %= frames.length;
@@ -1035,7 +1042,8 @@ const pvPlayer = {
     const bmp = frames[pvPlayer.index];
     const cv = $("pv-canvas");
     if (bmp && cv) {
-      if (anim.size && cv.width !== anim.size[0]) [cv.width, cv.height] = anim.size;
+      const size = Motion.activeKey() ? [bmp.width, bmp.height] : anim.size;
+      if (size && (cv.width !== size[0] || cv.height !== size[1])) [cv.width, cv.height] = size;
       cv.getContext("2d").drawImage(bmp, 0, 0, cv.width, cv.height);
     }
     pvPlayer.rafId = requestAnimationFrame(pvPlayer.tick);
@@ -1190,7 +1198,7 @@ function refreshChecklist() {
     ["chk.sfx", nSfx, nSfx ? t("chk.nOf", { n: nSfx, total: 3 }) : t("chk.systemOnes"), false],
     ["chk.music", bgm.jobId, bgm.jobId ? "bgm_home.at9" : t("chk.systemMusic"), false],
     ["chk.animated", animActive(),
-     animActive() ? `${anim.frameCount} frames \u00b7 ${anim.wait.toFixed(2)}s`
+     animActive() ? (Motion.description() || `${anim.frameCount} frames \u00b7 ${anim.wait.toFixed(2)}s`)
                   : (anim.jobId ? t("chk.loadedNotUsed") : t("chk.optional")), false],
   ];
   $("pkg-checklist").innerHTML = rows
@@ -1261,6 +1269,7 @@ function appendComposition(fd) {
   fd.append("composition", JSON.stringify(Compositor.capture() || { version: 1, surfaces: {} }));
   fd.append("composition_mode", bgMode());
   fd.append("animation_size", $("anim-size").value);
+  fd.append("motion_key", Motion.activeKey() || "off");
 }
 
 async function packageBuild(assetsOnly = false) {
@@ -1499,6 +1508,7 @@ async function boot() {
   await Projects.boot();
   Library.boot();
   Compositor.boot();
+  Motion.boot();
 }
 
 /* ------------------------------------------------------------ listeners */
