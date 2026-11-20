@@ -276,7 +276,7 @@ async function loadBitmaps(urls) {
   anim.bitmaps = results.map((result) => result.value);
 }
 
-function applyAnimatedPayload(data) {
+function applyAnimatedPayload(data, { skipSave = false } = {}) {
   anim.jobId = data.job_id;
   syncRafOverlap();
   anim.frameCount = data.budget.frames;
@@ -296,7 +296,7 @@ function applyAnimatedPayload(data) {
   player.seek(0);
   updateBudget();
   updateTiming();
-  guardarSesion();
+  if (!skipSave) guardarSesion();
 }
 
 function setAnimBusy(busy) {
@@ -306,7 +306,7 @@ function setAnimBusy(busy) {
   $("anim-export").disabled = busy || anim.frameCount * sys.animated_frame_bytes > sys.limit_bytes;
 }
 
-/* ---- Diagnóstico inteligente pós-importação (Pilar II, não-bloqueante e cancelável) ---- */
+/* ---- OUROBOROS Unificado: 3 Propostas Automáticas (720p, 540p, 360p) + Diagnóstico Inteligente ---- */
 
 const animDiag = {
   taskId: null,
@@ -314,22 +314,47 @@ const animDiag = {
   pollTimer: 0,
   running: false,
   runSeq: 0,
+  report: null,
+  appliedProfileId: null,
+  appliedRenderKey: null,
+  players: new Map(), // profileId -> { proposal, bitmaps, playing, tenCycle, seamMode, showDiff, idx, cycle, lastTs, rafId, draw, stop }
+  fs: {
+    profileId: null,
+    playing: true,
+    tenCycle: false,
+    seamMode: false,
+    showDiff: false,
+    idx: 0,
+    cycle: 1,
+    lastTs: 0,
+    rafId: 0,
+  },
 };
-
-function syncAnimDiagLink(jobId = anim.jobId) {
-  const link = $("anim-diag-ouroboros");
-  if (!link) return;
-  const u = new URL("/static/ouroboros.html", location.origin);
-  if (Projects.id) u.searchParams.set("project", Projects.id);
-  if (jobId) u.searchParams.set("video", `animated/${jobId}`);
-  link.href = u.pathname + u.search;
-}
 
 function animDiagBadgeClass(aptidao) {
   if (aptidao === "FAVORÁVEL A LOOP NATURAL") return "is-good";
   if (aptidao === "ADEQUADO À SÍNTESE" || aptidao === "CORRIGÍVEL") return "is-synth";
   if (aptidao === "DIFÍCIL / RESULTADO CONDICIONAL") return "is-warn";
   return "is-bad";
+}
+
+function obVerdictClass(verdict) {
+  if (verdict === "APROVADO") return "verdict-aprovado";
+  if (verdict === "CONDICIONAL") return "verdict-condicional";
+  return "verdict-reprovado";
+}
+
+function stopOuroborosPlayers() {
+  if (animDiag.fs.rafId) {
+    cancelAnimationFrame(animDiag.fs.rafId);
+    animDiag.fs.rafId = 0;
+  }
+  animDiag.fs.profileId = null;
+  for (const st of animDiag.players.values()) {
+    if (st.rafId) cancelAnimationFrame(st.rafId);
+    st.bitmaps?.forEach((bm) => bm.close?.());
+  }
+  animDiag.players.clear();
 }
 
 function renderAnimDiagnostic(diag) {
@@ -415,9 +440,432 @@ function setAnimDiagRunning(running) {
   const runBtn = $("anim-diag-run");
   const cancelBtn = $("anim-diag-cancel");
   const prog = $("anim-diag-progress");
-  if (runBtn) runBtn.disabled = running || !anim.jobId || !Projects.id;
+  const obRun = $("ouroboros-run");
+  const obCancel = $("ouroboros-cancel");
+  const obProg = $("ouroboros-progress");
+  const disabled = running || !anim.jobId || !Projects.id;
+  if (runBtn) runBtn.disabled = disabled;
   if (cancelBtn) cancelBtn.hidden = !running;
   if (prog) prog.hidden = !running;
+  if (obRun) obRun.disabled = disabled;
+  if (obCancel) obCancel.hidden = !running;
+  if (obProg) obProg.hidden = !running;
+}
+
+function _obSeamSequence(n) {
+  if (n <= 2) return [0, n - 1];
+  return [Math.max(0, n - 2), n - 1, 0, Math.min(1, n - 1)];
+}
+
+function _obDrawFrame(canvas, bitmaps, frameIdx, hudEl, { tenCycle, cycle, seamMode, waitMs }) {
+  if (!canvas || !bitmaps.length) return;
+  const bm = bitmaps[frameIdx % bitmaps.length];
+  if (!bm) return;
+  if (canvas.width !== bm.width || canvas.height !== bm.height) {
+    canvas.width = bm.width;
+    canvas.height = bm.height;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(bm, 0, 0);
+  if (hudEl) {
+    const fStr = `${String(frameIdx + 1).padStart(2, "0")}/${String(bitmaps.length).padStart(2, "0")}`;
+    if (seamMode) {
+      const tag = frameIdx === bitmaps.length - 1 ? "ÚLTIMO → JUNÇÃO" : (frameIdx === 0 ? "JUNÇÃO → PRIMEIRO" : "JUNÇÃO");
+      hudEl.textContent = `${fStr} · ${tag}`;
+    } else if (tenCycle) {
+      hudEl.textContent = `${fStr} · Ciclo ${cycle}/10 · ${Math.round(waitMs)} ms`;
+    } else {
+      hudEl.textContent = `${fStr} · ${Math.round(waitMs)} ms`;
+    }
+  }
+}
+
+async function _loadProposalBitmaps(reportKey, proposal) {
+  const urls = [];
+  for (let i = 0; i < proposal.frames; i++) {
+    const name = `${String(i).padStart(2, "0")}.webp`;
+    urls.push(Projects.mediaUrl(`/api/ouroboros/artifact/${encodeURIComponent(reportKey)}/${encodeURIComponent(proposal.profileId)}/${name}`));
+  }
+  const results = await Promise.all(
+    urls.map(async (u) => {
+      const resp = await fetch(u);
+      if (!resp.ok) throw new Error(`Falha ao carregar quadro da proposta ${proposal.profileId}.`);
+      return createImageBitmap(await resp.blob());
+    })
+  );
+  return results;
+}
+
+function _markAppliedProposalCard(profileId, renderKey) {
+  animDiag.appliedProfileId = profileId;
+  animDiag.appliedRenderKey = renderKey;
+  document.querySelectorAll("#ouroboros-proposals .ob-card").forEach((card) => {
+    const isThis = card.dataset.profile === profileId;
+    card.classList.toggle("is-applied", isThis);
+    const pill = card.querySelector(".ob-applied-pill");
+    if (pill) pill.hidden = !isThis;
+    const btn = card.querySelector(".ob-btn-apply");
+    if (btn) {
+      btn.textContent = isThis ? "APLICADO AO TEMA (RE-APLICAR)" : "APLICAR ESTE LOOP AO MEU TEMA";
+    }
+  });
+}
+
+async function applyOuroborosProposal(profileId, expectedRenderKey) {
+  if (!animDiag.report?.key || !Projects.id) {
+    toast("Abra um projeto e gere as propostas Ouroboros antes de aplicar.");
+    return;
+  }
+  const buttons = [
+    ...document.querySelectorAll("#ouroboros-proposals .ob-btn-apply"),
+    $("ob-fs-apply"),
+  ].filter(Boolean);
+  buttons.forEach((b) => { b.disabled = true; });
+  const obStatus = $("ouroboros-status");
+  if (obStatus) obStatus.textContent = "Aplicando loop verificado ao tema do projeto…";
+
+  try {
+    // Persist any pending client-side edits (icons/fields/compositor) before server-side apply.
+    const flushed = await Projects.flush();
+    if (!flushed) throw new Error("Salve ou resolva o conflito do projeto antes de aplicar o loop.");
+
+    const res = await api("/api/ouroboros/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        key: animDiag.report.key,
+        profileId,
+        expectedRenderKey,
+      }),
+    });
+
+    // Synchronize browser manifest revision immediately with server to prevent 409 on later saves.
+    await Projects.syncAfterExternalUpdate();
+
+    // Sync main animated stage with exact applied DDS frames & canonical wait.
+    $("bgmode-animated").checked = true;
+    const sizeStr = `${res.size[0]}x${res.size[1]}`;
+    $("anim-size").value = sizeStr;
+    syncSizeUi();
+    anim.frameCount = res.frames;
+    anim.wait = res.wait;
+    $("anim-wait").value = String(res.wait);
+    $("anim-wait-out").textContent = Number(res.wait).toFixed(2);
+    updateTiming();
+
+    const fd = new FormData();
+    fd.append("size", sizeStr);
+    fd.append("frames", String(res.frames));
+    const frameData = await api(`/api/animated/${res.jobId}/frames`, { method: "POST", body: fd });
+    await loadBitmaps(frameData.frames);
+    $("anim-drop").hidden = true;
+    $("anim-workspace").hidden = false;
+    $("anim-result").hidden = true;
+    applyAnimatedPayload(frameData, { skipSave: true });
+    anim.wait = res.wait;
+    updateTiming();
+    player.start();
+
+    _markAppliedProposalCard(profileId, res.renderKey);
+    refreshChecklist();
+    renderTree();
+    renderPreview();
+    if (typeof forgeUpdateSummary === "function") forgeUpdateSummary();
+
+    const dlg = $("ouroboros-fs-dialog");
+    if (dlg && dlg.open) dlg.close();
+
+    if (obStatus) {
+      obStatus.textContent =
+        `Loop aplicado ao tema (${res.size[0]}×${res.size[1]}, ${res.frames} quadros, ${Math.round(res.waitMs)} ms/quadro, ${fmtBytes(res.ddsBytes)}).`;
+    }
+    toast("Loop Ouroboros aplicado ao tema com sucesso!", "ok");
+  } catch (err) {
+    if (obStatus) obStatus.textContent = `Não foi possível aplicar o loop: ${err.message}`;
+    toast(err.message);
+  } finally {
+    buttons.forEach((b) => { b.disabled = false; });
+  }
+}
+
+function _startFsLoop() {
+  const fs = animDiag.fs;
+  if (fs.rafId) cancelAnimationFrame(fs.rafId);
+  const st = animDiag.players.get(fs.profileId);
+  if (!st || !st.bitmaps.length) return;
+  const canvas = $("ob-fs-canvas");
+  const hud = $("ob-fs-hud");
+  const diffImg = $("ob-fs-diff");
+  if (diffImg) diffImg.hidden = !fs.showDiff;
+
+  const drawCurrent = () => {
+    const seq = fs.seamMode ? _obSeamSequence(st.bitmaps.length) : null;
+    const realIdx = seq ? seq[fs.idx % seq.length] : (fs.idx % st.bitmaps.length);
+    _obDrawFrame(canvas, st.bitmaps, realIdx, hud, {
+      tenCycle: fs.tenCycle,
+      cycle: fs.cycle,
+      seamMode: fs.seamMode,
+      waitMs: st.proposal.waitMs,
+    });
+  };
+  drawCurrent();
+
+  const step = (ts) => {
+    if (!fs.profileId || !$("ouroboros-fs-dialog")?.open) {
+      fs.rafId = 0;
+      return;
+    }
+    if (fs.playing && !fs.showDiff) {
+      const interval = fs.seamMode ? Math.max(st.proposal.waitMs * 2.5, 420) : Math.max(20, st.proposal.waitMs);
+      if (!fs.lastTs) fs.lastTs = ts;
+      if (ts - fs.lastTs >= interval) {
+        fs.lastTs = ts;
+        if (fs.seamMode) {
+          const seq = _obSeamSequence(st.bitmaps.length);
+          fs.idx = (fs.idx + 1) % seq.length;
+        } else {
+          fs.idx = (fs.idx + 1) % st.bitmaps.length;
+          if (fs.idx === 0 && fs.tenCycle) {
+            fs.cycle = fs.cycle >= 10 ? 1 : fs.cycle + 1;
+          }
+        }
+        drawCurrent();
+      }
+    }
+    fs.rafId = requestAnimationFrame(step);
+  };
+  fs.lastTs = 0;
+  fs.rafId = requestAnimationFrame(step);
+}
+
+function openOuroborosFullscreen(profileId) {
+  const st = animDiag.players.get(profileId);
+  const dlg = $("ouroboros-fs-dialog");
+  if (!st || !dlg || !animDiag.report) return;
+  const p = st.proposal;
+  const fs = animDiag.fs;
+  fs.profileId = profileId;
+  fs.playing = true;
+  fs.tenCycle = st.tenCycle;
+  fs.seamMode = st.seamMode;
+  fs.showDiff = st.showDiff;
+  fs.idx = 0;
+  fs.cycle = 1;
+
+  $("ob-fs-title").textContent = `${p.title} (${p.resolutionLabel}) — ${p.verdict}`;
+  $("ob-fs-meta").textContent =
+    `${p.frames} quadros · ${Math.round(p.waitMs)} ms/quadro (${p.fps} FPS) · ${p.duration}s · ${fmtBytes(p.ddsBytes)} (${p.budgetPercent}%) · ${p.strategyLabel}`;
+  $("ob-fs-diff").src = Projects.mediaUrl(
+    `/api/ouroboros/artifact/${encodeURIComponent(animDiag.report.key)}/${encodeURIComponent(profileId)}/diff.png`
+  );
+  $("ob-fs-play").textContent = "Pausar";
+  $("ob-fs-10c").setAttribute("aria-pressed", String(fs.tenCycle));
+  $("ob-fs-seam").setAttribute("aria-pressed", String(fs.seamMode));
+  $("ob-fs-diff-btn").setAttribute("aria-pressed", String(fs.showDiff));
+
+  if (!dlg.open) dlg.showModal();
+  _startFsLoop();
+}
+
+async function renderOuroborosProposals(report, seq) {
+  const container = $("ouroboros-proposals");
+  const gifBanner = $("ouroboros-gif-banner");
+  if (!container || !report || !Array.isArray(report.proposals)) return;
+
+  stopOuroborosPlayers();
+  container.replaceChildren();
+  animDiag.report = report;
+
+  if (gifBanner) {
+    const g = report.gifInfo;
+    if (g?.isGif) {
+      const modeText = g.hasVariableDelays
+        ? `GIF com atrasos variáveis detectados (${g.minDelayMs}–${g.maxDelayMs} ms, ${g.distinctFrameCount} quadros distintos). Como o formato PS4 RAF usa <case wait> uniforme, o Ouroboros aplicou cadência temporal contínua (Modo B) preservando transparência e disposal reais via gifsicle.`
+        : `GIF inspecionado via gifsicle (${g.frameCount} quadros, ${g.distinctFrameCount} distintos, atraso médio ${g.meanDelayMs} ms, disposição ${g.hasPartialRects ? "parcial/otimizada" : "quadro completo"}). Temporização original preservada no RAF canônico (Modo A).`;
+      gifBanner.textContent = modeText;
+      gifBanner.hidden = false;
+    } else {
+      gifBanner.hidden = true;
+      gifBanner.textContent = "";
+    }
+  }
+
+  const ordered = [...report.proposals].sort((a, b) => (a.order || 0) - (b.order || 0));
+  for (const prop of ordered) {
+    const isRec = report.recommendedProfileId === prop.profileId;
+    const isApplied = animDiag.appliedRenderKey && animDiag.appliedRenderKey === prop.renderKey;
+
+    const card = document.createElement("article");
+    card.className = `ob-card${isRec ? " is-recommended" : ""}${isApplied ? " is-applied" : ""}`;
+    card.dataset.profile = prop.profileId;
+    card.dataset.renderKey = prop.renderKey;
+
+    const m = prop.metrics || {};
+    const diffUrl = Projects.mediaUrl(
+      `/api/ouroboros/artifact/${encodeURIComponent(report.key)}/${encodeURIComponent(prop.profileId)}/diff.png`
+    );
+
+    card.innerHTML = `
+      <div class="ob-card-head">
+        <div class="ob-card-title-row">
+          <h4 class="ob-card-title">${prop.title}</h4>
+          <span class="ob-pill is-res">${prop.resolutionLabel}</span>
+        </div>
+        <div class="ob-badges">
+          <span class="ob-pill ${obVerdictClass(prop.verdict)}">${prop.verdict}</span>
+          ${isRec ? `<span class="ob-pill is-rec">Recomendada</span>` : ""}
+          <span class="ob-pill is-applied ob-applied-pill"${isApplied ? "" : " hidden"}>APLICADO AO TEMA</span>
+        </div>
+        <p class="ob-card-priority">${prop.priority}</p>
+      </div>
+      <div class="ob-stage">
+        <canvas class="ob-canvas" width="${prop.size[0]}" height="${prop.size[1]}" aria-label="Prévia DDS real — ${prop.title}"></canvas>
+        <img class="ob-diff-img" src="${diffUrl}" alt="Mapa de costura da proposta ${prop.profileId}" hidden>
+        <div class="ob-stage-hud">Carregando DDS…</div>
+      </div>
+      <div class="ob-controls">
+        <button type="button" class="btn btn-ghost ob-btn-play">Pausar</button>
+        <button type="button" class="btn btn-ghost ob-btn-10c" aria-pressed="false">10 Ciclos</button>
+        <button type="button" class="btn btn-ghost ob-btn-seam" aria-pressed="false">Inspecionar junção</button>
+        <button type="button" class="btn btn-ghost ob-btn-fs">Tela cheia</button>
+      </div>
+      <dl class="ob-metrics">
+        <div class="ob-metric"><dt>Quadros / Limite</dt><dd>${prop.frames} / ${prop.maxFrames}</dd></div>
+        <div class="ob-metric"><dt>Cadência / Duração</dt><dd>${Math.round(prop.waitMs)} ms (${prop.fps} FPS) · ${prop.duration}s</dd></div>
+        <div class="ob-metric"><dt>Orçamento DDS</dt><dd>${fmtBytes(prop.ddsBytes)} (${prop.budgetPercent}%)</dd></div>
+        <div class="ob-metric"><dt>Trecho &amp; Estratégia</dt><dd>${prop.sourceInterval[0].toFixed(2)}–${prop.sourceInterval[1].toFixed(2)}s · ${prop.strategyCode}</dd></div>
+        <div class="ob-metric"><dt>SSIM / Costura</dt><dd>${Number(m.seamSsim ?? 0).toFixed(3)} · ratio ${Number(m.seamRatio ?? 0).toFixed(2)}</dd></div>
+        <div class="ob-metric"><dt>Direção / DXT1a</dt><dd>cos ${Number(m.seamDirectionCosine ?? 0).toFixed(2)} · ${m.ddsMeanPsnr != null ? `${m.ddsMeanPsnr} dB` : "ok"}</dd></div>
+      </dl>
+      <p class="ob-verdict-note">${prop.verdictSummary || ""}</p>
+      <button type="button" class="btn btn-primary btn-block ob-btn-apply" data-profile="${prop.profileId}" data-render-key="${prop.renderKey}">
+        ${isApplied ? "APLICADO AO TEMA (RE-APLICAR)" : "APLICAR ESTE LOOP AO MEU TEMA"}
+      </button>
+    `;
+
+    container.append(card);
+
+    const canvas = card.querySelector(".ob-canvas");
+    const hud = card.querySelector(".ob-stage-hud");
+    const diffImg = card.querySelector(".ob-diff-img");
+    const btnPlay = card.querySelector(".ob-btn-play");
+    const btn10c = card.querySelector(".ob-btn-10c");
+    const btnSeam = card.querySelector(".ob-btn-seam");
+    const btnFs = card.querySelector(".ob-btn-fs");
+    const btnApply = card.querySelector(".ob-btn-apply");
+
+    const state = {
+      proposal: prop,
+      bitmaps: [],
+      playing: true,
+      tenCycle: false,
+      seamMode: false,
+      showDiff: false,
+      idx: 0,
+      cycle: 1,
+      lastTs: 0,
+      rafId: 0,
+    };
+    animDiag.players.set(prop.profileId, state);
+
+    const drawCard = () => {
+      if (!state.bitmaps.length) return;
+      const seqIdx = state.seamMode ? _obSeamSequence(state.bitmaps.length) : null;
+      const realIdx = seqIdx ? seqIdx[state.idx % seqIdx.length] : (state.idx % state.bitmaps.length);
+      _obDrawFrame(canvas, state.bitmaps, realIdx, hud, {
+        tenCycle: state.tenCycle,
+        cycle: state.cycle,
+        seamMode: state.seamMode,
+        waitMs: prop.waitMs,
+      });
+    };
+
+    const tick = (ts) => {
+      if (!animDiag.players.has(prop.profileId)) {
+        state.rafId = 0;
+        return;
+      }
+      if (state.playing && !state.showDiff && state.bitmaps.length) {
+        const interval = state.seamMode ? Math.max(prop.waitMs * 2.5, 420) : Math.max(20, prop.waitMs);
+        if (!state.lastTs) state.lastTs = ts;
+        if (ts - state.lastTs >= interval) {
+          state.lastTs = ts;
+          if (state.seamMode) {
+            const seqArr = _obSeamSequence(state.bitmaps.length);
+            state.idx = (state.idx + 1) % seqArr.length;
+          } else {
+            state.idx = (state.idx + 1) % state.bitmaps.length;
+            if (state.idx === 0 && state.tenCycle) {
+              state.cycle = state.cycle >= 10 ? 1 : state.cycle + 1;
+            }
+          }
+          drawCard();
+        }
+      }
+      state.rafId = requestAnimationFrame(tick);
+    };
+
+    btnPlay.addEventListener("click", () => {
+      state.playing = !state.playing;
+      state.lastTs = 0;
+      btnPlay.textContent = state.playing ? "Pausar" : "Reproduzir";
+    });
+    btn10c.addEventListener("click", () => {
+      state.tenCycle = !state.tenCycle;
+      if (state.tenCycle) {
+        state.seamMode = false;
+        state.showDiff = false;
+        diffImg.hidden = true;
+        btnSeam.setAttribute("aria-pressed", "false");
+        state.idx = 0;
+        state.cycle = 1;
+        state.playing = true;
+        btnPlay.textContent = "Pausar";
+      }
+      btn10c.setAttribute("aria-pressed", String(state.tenCycle));
+      drawCard();
+    });
+    btnSeam.addEventListener("click", () => {
+      if (!state.seamMode) {
+        state.seamMode = true;
+        state.showDiff = false;
+        state.tenCycle = false;
+        state.idx = 0;
+        btn10c.setAttribute("aria-pressed", "false");
+        btnSeam.setAttribute("aria-pressed", "true");
+        btnSeam.textContent = "Ver mapa costura";
+        diffImg.hidden = true;
+      } else if (!state.showDiff) {
+        state.showDiff = true;
+        diffImg.hidden = false;
+        btnSeam.textContent = "Sair da junção";
+      } else {
+        state.seamMode = false;
+        state.showDiff = false;
+        diffImg.hidden = true;
+        btnSeam.setAttribute("aria-pressed", "false");
+        btnSeam.textContent = "Inspecionar junção";
+      }
+      drawCard();
+    });
+    btnFs.addEventListener("click", () => openOuroborosFullscreen(prop.profileId));
+    btnApply.addEventListener("click", () => applyOuroborosProposal(prop.profileId, prop.renderKey));
+
+    _loadProposalBitmaps(report.key, prop).then((bms) => {
+      if (seq !== animDiag.runSeq || !animDiag.players.has(prop.profileId)) {
+        bms.forEach((bm) => bm.close?.());
+        return;
+      }
+      state.bitmaps = bms;
+      drawCard();
+      state.rafId = requestAnimationFrame(tick);
+    }).catch(() => {
+      if (hud) hud.textContent = "Prévia DDS indisponível";
+    });
+  }
+
+  container.hidden = false;
 }
 
 async function cancelAnimDiagnostic({ quiet = false } = {}) {
@@ -434,32 +882,55 @@ async function cancelAnimDiagnostic({ quiet = false } = {}) {
       body: "{}",
     }).catch(() => { /* best effort cancel */ });
   }
-  if (!quiet && $("anim-diag-status")) {
-    $("anim-diag-status").textContent =
-      "Diagnóstico cancelado. O vídeo importado permanece disponível para edição e exportação.";
+  if (!quiet) {
+    if ($("ouroboros-status")) {
+      $("ouroboros-status").textContent =
+        "Geração Ouroboros cancelada. O vídeo importado permanece disponível.";
+    }
+    if ($("anim-diag-status")) {
+      $("anim-diag-status").textContent =
+        "Diagnóstico cancelado. O vídeo importado permanece disponível para edição e exportação.";
+    }
   }
 }
 
 function resetAnimDiagnostic() {
   cancelAnimDiagnostic({ quiet: true });
+  stopOuroborosPlayers();
   animDiag.jobId = null;
+  animDiag.report = null;
+  animDiag.appliedProfileId = null;
+  animDiag.appliedRenderKey = null;
+  const obSec = $("ouroboros-panel");
+  const obGrid = $("ouroboros-proposals");
+  const obGif = $("ouroboros-gif-banner");
+  if (obSec) obSec.hidden = true;
+  if (obGrid) { obGrid.replaceChildren(); obGrid.hidden = true; }
+  if (obGif) { obGif.textContent = ""; obGif.hidden = true; }
+  if ($("ouroboros-progress")) $("ouroboros-progress").value = 0;
+
   const sec = $("anim-diagnostic");
   const body = $("anim-diag-body");
   if (sec) sec.hidden = true;
   if (body) { body.replaceChildren(); body.hidden = true; }
-  if ($("anim-diag-status")) $("anim-diag-status").textContent = "Aguardando análise…";
+  if ($("anim-diag-status")) $("anim-diag-status").textContent = "Aguardando análise do Ouroboros…";
   if ($("anim-diag-progress")) $("anim-diag-progress").value = 0;
-  syncAnimDiagLink(null);
 }
 
 function prepareAnimDiagnosticPanel(jobId, { autoRun = false } = {}) {
+  const obSec = $("ouroboros-panel");
   const sec = $("anim-diagnostic");
-  if (!sec || !jobId) return;
+  if (!jobId) return;
   animDiag.jobId = jobId;
-  sec.hidden = false;
-  syncAnimDiagLink(jobId);
+  if (obSec) obSec.hidden = false;
+  if (sec) sec.hidden = false;
   if (!Projects.id) {
     setAnimDiagRunning(false);
+    if ($("ouroboros-proposals")) { $("ouroboros-proposals").replaceChildren(); $("ouroboros-proposals").hidden = true; }
+    if ($("ouroboros-status")) {
+      $("ouroboros-status").textContent =
+        "Sessão avulsa: abra ou crie um projeto para gerar as 3 propostas automáticas do OUROBOROS.";
+    }
     if ($("anim-diag-body")) { $("anim-diag-body").replaceChildren(); $("anim-diag-body").hidden = true; }
     if ($("anim-diag-status")) {
       $("anim-diag-status").textContent =
@@ -471,6 +942,10 @@ function prepareAnimDiagnosticPanel(jobId, { autoRun = false } = {}) {
     startAnimDiagnostic(jobId);
   } else {
     setAnimDiagRunning(false);
+    if ($("ouroboros-status")) {
+      $("ouroboros-status").textContent =
+        "Vídeo carregado no projeto. Toque em 'Analisar e gerar 3 propostas' para gerar ou comparar os loops 720p, 540p e 360p.";
+    }
     if ($("anim-diag-status")) {
       $("anim-diag-status").textContent =
         "Vídeo carregado no projeto. Toque em 'Reanalisar vídeo' para consultar ou gerar o diagnóstico completo.";
@@ -486,22 +961,32 @@ async function startAnimDiagnostic(jobId = anim.jobId) {
   await cancelAnimDiagnostic({ quiet: true });
   const seq = ++animDiag.runSeq;
   animDiag.jobId = jobId;
+  const obSec = $("ouroboros-panel");
+  const obStatus = $("ouroboros-status");
+  const obProg = $("ouroboros-progress");
+  const obGrid = $("ouroboros-proposals");
   const sec = $("anim-diagnostic");
   const statusEl = $("anim-diag-status");
   const progEl = $("anim-diag-progress");
   const bodyEl = $("anim-diag-body");
+
+  if (obSec) obSec.hidden = false;
   if (sec) sec.hidden = false;
-  syncAnimDiagLink(jobId);
+  if (obGrid) obGrid.hidden = true;
   if (bodyEl) bodyEl.hidden = true;
+  if (obProg) obProg.value = 5;
   if (progEl) progEl.value = 5;
-  if (statusEl) statusEl.textContent = "Iniciando diagnóstico automático em segundo plano…";
+  if (obStatus) obStatus.textContent = "Ouroboros iniciando inspeção completa e otimização independente (720p, 540p, 360p)…";
+  if (statusEl) statusEl.textContent = "Iniciando diagnóstico automático e geração das 3 propostas Ouroboros…";
   setAnimDiagRunning(true);
 
+  const stabilizeCamera = Boolean($("ouroboros-stabilize")?.checked);
+
   try {
-    const ticket = await api("/api/ouroboros/deluxe/diagnose", {
+    const ticket = await api("/api/ouroboros/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind: "animated", id: jobId }),
+      body: JSON.stringify({ kind: "animated", id: jobId, stabilizeCamera }),
     });
     if (seq !== animDiag.runSeq) return;
     animDiag.taskId = ticket.id;
@@ -512,14 +997,19 @@ async function startAnimDiagnostic(jobId = anim.jobId) {
         const st = await api(`/api/ouroboros/jobs/${encodeURIComponent(animDiag.taskId)}`);
         if (seq !== animDiag.runSeq) return;
         if (st.state === "working") {
-          if (statusEl) statusEl.textContent = st.stage || "Analisando movimento, estabilidade e periodicidade…";
-          if (progEl) progEl.value = Number(st.percent || 10);
+          const msg = st.stage || "Otimizando as 3 propostas Ouroboros…";
+          const pct = Number(st.percent || 10);
+          if (obStatus) obStatus.textContent = msg;
+          if (obProg) obProg.value = pct;
+          if (statusEl) statusEl.textContent = msg;
+          if (progEl) progEl.value = pct;
           animDiag.pollTimer = setTimeout(poll, 450);
           return;
         }
         animDiag.taskId = null;
         setAnimDiagRunning(false);
         if (st.state === "cancelled") {
+          if (obStatus) obStatus.textContent = "Geração Ouroboros cancelada.";
           if (statusEl) {
             statusEl.textContent =
               "Diagnóstico cancelado. O vídeo importado permanece disponível para edição e exportação.";
@@ -527,16 +1017,26 @@ async function startAnimDiagnostic(jobId = anim.jobId) {
           return;
         }
         if (st.state !== "ready" || !st.key) {
-          if (statusEl) statusEl.textContent = `Diagnóstico indisponível: ${st.stage || "falha na análise"}.`;
+          const failMsg = st.stage || "falha na análise";
+          if (obStatus) obStatus.textContent = `Ouroboros indisponível: ${failMsg}.`;
+          if (statusEl) statusEl.textContent = `Diagnóstico indisponível: ${failMsg}.`;
           return;
         }
         const report = await api(`/api/ouroboros/result/${encodeURIComponent(st.key)}`);
         if (seq !== animDiag.runSeq) return;
+
+        await renderOuroborosProposals(report, seq);
+        if (obStatus) {
+          const rec = (report.proposals || []).find((p) => p.profileId === report.recommendedProfileId);
+          obStatus.textContent = rec
+            ? `3 propostas prontas em ${(Number(report.elapsedMs || 0) / 1000).toFixed(1)}s · Recomendada: ${rec.shortTitle} (${rec.resolutionLabel}, ${rec.verdict}). Compare abaixo e toque em APLICAR.`
+            : "3 propostas Ouroboros prontas para comparação e aplicação.";
+        }
         if (report?.mediaDiagnostic) {
           renderAnimDiagnostic(report.mediaDiagnostic);
           if (statusEl) {
             statusEl.textContent =
-              `Diagnóstico concluído (${report.mediaDiagnostic.aptidao}) · cache compartilhado com o Ouroboros Deluxe.`;
+              `Diagnóstico concluído (${report.mediaDiagnostic.aptidao}) · motor unificado OUROBOROS.`;
           }
         } else if (statusEl) {
           statusEl.textContent = "Diagnóstico concluído sem relatório detalhado.";
@@ -545,6 +1045,7 @@ async function startAnimDiagnostic(jobId = anim.jobId) {
         if (seq !== animDiag.runSeq) return;
         animDiag.taskId = null;
         setAnimDiagRunning(false);
+        if (obStatus) obStatus.textContent = `Erro ao carregar propostas Ouroboros (${err.message}).`;
         if (statusEl) {
           statusEl.textContent = `Não foi possível concluir o diagnóstico (${err.message}). O vídeo continua pronto para uso.`;
         }
@@ -556,6 +1057,7 @@ async function startAnimDiagnostic(jobId = anim.jobId) {
     if (seq !== animDiag.runSeq) return;
     animDiag.taskId = null;
     setAnimDiagRunning(false);
+    if (obStatus) obStatus.textContent = `Ouroboros em espera (${err.message}).`;
     if (statusEl) {
       statusEl.textContent = `Diagnóstico em espera (${err.message}). O vídeo continua pronto para edição e exportação.`;
     }
@@ -2730,19 +3232,83 @@ $("anim-scrub").addEventListener("input", (e) => {
 });
 $("anim-export").addEventListener("click", animatedExport);
 $("anim-reset").addEventListener("click", resetAnimated);
+if ($("ouroboros-run")) {
+  $("ouroboros-run").addEventListener("click", () => startAnimDiagnostic(anim.jobId));
+}
+if ($("ouroboros-cancel")) {
+  $("ouroboros-cancel").addEventListener("click", () => cancelAnimDiagnostic());
+}
 if ($("anim-diag-run")) {
   $("anim-diag-run").addEventListener("click", () => startAnimDiagnostic(anim.jobId));
 }
 if ($("anim-diag-cancel")) {
   $("anim-diag-cancel").addEventListener("click", () => cancelAnimDiagnostic());
 }
-if ($("anim-diag-ouroboros")) {
-  $("anim-diag-ouroboros").addEventListener("click", async (event) => {
-    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
-    event.preventDefault();
-    const href = $("anim-diag-ouroboros").href;
-    if (Projects.id) await Projects.flush();
-    location.assign(href);
+if ($("ouroboros-fs-dialog")) {
+  $("ouroboros-fs-dialog").addEventListener("close", () => {
+    if (animDiag.fs.rafId) {
+      cancelAnimationFrame(animDiag.fs.rafId);
+      animDiag.fs.rafId = 0;
+    }
+    animDiag.fs.profileId = null;
+  });
+}
+if ($("ob-fs-play")) {
+  $("ob-fs-play").addEventListener("click", () => {
+    animDiag.fs.playing = !animDiag.fs.playing;
+    animDiag.fs.lastTs = 0;
+    $("ob-fs-play").textContent = animDiag.fs.playing ? "Pausar" : "Reproduzir";
+  });
+}
+if ($("ob-fs-10c")) {
+  $("ob-fs-10c").addEventListener("click", () => {
+    const fs = animDiag.fs;
+    fs.tenCycle = !fs.tenCycle;
+    if (fs.tenCycle) {
+      fs.seamMode = false;
+      fs.showDiff = false;
+      fs.idx = 0;
+      fs.cycle = 1;
+      fs.playing = true;
+      $("ob-fs-play").textContent = "Pausar";
+      $("ob-fs-seam").setAttribute("aria-pressed", "false");
+      $("ob-fs-diff-btn").setAttribute("aria-pressed", "false");
+      if ($("ob-fs-diff")) $("ob-fs-diff").hidden = true;
+    }
+    $("ob-fs-10c").setAttribute("aria-pressed", String(fs.tenCycle));
+    _startFsLoop();
+  });
+}
+if ($("ob-fs-seam")) {
+  $("ob-fs-seam").addEventListener("click", () => {
+    const fs = animDiag.fs;
+    fs.seamMode = !fs.seamMode;
+    if (fs.seamMode) {
+      fs.tenCycle = false;
+      fs.showDiff = false;
+      fs.idx = 0;
+      $("ob-fs-10c").setAttribute("aria-pressed", "false");
+      $("ob-fs-diff-btn").setAttribute("aria-pressed", "false");
+      if ($("ob-fs-diff")) $("ob-fs-diff").hidden = true;
+    }
+    $("ob-fs-seam").setAttribute("aria-pressed", String(fs.seamMode));
+    _startFsLoop();
+  });
+}
+if ($("ob-fs-diff-btn")) {
+  $("ob-fs-diff-btn").addEventListener("click", () => {
+    const fs = animDiag.fs;
+    fs.showDiff = !fs.showDiff;
+    $("ob-fs-diff-btn").setAttribute("aria-pressed", String(fs.showDiff));
+    if ($("ob-fs-diff")) $("ob-fs-diff").hidden = !fs.showDiff;
+    _startFsLoop();
+  });
+}
+if ($("ob-fs-apply")) {
+  $("ob-fs-apply").addEventListener("click", () => {
+    const pid = animDiag.fs.profileId;
+    const st = pid ? animDiag.players.get(pid) : null;
+    if (st) applyOuroborosProposal(pid, st.proposal.renderKey);
   });
 }
 

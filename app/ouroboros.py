@@ -20,11 +20,15 @@ from . import circulo, jobs, library, ouroboros_media as media, projects
 from .composition_model import AssetId, Model
 from .projects import JobId
 
+from .ouroboros_engine import OUROBOROS_VERSION, OuroborosEngine, media_io as engine_media  # noqa: E402
+from .ouroboros_engine.regions import RegionalRecipe, list_recipes, load_recipe, save_recipe  # noqa: E402
+
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/ouroboros")
-pool = ThreadPoolExecutor(max_workers=2)
+pool = ThreadPoolExecutor(max_workers=3)
 lock = Lock()
 VERSION = "ouroboros-foundation-1"
+_ENGINE = OuroborosEngine()
 
 
 class Source(Model):
@@ -52,7 +56,7 @@ class Task:
 
     def check(self):
         if self.stop.is_set():
-            raise media.Cancelled()
+            raise engine_media.Cancelled()
 
     def progress(self, stage, percent):
         self.check()
@@ -101,18 +105,24 @@ def record(root, key):
         raise HTTPException(404, "Resultado indisponível neste projeto.") from exc
 
 
-def submit(root, signature, calculate):
+def submit(root, signature, calculate, *, preempt: bool = False):
     with lock:
         for ident, t in list(tasks.items()):
             if t.finished and time.monotonic() - t.finished > 600:
                 del tasks[ident]
         running = [t for t in tasks.values() if t.state == "working"]
+        active_other = 0
         for task in running:
             if task.root == root:
                 if task.signature == signature and not task.stop.is_set():
                     return task.public()
+                if preempt:
+                    task.stop.set()
+                    continue
                 raise HTTPException(409, "Aguarde ou cancele a operação deste projeto.")
-        if len(running) >= 2:
+            elif not task.stop.is_set():
+                active_other += 1
+        if active_other >= 2:
             raise HTTPException(429, "Os processadores estão ocupados.")
         task = Task(root, signature)
         tasks[task.id] = task
@@ -123,9 +133,43 @@ def submit(root, signature, calculate):
 def healthy(folder, key, check):
     try:
         header = json.loads((folder / "report.json").read_bytes())
-        if header["key"] != key or header["version"] != VERSION:
-            return False
         kind = header.get("type")
+        if header["key"] != key:
+            return False
+        if kind == "ouroboros_proposals":
+            if header.get("version") != OUROBOROS_VERSION:
+                return False
+            proposals = header.get("proposals")
+            if not isinstance(proposals, list) or len(proposals) != 3:
+                return False
+            seen_profiles = set()
+            for prop in proposals:
+                pid = prop.get("profileId")
+                if pid not in {"quality", "balance", "flexibility"}:
+                    return False
+                seen_profiles.add(pid)
+                count = int(prop["frames"])
+                if not 4 <= count <= 48:
+                    return False
+                prof_dir = folder / pid
+                files_map = prop.get("files") or {}
+                expected_names = [f"{i:02d}.webp" for i in range(count)] + [
+                    "source.png",
+                    "diff.png",
+                    "background.raf.zip",
+                ]
+                for i in range(count):
+                    if not (prof_dir / "deluxe_dds" / f"{i:02d}.dds").is_file():
+                        return False
+                    if not (prof_dir / "deluxe_frames" / f"{i:02d}.png").is_file():
+                        return False
+                for name in expected_names:
+                    check()
+                    if engine_media.digest(prof_dir / name, check) != files_map.get(name):
+                        return False
+            return seen_profiles == {"quality", "balance", "flexibility"}
+        if header.get("version") != VERSION:
+            return False
         if kind == "analysis":
             return len(header["groups"]) == 3 and "sentinela" in header
         if kind == "deluxe_analysis":
@@ -152,11 +196,21 @@ def healthy(folder, key, check):
                     return False
         for name in names:
             check()
-            if media.digest(folder / name, check) != header["files"][name]:
+            if engine_media.digest(folder / name, check) != header["files"][name]:
                 return False
         return True
     except (OSError, ValueError, KeyError, TypeError):
         return False
+
+
+def _replace_tree_files(src_dir: Path, dst_dir: Path) -> None:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for item in src_dir.iterdir():
+        target = dst_dir / item.name
+        if item.is_dir():
+            _replace_tree_files(item, target)
+        else:
+            item.replace(target)
 
 
 def execute(task, calculate):
@@ -170,15 +224,19 @@ def execute(task, calculate):
                 stage = Path(tmp) / "result"
                 stage.mkdir()
                 data = fn(stage)
-                data.update(key=key, version=VERSION)
-                if "frames" in data:
-                    data["files"] = {p.name: media.digest(p, task.check) for p in stage.glob("*.webp")}
-                if data["type"] == "genesis":
-                    for name in ("source.png", "background.raf.zip"):
-                        data["files"][name] = media.digest(stage / name, task.check)
-                elif data["type"] == "deluxe_render":
-                    for name in ("source.png", "diff.png", "background.raf.zip"):
-                        data["files"][name] = media.digest(stage / name, task.check)
+                data["key"] = key
+                if data.get("type") == "ouroboros_proposals":
+                    data["version"] = OUROBOROS_VERSION
+                else:
+                    data["version"] = VERSION
+                    if "frames" in data:
+                        data["files"] = {p.name: engine_media.digest(p, task.check) for p in stage.glob("*.webp")}
+                    if data["type"] == "genesis":
+                        for name in ("source.png", "background.raf.zip"):
+                            data["files"][name] = engine_media.digest(stage / name, task.check)
+                    elif data["type"] == "deluxe_render":
+                        for name in ("source.png", "diff.png", "background.raf.zip"):
+                            data["files"][name] = engine_media.digest(stage / name, task.check)
                 (stage / "report.json").write_text(json.dumps(data, allow_nan=False), encoding="utf-8")
                 with lock:
                     task.check()
@@ -186,13 +244,16 @@ def execute(task, calculate):
                         stage.rename(dest)
                     else:
                         # Readers see complete files from the same immutable recipe.
-                        for name in data.get("files", {}):
-                            (stage / name).replace(dest / name)
-                        for sub in ("deluxe_dds", "deluxe_frames"):
-                            if (stage / sub).is_dir():
-                                (dest / sub).mkdir(exist_ok=True)
-                                for item_p in (stage / sub).iterdir():
-                                    item_p.replace(dest / sub / item_p.name)
+                        if data.get("type") == "ouroboros_proposals":
+                            for pid in ("quality", "balance", "flexibility"):
+                                if (stage / pid).is_dir():
+                                    _replace_tree_files(stage / pid, dest / pid)
+                        else:
+                            for name in data.get("files", {}):
+                                (stage / name).replace(dest / name)
+                            for sub in ("deluxe_dds", "deluxe_frames"):
+                                if (stage / sub).is_dir():
+                                    _replace_tree_files(stage / sub, dest / sub)
                         (stage / "report.json").replace(dest / "report.json")
         with lock:
             task.check()
@@ -202,7 +263,7 @@ def execute(task, calculate):
                 100,
                 key,
             )
-    except media.Cancelled:
+    except (media.Cancelled, engine_media.Cancelled):
         with lock:
             task.state, task.stage = "cancelled", "Cancelado."
     except Exception as exc:
@@ -216,7 +277,7 @@ def execute(task, calculate):
             task.state = "error"
             task.stage = (
                 str(exc)
-                if isinstance(exc, media.MotionError)
+                if isinstance(exc, (media.MotionError, engine_media.MotionError))
                 else "Falha ao analisar. Confira a fonte e o espaço disponível."
             )
     finally:
@@ -348,6 +409,143 @@ def genesis_source(request: Request, kind: Literal["animated", "library"], ident
     if not mime:
         raise HTTPException(415, "Use o quadro de referência para comparar este formato.")
     return FileResponse(path, media_type=mime, headers={"X-Content-Type-Options": "nosniff"})
+
+
+class UnifiedRunRequest(Model):
+    kind: Literal["library", "animated"]
+    id: AssetId | JobId
+    stabilizeCamera: bool = False
+    recipeId: str | None = None
+    recipe: RegionalRecipe | None = None
+
+
+class UnifiedApplyRequest(Model):
+    key: AssetId
+    profileId: Literal["quality", "balance", "flexibility"]
+    expectedRenderKey: AssetId | None = None
+    displayName: str | None = Field(default=None, max_length=120)
+
+
+@router.post("/run", status_code=202)
+def unified_run(request: Request, item: UnifiedRunRequest):
+    """Single Ouroboros entrypoint: inspect -> analyze -> search -> 3 independent PS4 proposals (720p, 540p, 360p)."""
+    root = workspace()
+    path, duration, name = source(request, Source(kind=item.kind, id=item.id))
+
+    resolved_recipe = item.recipe
+    if resolved_recipe is None and item.recipeId:
+        try:
+            resolved_recipe = load_recipe(root, item.recipeId)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(404, "Receita regional não encontrada neste projeto.") from exc
+
+    def prepare(task):
+        sha = engine_media.digest(path, task.check)
+        sig_payload = {
+            "kind": item.kind,
+            "id": item.id,
+            "stabilizeCamera": item.stabilizeCamera,
+            "recipe": resolved_recipe.model_dump() if resolved_recipe else None,
+        }
+        key = engine_media.fingerprint([OUROBOROS_VERSION, "proposals", sha, sig_payload])
+
+        def calculate(folder: Path):
+            res = _ENGINE.generate_three_proposals(
+                path,
+                duration,
+                folder,
+                filename=name,
+                source_sha256=sha,
+                recipe=resolved_recipe,
+                stabilize_camera=item.stabilizeCamera,
+                progress=task.progress,
+                check=task.check,
+            )
+            res["source"] = {"kind": item.kind, "id": item.id}
+            return res
+
+        return key, calculate
+
+    return submit(root, "ouroboros-run:" + item.model_dump_json(), prepare, preempt=True)
+
+
+@router.get("/artifact/{key}/{profile}/{name}")
+def unified_artifact(key: AssetId, profile: Literal["quality", "balance", "flexibility"], name: str):
+    folder, data = record(workspace(), key)
+    if data.get("type") != "ouroboros_proposals":
+        raise HTTPException(404, "Artefato Ouroboros indisponível.")
+    prof_dir = folder / profile
+    if name in {"source.png", "diff.png", "background.raf.zip"}:
+        target = prof_dir / name
+        if not target.is_file():
+            raise HTTPException(404, "Arquivo não encontrado.")
+        media_type = "application/zip" if name.endswith(".zip") else "image/png"
+        return FileResponse(target, media_type=media_type, filename=name if name.endswith(".zip") else None)
+    if re.fullmatch(r"[0-9]{2}\.webp", name):
+        target = prof_dir / name
+        if not target.is_file():
+            raise HTTPException(404, "Quadro não encontrado.")
+        return FileResponse(target, media_type="image/webp")
+    raise HTTPException(404, "Artefato inválido.")
+
+
+@router.post("/apply")
+def unified_apply(item: UnifiedApplyRequest):
+    """Apply one of the 3 verified Ouroboros proposals directly to the active project with strict render identity."""
+    root = workspace()
+    folder, data = record(root, item.key)
+    if data.get("type") != "ouroboros_proposals":
+        raise HTTPException(422, "Execute o Ouroboros antes de aplicar uma proposta ao tema.")
+
+    proposals = data.get("proposals") or []
+    prop = next((p for p in proposals if p.get("profileId") == item.profileId), None)
+    if prop is None:
+        raise HTTPException(404, f"Proposta '{item.profileId}' indisponível neste resultado.")
+
+    # Strict cryptographic render identity guarantee: NEVER apply Proposal A when user chose Proposal B!
+    if item.expectedRenderKey and prop.get("renderKey") != item.expectedRenderKey:
+        raise HTTPException(
+            409,
+            "A identidade da proposta selecionada não confere com o resultado renderizado. Atualize as propostas antes de aplicar.",
+        )
+
+    prof_dir = folder / item.profileId
+    prof_report = (data.get("profileReports") or {}).get(item.profileId) or prop
+    prof_report = dict(prof_report)
+    prof_report.setdefault("profileId", item.profileId)
+    prof_report.setdefault("profileTitle", prop.get("title"))
+    prof_report.setdefault("renderKey", prop.get("renderKey"))
+    prof_report.setdefault("key", prop.get("renderKey"))
+    try:
+        return _ENGINE.apply_to_project(
+            root, prof_dir, prof_report, display_name=item.displayName, acquire_lock=False
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(503, "Falha ao gravar no projeto. A versão anterior foi preservada.") from exc
+
+
+@router.get("/recipes")
+def unified_list_recipes():
+    return {"recipes": list_recipes(workspace())}
+
+
+@router.get("/recipes/{recipe_id}")
+def unified_get_recipe(recipe_id: str):
+    try:
+        return load_recipe(workspace(), recipe_id).model_dump()
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(404, "Receita regional não encontrada.") from exc
+
+
+@router.post("/recipes/{recipe_id}")
+def unified_save_recipe(recipe_id: str, recipe: RegionalRecipe):
+    try:
+        save_recipe(workspace(), recipe_id, recipe)
+        return {"saved": True, "id": recipe_id}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 from .deluxe.router import router as _deluxe_router  # noqa: E402

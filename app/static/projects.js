@@ -3,12 +3,14 @@ const Projects = (() => {
   const id = new URLSearchParams(location.search).get("project");
   const get = (name) => document.getElementById(`project-${name}`);
   const diagnostic = document.getElementById("ouroboros-link");
-  if (id) diagnostic.href = `/static/ouroboros.html?project=${encodeURIComponent(id)}`;
-  diagnostic.addEventListener("click", (event) => {
-    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
-    event.preventDefault();
-    navigate(() => { location.assign(diagnostic.href); });
-  });
+  if (diagnostic) {
+    if (id) diagnostic.href = `/static/ouroboros.html?project=${encodeURIComponent(id)}`;
+    diagnostic.addEventListener("click", (event) => {
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      navigate(() => { location.assign(diagnostic.href); });
+    });
+  }
   const path = id ? `/api/projects/${encodeURIComponent(id)}` : null;
   const draftKey = `czar.project.draft.v1.${id}`;
   let manifest = null;
@@ -206,5 +208,19 @@ const Projects = (() => {
     return true;
   }
 
-  return { id, boot, changed, flush, mediaUrl, fetchMedia };
+  async function syncAfterExternalUpdate() {
+    if (!id || !path) return null;
+    clearTimeout(timer);
+    if (saving) await saving;
+    const loaded = await request(path);
+    manifest = loaded;
+    pending = null;
+    conflict = false;
+    cacheDraft();
+    showUpdated();
+    show("Salvo");
+    return loaded;
+  }
+
+  return { id, boot, changed, flush, syncAfterExternalUpdate, mediaUrl, fetchMedia };
 })();

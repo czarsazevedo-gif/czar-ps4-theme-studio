@@ -375,16 +375,35 @@
         </aside>
       </div>
 
+      <section id="ouroboros-panel" class="ouroboros-panel" aria-live="polite" hidden>
+        <div class="ouroboros-head">
+          <div>
+            <h3 class="ouroboros-title">OUROBOROS <span class="ouroboros-sub">· 3 Propostas Automáticas de Loop PS4</span></h3>
+            <p id="ouroboros-status" class="ouroboros-status">Importe um vídeo ou GIF para gerar automaticamente as 3 propostas otimizadas (720p, 540p e 360p).</p>
+          </div>
+          <div class="ouroboros-actions">
+            <label class="ouroboros-check">
+              <input id="ouroboros-stabilize" type="checkbox">
+              <span>Estabilizar câmera</span>
+            </label>
+            <button id="ouroboros-run" type="button" class="btn btn-primary">Analisar e gerar 3 propostas</button>
+            <button id="ouroboros-cancel" type="button" class="btn btn-ghost" hidden>Cancelar</button>
+          </div>
+        </div>
+        <progress id="ouroboros-progress" max="100" value="0" hidden></progress>
+        <div id="ouroboros-gif-banner" class="ouroboros-gif-banner" hidden></div>
+        <div id="ouroboros-proposals" class="ouroboros-proposals" hidden></div>
+      </section>
+
       <section id="anim-diagnostic" class="anim-diagnostic" aria-live="polite" hidden>
         <div class="anim-diag-head">
           <div>
             <h3 class="anim-diag-title">Diagnóstico inteligente do vídeo importado</h3>
-            <p id="anim-diag-status" class="anim-diag-status">Aguardando análise…</p>
+            <p id="anim-diag-status" class="anim-diag-status">Aguardando análise do Ouroboros…</p>
           </div>
           <div class="anim-diag-actions">
             <button id="anim-diag-run" type="button" class="btn btn-ghost">Reanalisar vídeo</button>
             <button id="anim-diag-cancel" type="button" class="btn btn-ghost" hidden>Cancelar análise</button>
-            <a id="anim-diag-ouroboros" class="btn btn-primary" href="/static/ouroboros.html">Abrir no Ouroboros Deluxe</a>
           </div>
         </div>
         <progress id="anim-diag-progress" max="100" value="0" hidden></progress>
@@ -778,6 +797,28 @@
   <button id="library-apply" class="btn btn-primary" disabled>Usar no projeto</button>
   <button id="library-layer" class="btn btn-ghost" hidden>Adicionar como camada</button>
   <p id="library-apply-status" role="status"></p>
+</dialog>
+
+<dialog id="ouroboros-fs-dialog" class="ob-fs-dialog" aria-labelledby="ob-fs-title">
+  <div class="ob-fs-head">
+    <div>
+      <h2 id="ob-fs-title">OUROBOROS — Inspeção em tela cheia</h2>
+      <p id="ob-fs-meta" class="dim"></p>
+    </div>
+    <form method="dialog"><button type="submit" class="btn btn-ghost">Fechar</button></form>
+  </div>
+  <div class="ob-fs-stage">
+    <canvas id="ob-fs-canvas" width="1280" height="720"></canvas>
+    <img id="ob-fs-diff" class="ob-fs-diff" alt="Mapa de diferença na junção" hidden>
+    <div id="ob-fs-hud" class="ob-stage-hud">00/00</div>
+  </div>
+  <div class="ob-fs-controls">
+    <button id="ob-fs-play" type="button" class="btn btn-ghost">Pausar</button>
+    <button id="ob-fs-10c" type="button" class="btn btn-ghost" aria-pressed="false">10 Ciclos</button>
+    <button id="ob-fs-seam" type="button" class="btn btn-ghost" aria-pressed="false">Inspecionar junção</button>
+    <button id="ob-fs-diff-btn" type="button" class="btn btn-ghost" aria-pressed="false">Mapa de costura</button>
+    <button id="ob-fs-apply" type="button" class="btn btn-primary">APLICAR ESTE LOOP AO MEU TEMA</button>
+  </div>
 </dialog>
 
 <script src="/static/projects.js"></script>

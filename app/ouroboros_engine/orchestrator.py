@@ -402,6 +402,35 @@ class OuroborosEngine:
             },
         }
 
+    def generate_three_proposals(
+        self,
+        source_path: Path,
+        source_duration: float,
+        out_folder: Path,
+        *,
+        filename: str = "",
+        source_sha256: str = "",
+        recipe: RegionalRecipe | None = None,
+        stabilize_camera: bool = False,
+        progress: Callable[[str, int], None] = lambda *_: None,
+        check: Callable[[], None] = lambda: None,
+    ) -> dict[str, Any]:
+        """Steps 1-9: Full pipeline producing 3 independently optimized proposals (720p, 540p, 360p)."""
+        from .proposals import generate_three_proposals as _gen
+
+        return _gen(
+            self,
+            source_path,
+            source_duration,
+            out_folder,
+            filename=filename,
+            source_sha256=source_sha256,
+            recipe=recipe,
+            stabilize_camera=stabilize_camera,
+            progress=progress,
+            check=check,
+        )
+
     def apply_to_project(
         self,
         project_root: Path,
