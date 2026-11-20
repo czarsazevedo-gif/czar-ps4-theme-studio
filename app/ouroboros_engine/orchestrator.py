@@ -23,6 +23,7 @@ from .applier import apply_loop_to_project, assemble_canonical_raf, sha256_bytes
 from .calibrator import calibrate_interval
 from .diagnostic import build_media_diagnostic
 from .finish import apply_deluxe_finish
+from .gif_inspector import extract_gif_continuous_cadence, inspect_gif, is_gif_file
 from .metrics import compare_before_after, evaluate_post_dds, evaluate_ten_cycles
 from .reconstruction import (
     level2_photometric_harmonize,
@@ -71,10 +72,20 @@ class OuroborosEngine:
         source_path: Path,
         duration: float,
         *,
+        work_dir: Path | None = None,
         check: Callable[[], None] = lambda: None,
     ) -> dict[str, Any]:
-        """Step 1: Inspect source metadata (FFprobe + PyAV PTS + GIF timing when applicable)."""
+        """Step 1: Inspect source metadata (FFprobe + PyAV PTS + Gifsicle timing for GIFs)."""
         info = io_media.source_info(source_path, duration, check)
+        if is_gif_file(source_path):
+            gif_info = inspect_gif(source_path, work_dir=work_dir, check=check)
+            info["gifInfo"] = gif_info
+            if gif_info.get("totalDurationSec", 0) > 0:
+                info["duration"] = float(gif_info["totalDurationSec"])
+            if gif_info.get("hasVariableDelays"):
+                info["irregular"] = True
+        else:
+            info["gifInfo"] = {"isGif": False}
         return info
 
     def analyze_and_search(
@@ -88,11 +99,13 @@ class OuroborosEngine:
         progress: Callable[[str, int], None] = lambda *_: None,
         check: Callable[[], None] = lambda: None,
     ) -> dict[str, Any]:
-        """Steps 2-3: Full-duration motion/scene analysis, global candidate search & 21-field media diagnostic."""
+        """Steps 2-3: Full-duration motion/scene analysis, Gifsicle inspection, global search & 21-field diagnostic."""
         sha = source_sha256 or io_media.digest(source_path, check)
+        gif_info = inspect_gif(source_path, work_dir=work_dir, check=check) if is_gif_file(source_path) else {"isGif": False}
+        eff_dur = float(gif_info["totalDurationSec"]) if gif_info.get("isGif") and gif_info.get("totalDurationSec", 0) > 0 else duration
         result = search_supreme(
             source_path,
-            duration,
+            eff_dur,
             work_dir,
             source_sha256=sha,
             progress=progress,
@@ -101,6 +114,7 @@ class OuroborosEngine:
         result["version"] = OUROBOROS_VERSION
         result["sha256"] = sha
         result["name"] = filename or source_path.name
+        result["gifInfo"] = gif_info
         result["mediaDiagnostic"] = build_media_diagnostic(result, filename=result["name"])
         return result
 
@@ -138,6 +152,7 @@ class OuroborosEngine:
         size: tuple[int, int],
         wait: float,
         mode: RenderMode = "auto",
+        gif_timing_mode: Literal["auto", "mode_a_preserve", "mode_b_reconstruct"] = "auto",
         recipe: RegionalRecipe | None = None,
         finish_enabled: bool = True,
         stabilize_camera: bool = False,
@@ -167,8 +182,14 @@ class OuroborosEngine:
         out_folder.mkdir(parents=True, exist_ok=True)
         progress("Extraindo quadros da fonte na resolução de saída", 12)
         check()
+        gif_timing_meta: dict[str, Any] | None = None
         if preextracted_frames is not None:
             raw_frames = np.asarray(preextracted_frames, dtype=np.uint8)
+            frames = int(raw_frames.shape[0])
+        elif is_gif_file(source_path):
+            raw_frames, gif_timing_meta = extract_gif_continuous_cadence(
+                source_path, start_c, end_c, frames, size, out_folder, mode=gif_timing_mode, check=check
+            )
             frames = int(raw_frames.shape[0])
         else:
             raw_frames = np.array(io_media.extract(source_path, start_c, end_c, frames, size, out_folder, check))
@@ -179,7 +200,7 @@ class OuroborosEngine:
         lead_out = None
         step_sec = max(0.01, (end_c - start_c) / float(frames))
         bridge_k = min(5, max(2, frames // 3))
-        if preextracted_frames is None and eff_mode in {"reconstruct_auto", "content_bridge"}:
+        if preextracted_frames is None and not is_gif_file(source_path) and eff_mode in {"reconstruct_auto", "content_bridge"}:
             if start_c >= bridge_k * step_sec + 0.02:
                 try:
                     lead_in = np.array(
@@ -346,6 +367,7 @@ class OuroborosEngine:
             "strategyUsed": strategy_used,
             "strategyLabel": INTERNAL_STRATEGIES[strat_code][1],
             "strategyMeta": strategy_meta,
+            "gifTiming": gif_timing_meta,
             "finish": finish_meta,
             "diffStats": {k: v for k, v in diff_info.items() if k != "heatmap"},
             "baselinePostDds": raw_post_dds,

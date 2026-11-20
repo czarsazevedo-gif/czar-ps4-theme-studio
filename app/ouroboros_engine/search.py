@@ -196,6 +196,53 @@ def compute_multicriteria_cost(
     }
 
 
+def detect_scipy_periodicity(frames: np.ndarray, step: float) -> dict:
+    """Detect dominant temporal periodicities using SciPy autocorrelation and peak prominence."""
+    from scipy import signal as sp_signal
+
+    n = int(frames.shape[0])
+    if n < 8:
+        return {"detected": False, "periodsSec": [], "peakLags": [], "strength": 0.0}
+    # Compact luminance + spatial-quadrant temporal signals (captures directional + periodic cycles)
+    small = frames[:, ::4, ::4].mean(axis=3).astype(np.float64)
+    h, w = small.shape[1], small.shape[2]
+    signals = [
+        small.mean(axis=(1, 2)),
+        small[:, : max(1, h // 2), :].mean(axis=(1, 2)),
+        small[:, :, : max(1, w // 2)].mean(axis=(1, 2)),
+        small[:, max(0, h // 2) :, max(0, w // 2) :].mean(axis=(1, 2)),
+    ]
+    ac_sum = np.zeros(n, dtype=np.float64)
+    valid = 0
+    for sig in signals:
+        s = sig - np.mean(sig)
+        energy = float(np.dot(s, s))
+        if energy < 1e-6:
+            continue
+        corr = sp_signal.correlate(s, s, mode="full")[n - 1 :] / energy
+        ac_sum += corr
+        valid += 1
+    if valid == 0:
+        return {"detected": False, "periodsSec": [], "peakLags": [], "strength": 0.0}
+    ac = ac_sum / float(valid)
+    min_lag = max(3, int(round(0.35 / max(step, 1e-3))))
+    max_lag = min(n - 2, int(n * 0.85))
+    if max_lag <= min_lag + 1:
+        return {"detected": False, "periodsSec": [], "peakLags": [], "strength": 0.0}
+    peaks, props = sp_signal.find_peaks(ac[min_lag:max_lag], height=0.35, prominence=0.12, distance=max(2, min_lag // 2))
+    if len(peaks) == 0:
+        return {"detected": False, "periodsSec": [], "peakLags": [], "strength": 0.0}
+    order = np.argsort(props["peak_heights"])[::-1][:4]
+    lags = [int(peaks[i] + min_lag) for i in order]
+    strength = float(props["peak_heights"][order[0]])
+    return {
+        "detected": True,
+        "peakLags": lags,
+        "periodsSec": [round(l * step, 4) for l in lags],
+        "strength": round(strength, 4),
+    }
+
+
 def _generate_seeds(
     frames: np.ndarray,
     offset: float,
@@ -207,8 +254,8 @@ def _generate_seeds(
     """Generate diverse candidate (rough_score, start, end, frame_count, wait) tuples across full span.
 
     Uses Schödl et al. (2000) Video Textures multi-frame temporal neighborhood filtering combined
-    with signed temporal-derivative (motion-phase) matching so opposite-phase seams (e.g. swaying
-    foliage moving left at start and right at end) are rejected before shortlisting.
+    with signed temporal-derivative (motion-phase) matching and SciPy periodicity peaks so
+    opposite-phase seams (e.g. swaying foliage moving left at start and right at end) are rejected.
     """
     cap = max_frames_for(size)
     # 40x22 descriptor for fast vectorized lag bank
@@ -238,6 +285,15 @@ def _generate_seeds(
             lag = int(round(dur / step))
             if 3 <= lag <= n_desc - 1:
                 lags_to_check.setdefault(lag, []).append((cnt, w))
+
+    # Inject SciPy-detected periodicity peaks directly into the lag bank
+    sci_per = detect_scipy_periodicity(frames, step)
+    for p_lag in sci_per["peakLags"]:
+        if 3 <= p_lag <= n_desc - 1:
+            p_dur = p_lag * step
+            best_cnt = max(4, min(cap, int(round(p_dur * min(source_fps, 15.0)))))
+            best_w = min(CANONICAL_WAITS, key=lambda w: abs(best_cnt * w - p_dur))
+            lags_to_check.setdefault(p_lag, []).append((best_cnt, best_w))
 
     # Cumulative motion activity to reject dead static windows
     step_act = np.abs(vel).mean(axis=(1, 2, 3))

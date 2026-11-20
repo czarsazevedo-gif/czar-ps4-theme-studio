@@ -9,14 +9,45 @@ from typing import Callable
 
 import numpy as np
 
-from . import media_io as io_media
+from scipy import optimize as sp_optimize
+
 from ..config import ANIMATED_SIZES, MAX_WAIT_SECONDS, MIN_WAIT_SECONDS, RAF_SIZE_LIMIT, dds_bytes_for, max_frames_for
 from . import OUROBOROS_VERSION as DELUXE_VERSION
+from . import media_io as io_media
+from .gif_inspector import extract_gif_continuous_cadence, inspect_gif, is_gif_file
 from .metrics import evaluate_loop, evaluate_post_dds
 
-# Canonical wait intervals in milliseconds (Section 11)
+# Canonical wait intervals in milliseconds (Section 21)
 WAIT_GRID_MS = (25.0, 33.333, 40.0, 50.0, 66.667, 75.0, 100.0, 125.0, 150.0)
 WAIT_GRID_SEC = tuple(round(ms / 1000.0, 6) for ms in WAIT_GRID_MS)
+
+
+def optimize_wait_scipy(
+    source_span: float,
+    frames: int,
+    *,
+    grid_sec: tuple[float, ...] = WAIT_GRID_SEC,
+) -> dict:
+    """Use SciPy bounded scalar optimization to find continuous ideal wait & snap to canonical PS4 grid."""
+    ideal_lo = max(MIN_WAIT_SECONDS, min(grid_sec))
+    ideal_hi = min(MAX_WAIT_SECONDS, max(grid_sec))
+
+    def _objective(w: float) -> float:
+        dur = frames * w
+        speed_err = abs(math.log2(max(source_span / max(dur, 1e-6), 0.1)))
+        fps = 1.0 / max(w, 1e-6)
+        judder_pen = max(0.0, (10.0 - fps) / 10.0) * 0.12
+        return speed_err * speed_err + judder_pen
+
+    res = sp_optimize.minimize_scalar(_objective, bounds=(ideal_lo, ideal_hi), method="bounded")
+    cont_wait = float(res.x)
+    snapped = min(grid_sec, key=lambda g: abs(g - cont_wait))
+    return {
+        "continuousOptimalSec": round(cont_wait, 6),
+        "snappedWaitSec": snapped,
+        "snappedWaitMs": round(snapped * 1000.0, 3),
+        "speedRatioAtSnapped": round(source_span / max(frames * snapped, 1e-6), 4),
+    }
 
 
 def _score_configuration(
@@ -150,9 +181,10 @@ def calibrate_interval(
     if span <= 0.05:
         raise ValueError("Intervalo temporal inválido para calibração.")
 
+    gif_info = inspect_gif(source_path, work_dir=folder, check=check) if is_gif_file(source_path) else None
+    distinct_gif_frames = int(gif_info["distinctFrameCount"]) if gif_info and gif_info.get("isGif") else None
+
     configs: list[dict] = []
-    # Request-local bounded frame cache keyed by (frames, render_sz) so shared proxy
-    # extractions across 720p/540p/360p are decoded once per request without growing RAM unboundedly (CZAR-AUD-010).
     eval_fn = evaluate_post_dds if verify_dds else evaluate_loop
     max_cache_bytes = 64 * 1024 * 1024
     extract_cache: dict[tuple[int, tuple[int, int]], np.ndarray] = {}
@@ -165,7 +197,12 @@ def calibrate_interval(
         cached = extract_cache.get(ckey)
         if cached is not None:
             return cached
-        arr = np.array(io_media.extract(source_path, start, end, n_frames, render_sz, folder, check))
+        if gif_info and gif_info.get("isGif"):
+            arr, _ = extract_gif_continuous_cadence(
+                source_path, start, end, n_frames, render_sz, folder, mode="auto", check=check
+            )
+        else:
+            arr = np.array(io_media.extract(source_path, start, end, n_frames, render_sz, folder, check))
         arr_bytes = int(arr.nbytes)
         if arr_bytes <= max_cache_bytes:
             while cache_bytes + arr_bytes > max_cache_bytes and cache_order:
@@ -185,16 +222,16 @@ def calibrate_interval(
             for w_sec in waits_sec:
                 if not (MIN_WAIT_SECONDS <= w_sec <= MAX_WAIT_SECONDS):
                     continue
-                # Natural frame count preserving the source's true temporal speed: N ≈ span / wait
                 nat_n = int(round(span / w_sec))
-                # Allow clamping to cap ONLY if resulting speed change stays reasonable (within 0.65x..1.45x)
+                # Never inflate a low-frame GIF by duplicating frames to simulate smoothness
+                if distinct_gif_frames is not None and not gif_info.get("hasVariableDelays"):
+                    nat_n = min(nat_n, distinct_gif_frames)
                 n = max(4, min(cap, nat_n))
                 if n * dds_bytes_for(*size) > RAF_SIZE_LIMIT:
                     continue
                 actual_wait = float(f"{w_sec:.6g}")
                 playback_dur = n * actual_wait
                 speed_ratio = span / max(playback_dur, 1e-6)
-                # Never arbitrarily speed up slow sources or slow down fast sources!
                 if not (0.65 <= speed_ratio <= 1.45):
                     continue
                 if n in seen_counts and abs(speed_ratio - 1.0) > 0.15:
@@ -203,10 +240,9 @@ def calibrate_interval(
 
                 check()
                 try:
-                    # Render at actual output size when verify_dds=True, or 240p-equivalent proxy scaled cleanly
                     render_sz = size if verify_dds else (min(size[0], 320), min(size[1], 180))
                     rendered = _get_frames(n, render_sz)
-                except io_media.MotionError:
+                except (io_media.MotionError, ValueError):
                     continue
 
                 ev = eval_fn(rendered, actual_wait)
@@ -218,20 +254,21 @@ def calibrate_interval(
                     source_span=span,
                     source_fps=source_fps,
                 )
+                scored["scipyOptimization"] = optimize_wait_scipy(span, n, grid_sec=waits_sec)
                 configs.append(scored)
 
         if not configs:
-            # Fallback: compute best-fit natural config per resolution using exact span / N
             for size in sizes:
                 cap = max_frames_for(size)
                 n = max(4, min(cap, int(round(span * min(source_fps, 15.0)))))
-                w_sec = float(f"{np.clip(span / n, MIN_WAIT_SECONDS, MAX_WAIT_SECONDS):.6g}")
+                opt = optimize_wait_scipy(span, n, grid_sec=waits_sec)
+                w_sec = opt["snappedWaitSec"]
                 render_sz = size if verify_dds else (min(size[0], 320), min(size[1], 180))
                 rendered = _get_frames(n, render_sz)
                 ev = eval_fn(rendered, w_sec)
-                configs.append(
-                    _score_configuration(ev, size=size, frames=n, wait=w_sec, source_span=span, source_fps=source_fps)
-                )
+                scored = _score_configuration(ev, size=size, frames=n, wait=w_sec, source_span=span, source_fps=source_fps)
+                scored["scipyOptimization"] = opt
+                configs.append(scored)
     finally:
         extract_cache.clear()
         cache_order.clear()
@@ -251,6 +288,13 @@ def calibrate_interval(
         "end": round(end, 6),
         "sourceSpan": round(span, 4),
         "sourceFps": round(source_fps, 3),
+        "candidateWaitsMs": list(WAIT_GRID_MS),
+        "rafXmlTimingSemantics": {
+            "uniformWaitPerCase": True,
+            "physicalPs4Verified": False,
+            "note": "Intervalos são validados contra app/raf.py (wait uniforme em segundos); suporte físico de cada intervalo no PS4 Slim 12.52 requer teste no console.",
+        },
+        "gifTiming": gif_info,
         "evaluatedCount": len(configs),
         "configurations": sorted(configs, key=lambda c: c["scores"]["balance"], reverse=True),
         "recommendations": recommendations,
