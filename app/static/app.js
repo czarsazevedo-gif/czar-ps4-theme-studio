@@ -561,9 +561,10 @@ async function bulkUpload(group, file) {
 }
 
 /* --- musica del menu ---------------------------------------------------
- * With at9tool present anything is converted; without it, the file has to
- * arrive as .at9 and is only validated. */
-const bgm = { jobId: null, gain: 0, busy: false, loudness: null };
+ * With psgfx-at9 or at9tool present anything is converted; without it, the
+ * file has to arrive as .at9 and is only validated. */
+const bgm = { jobId: null, gain: 0, busy: false, loudness: null, meta: null };
+const forgeAudio = { stagingId: null, fileName: null, duration: 0, busy: false };
 
 /** Loudness of the bgm_home.at9 from the reference theme that plays on the
  *  console. A yardstick: a normal song lands ~13 dB above it. */
@@ -571,9 +572,14 @@ const BGM_LOUD_REFERENCIA = -32.0;
 
 function paintBgm(d) {
   const info = $("bgm-info");
+  const playerBox = $("bgm-player-box");
+  const audioEl = $("bgm-player");
+  const seamEl = $("bgm-seam-player");
+  const badgeEl = $("bgm-validation-badge");
   if (d) {
     bgm.jobId = d.job_id;
     bgm.loudness = d.loudness;
+    bgm.meta = d;
     if (d.gain_db != null) {
       bgm.gain = d.gain_db;
       $("bgm-gain").value = String(d.gain_db);
@@ -583,20 +589,40 @@ function paintBgm(d) {
     info.textContent = `${d.name} — ${d.codec} ${d.rate} Hz, ${d.channels}ch, ${d.duration}s${loud}`;
     info.className = "bgm-info on";
     $("bgm-clear").hidden = false;
-    // Changing the volume means re-encoding the .at9, and that needs at9tool.
-    // Without it the control could only throw an error on release, so it is
-    // not shown. Same rule as everywhere else: what cannot be done safely is
-    // not offered.
     $("bgm-gain-row").hidden = !sys.at9tool;
     pintarGanancia(d.loudness);
+    if (playerBox && audioEl) {
+      const prevUrl = d.preview || `/api/audio/${d.job_id}/preview`;
+      audioEl.src = Projects.mediaUrl(prevUrl);
+      if (seamEl) {
+        const seamUrl = d.seam_preview || `/api/audio/${d.job_id}/seam-preview`;
+        seamEl.src = Projects.mediaUrl(seamUrl);
+      }
+      if (badgeEl) {
+        const v = d.validation;
+        const loopTxt = v?.has_smpl ? `loop smpl (playCount=${v.play_count})` : "sem smpl";
+        const cfgTxt = v?.config_data_hex ? `configData ${v.config_data_hex}` : "";
+        const encTxt = d.encoder_backend ? ` · ${d.encoder_backend}` : "";
+        badgeEl.textContent = v?.valid
+          ? `ATRAC9 validado (${v.validator}): 48 kHz · 144 kbps · ${cfgTxt} · ${loopTxt}${encTxt}`
+          : `Áudio aplicado: ${d.codec} ${d.rate} Hz · ${fmtBytes(d.bytes)}${encTxt}`;
+      }
+      playerBox.hidden = false;
+    }
   } else {
     bgm.jobId = null;
     bgm.gain = 0;
+    bgm.loudness = null;
+    bgm.meta = null;
     $("bgm-gain").value = "0";
     info.textContent = t("snd.none");
     info.className = "bgm-info";
     $("bgm-clear").hidden = true;
     $("bgm-gain-row").hidden = true;
+    if (playerBox) playerBox.hidden = true;
+    if (audioEl) { audioEl.pause(); audioEl.removeAttribute("src"); audioEl.load(); }
+    if (seamEl) { seamEl.pause(); seamEl.removeAttribute("src"); seamEl.load(); }
+    if (badgeEl) badgeEl.textContent = "";
     guardarSesion();
   }
 }
@@ -640,18 +666,151 @@ async function uploadBgm(file) {
   fd.append("file", file);
   try {
     paintBgm(await api("/api/audio/bgm/upload", { method: "POST", body: fd }));
+    refreshChecklist();
+    renderTree();
   } catch (err) {
     toast(err.message);
   }
 }
 
-const sfx = { chosen: {}, catalog: [] };
+function _forgeAudioParams() {
+  const fd = new FormData();
+  if (forgeAudio.stagingId) fd.append("staging_id", forgeAudio.stagingId);
+  else if (bgm.jobId) fd.append("job_id", bgm.jobId);
+  fd.append("loop_mode", $("forge-loop-mode")?.value || "whole");
+  const startVal = $("forge-loop-start")?.value?.trim();
+  const endVal = $("forge-loop-end")?.value?.trim();
+  if (startVal) fd.append("start_sec", startVal);
+  if (endVal) fd.append("end_sec", endVal);
+  fd.append("trim_silence", $("forge-loop-trim")?.checked ? "true" : "false");
+  fd.append("crossfade_ms", $("forge-loop-xfade")?.value || "0");
+  const allowFade = Boolean($("forge-loop-fade")?.checked);
+  fd.append("allow_fade", allowFade ? "true" : "false");
+  if (allowFade) {
+    fd.append("fade_in_ms", "15");
+    fd.append("fade_out_ms", "15");
+  }
+  fd.append("volume_mode", $("forge-volume-mode")?.value || "original");
+  fd.append("gain_db", $("forge-volume-gain")?.value || "0");
+  const lufsVal = $("forge-volume-lufs")?.value?.trim();
+  if (lufsVal) fd.append("target_lufs", lufsVal);
+  return fd;
+}
+
+function _setForgeAudioBusy(busy, statusText = "") {
+  forgeAudio.busy = busy;
+  bgm.busy = busy;
+  const ready = Boolean(forgeAudio.stagingId || bgm.jobId);
+  if ($("forge-audio-preview-btn")) $("forge-audio-preview-btn").disabled = busy || !ready;
+  if ($("forge-bgm-apply")) $("forge-bgm-apply").disabled = busy || !ready;
+  if (statusText && $("forge-audio-status")) {
+    $("forge-audio-diagnostics").hidden = false;
+    $("forge-audio-status").textContent = statusText;
+  }
+}
+
+async function forgeInspectFile(file) {
+  _setForgeAudioBusy(true, "Analisando formato real, loudness EBU R128 e pontos de loop…");
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const d = await api("/api/forge/audio/inspect", { method: "POST", body: fd });
+    forgeAudio.stagingId = d.staging_id;
+    forgeAudio.fileName = d.name;
+    forgeAudio.duration = d.duration;
+    $("forge-audio-src-info").textContent =
+      `${d.name} · ${d.codec} ${d.sample_rate} Hz · ${d.channels}ch · ${d.duration}s · ${fmtBytes(d.bytes)}`;
+    if ($("forge-loop-end")) $("forge-loop-end").placeholder = String(d.duration);
+    $("forge-player-before").src = Projects.mediaUrl(d.preview_url);
+    $("forge-player-after").src = Projects.mediaUrl(d.preview_url);
+    $("forge-player-seam").src = Projects.mediaUrl(d.seam_preview_url);
+    $("forge-audio-ab-players").hidden = false;
+    const la = d.loop_analysis;
+    const ld = d.loudness;
+    const lines = [
+      `Codec origem: ${d.codec} (${d.sample_rate} Hz, ${d.channels}ch, ${d.duration}s)`,
+      `Loudness integrado: ${ld.integrated_lufs ?? "silêncio"} LUFS · True Peak: ${ld.true_peak_dbtp ?? "—"} dBTP · Clipping: ${ld.clipped_samples}`,
+      `Delta vs ref. PS4 (-32,0 LKFS): ${ld.delta_vs_reference_db ?? "—"} dB`,
+      `Costura original: clique=${la.click_risk} · similaridade=${la.spectral_similarity} · fase=${la.phase_correlation} · energia=${la.energy_delta_db} dB`,
+      la.convincing ? "Loop avaliado: convincente" : "Loop avaliado: atenção (recomenda-se ajuste)",
+      ...(la.warnings || []).map((w) => `Aviso: ${w}`),
+    ];
+    $("forge-audio-metrics").textContent = lines.join("\n");
+    $("forge-audio-status").textContent = "Áudio inspecionado. Ajuste loop/volume ou clique em CONVERTER E APLICAR MÚSICA.";
+  } catch (err) {
+    toast(err.message);
+    $("forge-audio-status").textContent = `Falhou: ${err.message}`;
+  } finally {
+    _setForgeAudioBusy(false);
+  }
+}
+
+async function forgePreviewProcess() {
+  if (forgeAudio.busy) return;
+  _setForgeAudioBusy(true, "Processando prévia de loop e volume (sem alterar o projeto)…");
+  try {
+    const d = await api("/api/forge/audio/preview-process", { method: "POST", body: _forgeAudioParams() });
+    forgeAudio.stagingId = d.staging_id;
+    $("forge-player-before").src = Projects.mediaUrl(d.original_preview_url);
+    $("forge-player-after").src = Projects.mediaUrl(d.preview_url);
+    $("forge-player-seam").src = Projects.mediaUrl(d.seam_preview_url);
+    $("forge-audio-ab-players").hidden = false;
+    const lr = d.loop_report;
+    const bl = d.before_loudness;
+    const al = d.after_loudness;
+    const lines = [
+      `Modo volume: ${d.volume_params.mode} (ganho efetivo ${d.volume_params.applied_gain_db >= 0 ? "+" : ""}${d.volume_params.applied_gain_db} dB${d.volume_params.limiter_applied ? " · limitador ativo" : ""})`,
+      `Antes: ${bl.integrated_lufs ?? "—"} LUFS (TP ${bl.true_peak_dbtp ?? "—"} dBTP) → Depois: ${al.integrated_lufs ?? "—"} LUFS (TP ${al.true_peak_dbtp ?? "—"} dBTP)`,
+      `Loop (${lr.mode}): ${lr.duration_seconds}s · clique ${lr.click_risk_before} → ${lr.click_risk_after} · similaridade ${lr.spectral_similarity} · crossfade ${lr.crossfade_ms} ms`,
+      lr.convincing ? "Resultado do loop: convincente" : "Resultado do loop: atenção — verifique a prévia da costura",
+      ...(lr.warnings || []).map((w) => `Aviso: ${w}`),
+    ];
+    $("forge-audio-metrics").textContent = lines.join("\n");
+    $("forge-audio-status").textContent = "Prévia pronta. Ouça Antes, Depois e a Costura do loop antes de aplicar.";
+  } catch (err) {
+    toast(err.message);
+    $("forge-audio-status").textContent = `Falhou: ${err.message}`;
+  } finally {
+    _setForgeAudioBusy(false);
+  }
+}
+
+async function forgeConvertAndApplyBgm() {
+  if (forgeAudio.busy) return;
+  _setForgeAudioBusy(true, "Convertendo para ATRAC9 real (48 kHz · 144 kbps), validando com FFmpeg e aplicando…");
+  try {
+    const d = await api("/api/forge/audio/convert-apply", { method: "POST", body: _forgeAudioParams() });
+    paintBgm(d);
+    refreshChecklist();
+    renderTree();
+    const v = d.validation;
+    const pl = d.post_at9_loop;
+    const lines = [
+      `CONCLUÍDO · sound/bgm_home.at9 (${fmtBytes(d.bytes)}, ${d.duration}s)`,
+      `Validação independente (${v.validator}): codec=${v.codec}, ${v.sample_rate} Hz, ${v.channels}ch, ${v.byte_rate} B/s, align=${v.block_align}, configData=${v.config_data_hex}`,
+      `Loop smpl: início=${v.loop_start_sample}, fim=${v.loop_end_sample}, playCount=${v.play_count}`,
+      `Loudness final (bgmhome_loud): ${d.loudness ?? "—"} LKFS`,
+      pl ? `Loop pós-ATRAC9: clique=${pl.click_risk}, similaridade=${pl.spectral_similarity}, fase=${pl.phase_correlation}, convincente=${pl.convincing ? "Sim" : "Atenção"}` : "",
+      `SHA-256 derivado: ${d.converted_sha256}`,
+    ].filter(Boolean);
+    $("forge-audio-metrics").textContent = lines.join("\n");
+    $("forge-audio-status").textContent = "Música convertida, validada e aplicada ao projeto.";
+    toast("Música ATRAC9 convertida, validada e aplicada!", "ok");
+  } catch (err) {
+    toast(err.message);
+    $("forge-audio-status").textContent = `Falhou: ${err.message}`;
+  } finally {
+    _setForgeAudioBusy(false);
+  }
+}
+
+const sfx = { chosen: {}, catalog: [], meta: {} };
 
 async function uploadSfx(slotId, file, row) {
   const fd = new FormData();
   fd.append("file", file);
   const info = row.querySelector(".bgm-info");
-  info.textContent = "convirtiendo…";
+  info.textContent = t("snd.converting");
   try {
     const d = await api(`/api/audio/${slotId}/upload`, { method: "POST", body: fd });
     applySfxPayload(d, row);
@@ -664,12 +823,18 @@ async function uploadSfx(slotId, file, row) {
 
 function applySfxPayload(data, row) {
   sfx.chosen[data.slot] = data.job_id;
+  sfx.meta[data.slot] = data;
   guardarSesion();
   if (!row) return;
   const info = row.querySelector(".bgm-info");
   info.textContent = `${data.name} → ${data.codec}, ${data.duration}s, ${fmtBytes(data.bytes)}`;
   info.className = "bgm-info on";
   row.querySelector(".sfx-clear").hidden = false;
+  const audio = row.querySelector(".sfx-preview");
+  if (audio) {
+    audio.src = Projects.mediaUrl(data.preview || `/api/audio/${data.job_id}/preview`);
+    audio.hidden = false;
+  }
 }
 
 async function useLibraryAsset(id, slot) {
@@ -708,11 +873,15 @@ function describeBgmSupport() {
   const nota = $("bgm-note");
   if (!nota) return;
   nota.innerHTML = t(sys.at9tool ? "snd.any" : "snd.at9only");
-  $("bgm-file").setAttribute("accept", sys.at9tool ? "audio/*,.at9" : ".at9");
+  $("bgm-file").setAttribute("accept", sys.at9tool ? "audio/*,.at9,.wav,.mp3,.flac" : ".at9");
 }
 
 async function bootSfx() {
-  sfx.catalog = (await api("/api/audio/slots")).slots;
+  try {
+    sfx.catalog = (await api("/api/audio/slots")).slots;
+  } catch {
+    sfx.catalog = [];
+  }
   pintarSfxRows();
 }
 
@@ -730,7 +899,8 @@ function pintarSfxRows() {
       <span class="sfx-name">${lbl(spec.label)}</span>
       <label class="btn btn-ghost">${t("snd.pick")}<input type="file" accept="audio/*" hidden></label>
       <button class="btn btn-ghost sfx-clear" hidden>${t("snd.remove")}</button>
-      <span class="bgm-info">${t("snd.none.sfx")}</span>`;
+      <span class="bgm-info">${t("snd.none.sfx")}</span>
+      <audio class="sfx-preview" controls preload="none" hidden></audio>`;
     const input = row.querySelector("input");
     input.addEventListener("change", () => {
       if (input.files?.[0]) uploadSfx(spec.id, input.files[0], row);
@@ -738,15 +908,27 @@ function pintarSfxRows() {
     });
     row.querySelector(".sfx-clear").addEventListener("click", () => {
       delete sfx.chosen[spec.id];
+      delete sfx.meta[spec.id];
       row.querySelector(".bgm-info").textContent = t("snd.none.sfx");
       row.querySelector(".bgm-info").className = "bgm-info";
       row.querySelector(".sfx-clear").hidden = true;
+      const audio = row.querySelector(".sfx-preview");
+      if (audio) { audio.pause(); audio.removeAttribute("src"); audio.hidden = true; }
       guardarSesion();
     });
     if (sfx.chosen[spec.id]) {
-      // Redraw with something already uploaded: keep the state, do not reset.
-      row.querySelector(".bgm-info").className = "bgm-info on";
+      const m = sfx.meta[spec.id];
+      const info = row.querySelector(".bgm-info");
+      if (m) {
+        info.textContent = `${m.name} → ${m.codec}, ${m.duration}s${m.bytes ? `, ${fmtBytes(m.bytes)}` : ""}`;
+      }
+      info.className = "bgm-info on";
       row.querySelector(".sfx-clear").hidden = false;
+      const audio = row.querySelector(".sfx-preview");
+      if (audio) {
+        audio.src = Projects.mediaUrl(m?.preview || `/api/audio/${sfx.chosen[spec.id]}/preview`);
+        audio.hidden = false;
+      }
     }
     rows.append(row);
   });
@@ -767,7 +949,7 @@ function pintarSlots() {
       .forEach((s) => grid.append(slotCard(s)));
   }
   for (const [slotId, jobId] of Object.entries(slots.chosen)) {
-    paintSlot(slotId, `/api/slot/${jobId}/preview`);
+    paintSlot(slotId, Projects.mediaUrl(`/api/slot/${jobId}/preview`));
   }
   syncRafOverlap();
 }
@@ -895,14 +1077,18 @@ async function restoreEditorState(d, project = false) {
 
   if (d.bgm) {
     try {
-      // paintBgm already knows how to draw name, loudness and volume.
+      // paintBgm already knows how to draw name, loudness, preview and volume.
       let audio = await api(`/api/audio/${d.bgm}/info`);
-      if (project && Math.abs(audio.gain_db - d.bgmGain) > 0.01) {
-        const body = new FormData();
-        body.append("gain_db", String(d.bgmGain));
-        audio = await api(`/api/audio/${d.bgm}/gain`, { method: "POST", body });
+      if (project && sys?.at9tool && Math.abs((audio.gain_db ?? 0) - (d.bgmGain ?? 0)) > 0.01) {
+        try {
+          const body = new FormData();
+          body.append("gain_db", String(d.bgmGain));
+          audio = await api(`/api/audio/${d.bgm}/gain`, { method: "POST", body });
+        } catch { /* Preserve loaded audio even if re-encode is skipped */ }
       }
       paintBgm(audio);
+      if ($("forge-audio-preview-btn")) $("forge-audio-preview-btn").disabled = false;
+      if ($("forge-bgm-apply")) $("forge-bgm-apply").disabled = false;
       vivos++;
     } catch { perdidos++; }
   }
@@ -911,13 +1097,20 @@ async function restoreEditorState(d, project = false) {
     try {
       const a = await api(`/api/audio/${jobId}/info`);
       sfx.chosen[slotId] = jobId;
-      const fila = [...document.querySelectorAll("#sfx-rows .sfx-row")]
-        .find((r) => r.querySelector(".sfx-name")?.textContent === lbl(a.slot_label));
+      sfx.meta[slotId] = a;
+      const fila = document.querySelector(`#sfx-rows .sfx-row[data-slot="${CSS.escape(slotId)}"]`)
+        || [...document.querySelectorAll("#sfx-rows .sfx-row")]
+          .find((r) => r.querySelector(".sfx-name")?.textContent === lbl(a.slot_label));
       if (fila) {
         fila.querySelector(".bgm-info").textContent =
           `${a.name} → ${a.codec}, ${a.duration}s`;
         fila.querySelector(".bgm-info").className = "bgm-info on";
         fila.querySelector(".sfx-clear").hidden = false;
+        const audio = fila.querySelector(".sfx-preview");
+        if (audio) {
+          audio.src = Projects.mediaUrl(a.preview || `/api/audio/${jobId}/preview`);
+          audio.hidden = false;
+        }
       }
       vivos++;
     } catch { perdidos++; }
@@ -1230,6 +1423,12 @@ function renderTree() {
   if (animActive()) {
     rows.push([t("tree.animated"), "scene/background.raf/", t("tree.animated.note")]);
   }
+  if (bgm.jobId) {
+    rows.push([t("snd.music"), "sound/bgm_home.at9", "ATRAC9 · 48 kHz · 144 kbps"]);
+  }
+  for (const slotId of Object.keys(sfx.chosen)) {
+    rows.push([`SFX (${slotId})`, `sound/${slotId}.vag`, "PS-ADPCM · 48 kHz mono"]);
+  }
 
   $("pkg-tree").innerHTML =
     `<div class="tree-row tree-fixed"><span class="tree-k">Image0/</span></div>` +
@@ -1525,6 +1724,20 @@ $("bgm-gain").addEventListener("input", (e) => {
   $("bgm-gain-out").textContent = `${bgm.gain >= 0 ? "+" : ""}${bgm.gain.toFixed(1)} dB`;
 });
 $("bgm-gain").addEventListener("change", aplicarGanancia);
+
+if ($("forge-audio-file")) {
+  $("forge-audio-file").addEventListener("change", (e) => {
+    const f = e.target.files?.[0];
+    if (f) forgeInspectFile(f);
+    e.target.value = "";
+  });
+}
+if ($("forge-audio-preview-btn")) {
+  $("forge-audio-preview-btn").addEventListener("click", forgePreviewProcess);
+}
+if ($("forge-bgm-apply")) {
+  $("forge-bgm-apply").addEventListener("click", forgeConvertAndApplyBgm);
+}
 
 // wait does not change the frames, only the timing and the xml: applied live.
 $("anim-wait").addEventListener("input", (e) => {

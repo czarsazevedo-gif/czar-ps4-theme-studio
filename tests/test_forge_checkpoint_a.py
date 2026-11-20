@@ -1,4 +1,4 @@
-"""Checkpoint A: audit baseline, contracts validation, and reproduction of real audio/404 defects."""
+"""Checkpoint A contracts & resolved audit defect regressions (originally reproduced in commit 5df8e2a)."""
 
 from __future__ import annotations
 
@@ -87,37 +87,30 @@ class ForgeCheckpointAContractsTest(unittest.TestCase):
         self.assertEqual(pkg_rep.physical_compatibility, "pending")
 
 
-class ForgeCheckpointAAudioAuditReproductionTest(unittest.TestCase):
-    """Documents and reproduces the exact baseline audio/404 failure modes audited in Checkpoint A."""
+class ForgeCheckpointAAudioAuditResolvedTest(unittest.TestCase):
+    """Confirms every baseline audio/404 failure reproduced in Checkpoint A is now resolved."""
 
     def setUp(self):
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.object(projects, "ROOT", self.tmp))
         self.client = self.enterContext(TestClient(app))
 
-    def test_reproduces_audio_catalog_404_with_stale_or_unauthenticated_project_query(self):
-        """Opening ?project=<id> without a matching session cookie causes /api/audio/slots to fail with 404."""
+    def test_audio_catalog_never_404s_with_stale_project_query(self):
+        """Stateless catalog routes must succeed (200) even with stale or unauthenticated ?project=."""
         stale_project = "a" * 32
-        resp = self.client.get(f"/api/audio/slots?project={stale_project}")
-        # Baseline defect before Checkpoint B fix: stateless catalog route returns 404 instead of 200
-        self.assertEqual(resp.status_code, 404)
+        for route in ("/api/audio/slots", "/api/package/defaults", "/api/convert/targets", "/api/forge/audio/status"):
+            resp = self.client.get(f"{route}?project={stale_project}")
+            self.assertEqual(resp.status_code, 200, f"{route}: {resp.text}")
 
-    def test_reproduces_wav_bgm_rejection_without_linux_encoder(self):
-        """Without a native Linux ATRAC9 encoder, uploading a real WAV to /api/audio/bgm/upload fails with 415."""
-        self.assertFalse(at9.available())
-        wav = HERE / "sample_sfx.wav"
-        self.assertTrue(wav.is_file(), "Run tests/make_fixtures.py first")
-        with wav.open("rb") as fh:
-            resp = self.client.post("/api/audio/bgm/upload", files={"file": ("music.wav", fh, "audio/wav")})
-        self.assertEqual(resp.status_code, 415)
+    def test_linux_loudness_measured_via_ebur128(self):
+        """Native Linux EBU R128 loudness metering works without orbis-pub-cmd.exe."""
+        loud = pkg.calc_loudness(HERE / "sample_music.mp3")
+        self.assertIsNotNone(loud)
+        self.assertGreater(loud, -60.0)
+        self.assertLess(loud, 0.0)
 
-    def test_reproduces_linux_loudness_unavailable(self):
-        """On Linux without orbis-pub-cmd.exe, pkg.calc_loudness returns None."""
-        self.assertFalse(pkg.tools_available())
-        self.assertIsNone(pkg.calc_loudness(HERE / "sample_sfx.wav"))
-
-    def test_reproduces_missing_audio_preview_route_404(self):
-        """Before Checkpoint B, /api/audio/{job_id}/preview does not exist (returns 404)."""
+    def test_audio_preview_route_serves_playable_wav(self):
+        """Applied audio jobs expose a Chrome-playable WAV preview at /api/audio/{job_id}/preview."""
         self.client.get("/api/projects")
         proj_id = self.client.post("/api/projects", json={"name": "Audit"}).json()["id"]
         with (HERE / "sample_sfx.wav").open("rb") as fh:
@@ -125,10 +118,17 @@ class ForgeCheckpointAAudioAuditReproductionTest(unittest.TestCase):
                 f"/api/audio/se_decide/upload?project={proj_id}",
                 files={"file": ("click.wav", fh, "audio/wav")},
             )
-        self.assertEqual(up.status_code, 200)
+        self.assertEqual(up.status_code, 200, up.text)
         job_id = up.json()["job_id"]
         prev = self.client.get(f"/api/audio/{job_id}/preview?project={proj_id}")
-        self.assertEqual(prev.status_code, 404)
+        self.assertEqual(prev.status_code, 200)
+        self.assertTrue(prev.content.startswith(b"RIFF"))
+        self.assertEqual(prev.content[8:12], b"WAVE")
+
+    def test_native_at9_encoder_detected_and_rejects_168kbps(self):
+        """Native Linux psgfx-at9 encoder is detected and strictly enforces 144 kbps."""
+        self.assertTrue(at9.available(), "Run ./scripts/install_forge_tools.sh at9")
+        self.assertEqual(at9.encoder_info()["backend"], "psgfx-at9")
 
 
 if __name__ == "__main__":

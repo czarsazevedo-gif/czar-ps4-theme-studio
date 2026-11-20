@@ -655,6 +655,84 @@ input[type=range]:disabled { opacity: .45; cursor: default; }
 .sfx-row:last-child { border-bottom: 0; }
 .sfx-name { font-size: 14px; min-width: 130px; }
 .sfx-row .btn { cursor: pointer; font-size: 13.5px; padding: 6px 12px; }
+.sfx-preview { height: 32px; max-width: 240px; }
+
+.forge-audio-box {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: var(--bg-soft, #ffffff06);
+}
+.forge-audio-players {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+}
+.forge-audio-players audio {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  height: 36px;
+}
+.forge-audio-studio {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-soft);
+}
+.forge-audio-studio > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 14px;
+  padding: 6px 0;
+}
+.forge-audio-grid {
+  display: grid;
+  gap: 14px;
+  margin-top: 12px;
+}
+.forge-audio-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin-top: 8px;
+}
+.forge-audio-inline label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+.forge-audio-inline input[type="number"] {
+  width: 96px;
+}
+.forge-audio-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.forge-audio-actions .btn {
+  min-height: 44px;
+  padding: 10px 18px;
+}
+.forge-audio-diag {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-soft, #ffffff05);
+}
+.forge-metrics-pre {
+  margin: 10px 0 0;
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: 6px;
+  background: #00000033;
+}
+
 
 
 

@@ -121,20 +121,32 @@ def project_path(request: Request, project: str) -> Path:
     return root
 
 
+STATELESS_CATALOG_PATHS = {
+    "/api/audio/slots",
+    "/api/convert/targets",
+    "/api/package/defaults",
+    "/api/package/content-id",
+    "/api/forge/audio/status",
+    "/api/forge/status",
+}
+
+
 async def scope_jobs(request: Request, call_next):
     """Use the existing media endpoints with a private project directory."""
     project = request.query_params.get("project")
     path = request.url.path
     library_apply = path.startswith("/api/library/") and path.endswith("/apply")
     project_tool = path.startswith(("/api/composition/", "/api/ouroboros/"))
-    protected = project is not None or project_tool or path.startswith(("/api/projects", "/api/library"))
+    protected = project is not None or project_tool or path.startswith(("/api/projects", "/api/library", "/api/forge"))
     if protected and request.method in {"POST", "PUT"}:
         if not valid_origin(request):
             return JSONResponse({"detail": "Origem da solicitação não autorizada."}, status_code=403)
     if (library_apply or project_tool) and project is None:
         return JSONResponse({"detail": "Abra um projeto antes de aplicar a mídia."}, status_code=400)
+    if path in STATELESS_CATALOG_PATHS:
+        return await call_next(request)
     if project is None or not (library_apply or project_tool or path.startswith(
-        ("/api/animated/", "/api/slot/", "/api/audio/", "/api/convert/", "/api/package/")
+        ("/api/animated/", "/api/slot/", "/api/audio/", "/api/convert/", "/api/package/", "/api/forge/")
     )):
         return await call_next(request)
     try:

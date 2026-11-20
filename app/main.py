@@ -7,8 +7,10 @@ else keeps working.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import shutil
 import tempfile
 import time
 import zipfile
@@ -21,6 +23,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 
 from . import at9, compositor, jobs, library, mdx, media, ouroboros, pkg, projects, raf, theme, theme_xml, vag
+from .forge import audio_router as forge_audio
+from .forge.audio_validation import measure_loudness, validate_at9
 from .config import (
     ANIMATED_FRAME_BYTES,
     ANIMATED_SIZE,
@@ -62,6 +66,7 @@ app.include_router(projects.router)
 app.include_router(library.router)
 app.include_router(compositor.router)
 app.include_router(ouroboros.router)
+app.include_router(forge_audio.router)
 
 #: The UI used to allow going over the cap "so the red bar could be seen".
 #: That let you assemble a theme the console rejects with CE-38196-7, so it no
@@ -159,6 +164,7 @@ def system_info() -> dict:
         "magick": bool(media.MAGICK),
         "pkg_tools": pkg.tools_available(),
         "at9tool": at9.available(),
+        "at9_encoder": at9.encoder_info(),
         "min_gain_db": MIN_GAIN_DB,
         "max_gain_db": MAX_GAIN_DB,
         "backends": available_backends(),
@@ -504,16 +510,18 @@ def audio_catalog() -> dict:
         ],
         "max_sfx_seconds": MAX_SFX_SECONDS,
         "at9tool": at9.available(),
+        "at9_encoder": at9.encoder_info(),
     }
 
 
 @app.post("/api/audio/{slot_id}/upload")
 async def audio_upload(slot_id: str, file: UploadFile = File(...),
                        gain_db: float = Form(0.0)) -> dict:
-    """Uploads the menu music.
+    """Uploads menu music or sound effects.
 
-    With at9tool present the file is converted; without it, it is only
-    validated, so a broken theme cannot be assembled by accident.
+    With a native ATRAC9 encoder (psgfx-at9) or at9tool.exe present, any
+    supported audio is converted to PS4 ATRAC9 (48 kHz, stereo, 144 kbps, loop);
+    without an encoder, uploaded .at9 files are strictly validated.
     """
     spec = AUDIO_SLOTS.get(slot_id)
     if spec is None:
@@ -521,11 +529,15 @@ async def audio_upload(slot_id: str, file: UploadFile = File(...),
     filename = file.filename or ""
     data = await _read_upload(file, _audio_upload_extensions(filename, spec))
     job = jobs.create("audio", filename or "source", data)
-    return _prepare_audio_upload(job, slot_id, spec, gain_db)
+    try:
+        return _prepare_audio_upload(job, slot_id, spec, gain_db)
+    except BaseException:
+        shutil.rmtree(job.root, ignore_errors=True)
+        raise
 
 
 def _audio_upload_extensions(filename: str, spec: dict) -> set[str]:
-    # With at9tool around, the music slot takes ordinary audio too.
+    # With an ATRAC9 encoder around, the music slot takes ordinary audio too.
     allowed = spec["exts"] or SOUND_EXTS
     if not spec["convert"]:
         if at9.available():
@@ -537,9 +549,8 @@ def _audio_upload_extensions(filename: str, spec: dict) -> set[str]:
             # Valid audio, we just cannot convert it: better to say so.
             raise HTTPException(
                 415,
-                "The console only accepts ATRAC9 (.at9) for the music. "
-                "Convert it first, or drop at9tool.exe in tools/ and it will be "
-                "done automatically.",
+                "O PS4 exige ATRAC9 (.at9) para a música do menu. Instale o codificador "
+                "nativo (./scripts/install_forge_tools.sh at9) ou envie um .at9 válido.",
             )
     return allowed
 
@@ -585,11 +596,20 @@ def apply_library_asset(request: Request, ident: str, selection: LibraryUse) -> 
                 return _prepare_animated_upload(job, selection.frames, selection.size)
             if kind == "slot":
                 return _prepare_slot_upload(job, slot, IMAGE_SLOTS[slot])
+            job.meta["library_id"] = asset.id
             return _prepare_audio_upload(job, slot, AUDIO_SLOTS[slot], 0.0)
     except (MediaError, HTTPException) as exc:
         raise HTTPException(422, "O processador não conseguiu preparar esta mídia para o destino.") from exc
     except OSError as exc:
         raise library.storage_error() from exc
+
+
+def _sha256_path(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while chunk := fh.read(1024 * 1024):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _procesar_audio(job: jobs.Job, spec: dict, gain_db: float = 0.0) -> dict:
@@ -603,16 +623,33 @@ def _procesar_audio(job: jobs.Job, spec: dict, gain_db: float = 0.0) -> dict:
     slot_id = str(job.meta.get("slot") or "bgm")
     info = media.probe_audio(job.source)
     job.meta["gain_db"] = gain_db
+    job.meta["source_codec"] = info.codec
+    job.meta["original_sha256"] = _sha256_path(job.source)
     ganancia = {"gain_db": gain_db}
+    stamp = int(time.time() * 1000)
 
     if spec["convert"]:
         # Effects can be generated here: PS-ADPCM is documented.
         pcm = media.pcm_mono(job.source, spec["rate"], MAX_SFX_SECONDS, gain_db)
         blob = vag.encode(pcm, spec["rate"], slot_id)
         out = job.out_dir / "sound.vag"
-        out.write_bytes(blob)
-        job.meta["converted"] = out.name
+        tmp = out.with_suffix(".vag.tmp")
+        tmp.write_bytes(blob)
+        tmp.replace(out)
+        conv_sha = hashlib.sha256(blob).hexdigest()
+        job.meta.update(
+            {
+                "converted": out.name,
+                "converted_sha256": conv_sha,
+                "derived_id": conv_sha[:16],
+                "codec": "vag (PS-ADPCM)",
+                "rate": spec["rate"],
+                "channels": 1,
+                "duration": round(min(info.duration, MAX_SFX_SECONDS), 2),
+            }
+        )
         job.save()
+        forge_audio.ensure_audio_job_previews(job)
         return {
             "slot": slot_id,
             "job_id": job.id,
@@ -626,6 +663,10 @@ def _procesar_audio(job: jobs.Job, spec: dict, gain_db: float = 0.0) -> dict:
             "source_codec": info.codec,
             "loudness": None,
             "slot_label": spec["label"],
+            "derived_id": conv_sha[:16],
+            "original_sha256": job.meta["original_sha256"],
+            "converted_sha256": conv_sha,
+            "preview": f"/api/audio/{job.id}/preview?v={stamp}",
             **ganancia,
         }
 
@@ -635,32 +676,64 @@ def _procesar_audio(job: jobs.Job, spec: dict, gain_db: float = 0.0) -> dict:
     if hay_que_convertir:
         if not at9.available():
             detalle = (
-                "Changing the volume means re-encoding the .at9, and that needs "
-                "at9tool.exe in tools/."
+                "Alterar o volume exige recodificar o .at9; instale o codificador ATRAC9 "
+                "(./scripts/install_forge_tools.sh at9)."
                 if info.codec == spec["codec"] else
-                f"The file is {info.codec}, not {spec['codec']}. The console only "
-                "accepts ATRAC9 in sound/bgm_home.at9. Drop at9tool.exe in "
-                "tools/ and it will be converted automatically."
+                f"O arquivo é {info.codec}, não {spec['codec']}. O console só aceita "
+                "ATRAC9 em sound/bgm_home.at9. Instale o codificador ATRAC9 ou envie um .at9 válido."
             )
             raise HTTPException(422, detalle)
 
         wav = job.out_dir / "source.wav"
-        media.to_wav(job.source, wav, at9.SAMPLE_RATE, at9.MAX_SECONDS, gain_db)
-        encoded = at9.encode(wav, job.out_dir / "bgm.at9")
-        wav.unlink(missing_ok=True)
-        job.meta["converted"] = encoded.name
+        try:
+            media.to_wav(job.source, wav, at9.SAMPLE_RATE, at9.MAX_SECONDS, gain_db)
+            encoded = at9.encode(wav, job.out_dir / "bgm.at9")
+        finally:
+            wav.unlink(missing_ok=True)
+        val = validate_at9(encoded, require_ps4_profile=True, require_loop=True)
+        if not val.valid:
+            raise HTTPException(422, "Validação do ATRAC9 gerado falhou: " + "; ".join(val.errors))
+        loud_rep = measure_loudness(encoded)
+        loud = pkg.calc_loudness(encoded) if pkg.tools_available() else loud_rep.integrated_lufs
+        conv_sha = _sha256_path(encoded)
+        enc_info = at9.encoder_info()
+        job.meta.update(
+            {
+                "converted": encoded.name,
+                "converted_sha256": conv_sha,
+                "derived_id": conv_sha[:16],
+                "codec": val.codec,
+                "rate": val.sample_rate,
+                "channels": val.channels,
+                "bitrate_kbps": at9.DEFAULT_BITRATE,
+                "duration": round(val.duration_seconds, 2),
+                "loudness": loud,
+                "loudness_report": loud_rep.model_dump(),
+                "volume_mode": "manual" if abs(gain_db) > 0.01 else "original",
+                "loop_start_sample": val.loop_start_sample,
+                "loop_end_sample": val.loop_end_sample,
+                "play_count": val.play_count,
+                "validation": val.model_dump(),
+                "encoder_backend": enc_info["backend"],
+            }
+        )
         job.save()
-        convertido = media.probe_audio(encoded)
-        loud = pkg.calc_loudness(encoded)
-        job.meta["loudness"] = loud
-        job.save()
+        forge_audio.ensure_audio_job_previews(job)
         return {
             "slot": slot_id, "job_id": job.id, "path": spec["path"],
-            "name": job.original_name, "codec": convertido.codec,
-            "rate": convertido.rate, "channels": convertido.channels,
-            "duration": round(convertido.duration, 1),
+            "name": job.original_name, "codec": val.codec,
+            "rate": val.sample_rate, "channels": val.channels,
+            "duration": round(val.duration_seconds, 1),
             "bytes": encoded.stat().st_size,
             "source_codec": info.codec, "loudness": loud,
+            "loudness_report": loud_rep.model_dump(),
+            "validation": val.model_dump(),
+            "derived_id": conv_sha[:16],
+            "original_sha256": job.meta["original_sha256"],
+            "converted_sha256": conv_sha,
+            "encoder_backend": enc_info["backend"],
+            "preview": f"/api/audio/{job.id}/preview?v={stamp}",
+            "seam_preview": f"/api/audio/{job.id}/seam-preview?v={stamp}",
             "slot_label": spec["label"], **ganancia,
         }
 
@@ -669,10 +742,39 @@ def _procesar_audio(job: jobs.Job, spec: dict, gain_db: float = 0.0) -> dict:
             422, f"It must be {spec['rate']} Hz; this one is {info.rate} Hz."
         )
 
+    val = validate_at9(job.source, require_ps4_profile=True, require_loop=False)
+    if not val.valid:
+        raise HTTPException(
+            422,
+            "O arquivo .at9 enviado está inválido ou fora da especificação PS4: "
+            + "; ".join(val.errors),
+        )
+
     job.meta.pop("converted", None)
-    loudness = pkg.calc_loudness(job.source)
-    job.meta["loudness"] = loudness
+    loud_rep = measure_loudness(job.source)
+    loudness = pkg.calc_loudness(job.source) if pkg.tools_available() else loud_rep.integrated_lufs
+    src_sha = job.meta["original_sha256"]
+    job.meta.update(
+        {
+            "converted_sha256": src_sha,
+            "derived_id": src_sha[:16],
+            "codec": val.codec,
+            "rate": val.sample_rate,
+            "channels": val.channels,
+            "bitrate_kbps": at9.DEFAULT_BITRATE,
+            "duration": round(val.duration_seconds, 2),
+            "loudness": loudness,
+            "loudness_report": loud_rep.model_dump(),
+            "volume_mode": "original",
+            "loop_start_sample": val.loop_start_sample,
+            "loop_end_sample": val.loop_end_sample,
+            "play_count": val.play_count,
+            "validation": val.model_dump(),
+            "encoder_backend": "passthrough-at9",
+        }
+    )
     job.save()
+    forge_audio.ensure_audio_job_previews(job)
     return {
         "slot": slot_id,
         "job_id": job.id,
@@ -685,6 +787,14 @@ def _procesar_audio(job: jobs.Job, spec: dict, gain_db: float = 0.0) -> dict:
         "bytes": job.source.stat().st_size,
         "source_codec": info.codec,
         "loudness": loudness,
+        "loudness_report": loud_rep.model_dump(),
+        "validation": val.model_dump(),
+        "derived_id": src_sha[:16],
+        "original_sha256": src_sha,
+        "converted_sha256": src_sha,
+        "encoder_backend": "passthrough-at9",
+        "preview": f"/api/audio/{job.id}/preview?v={stamp}",
+        "seam_preview": f"/api/audio/{job.id}/seam-preview?v={stamp}",
         "slot_label": spec["label"],
         **ganancia,
     }
@@ -700,6 +810,22 @@ def audio_gain(job_id: str, gain_db: float = Form(0.0)) -> dict:
     return _procesar_audio(job, spec, _clamp_gain(gain_db))
 
 
+@app.get("/api/audio/{job_id}/preview")
+def audio_preview(job_id: str) -> FileResponse:
+    """Streams a Chrome-playable WAV preview decoded from the active .at9 or .vag audio job."""
+    job = _get_job("audio", job_id)
+    preview_wav, _seam = forge_audio.ensure_audio_job_previews(job)
+    return FileResponse(preview_wav, media_type="audio/wav", headers={"Cache-Control": "private, no-store"})
+
+
+@app.get("/api/audio/{job_id}/seam-preview")
+def audio_seam_preview(job_id: str) -> FileResponse:
+    """Streams a short WAV focusing on the loop boundary (tail -> head) of the active BGM .at9."""
+    job = _get_job("audio", job_id)
+    _prev, seam_wav = forge_audio.ensure_audio_job_previews(job)
+    if seam_wav is None or not seam_wav.is_file():
+        raise HTTPException(404, "Prévia de costura de loop disponível apenas para música do menu.")
+    return FileResponse(seam_wav, media_type="audio/wav", headers={"Cache-Control": "private, no-store"})
 
 
 def _resolve_slot_jobs(raw: dict[str, str]) -> dict[str, jobs.Job]:
@@ -745,6 +871,7 @@ def audio_info(job_id: str) -> dict:
         raise HTTPException(404, "The file is gone.")
 
     info = media.probe_audio(blob)
+    stamp = int(time.time() * 1000)
     return {
         "slot": slot_id,
         "job_id": job.id,
@@ -756,6 +883,17 @@ def audio_info(job_id: str) -> dict:
         "duration": round(info.duration, 1),
         "bytes": blob.stat().st_size,
         "loudness": job.meta.get("loudness"),
+        "loudness_report": job.meta.get("loudness_report"),
+        "validation": job.meta.get("validation"),
+        "loop_report": job.meta.get("loop_report"),
+        "post_at9_loop": job.meta.get("post_at9_loop"),
+        "volume_mode": job.meta.get("volume_mode", "original"),
+        "derived_id": job.meta.get("derived_id"),
+        "original_sha256": job.meta.get("original_sha256"),
+        "converted_sha256": job.meta.get("converted_sha256"),
+        "encoder_backend": job.meta.get("encoder_backend"),
+        "preview": f"/api/audio/{job.id}/preview?v={stamp}",
+        "seam_preview": f"/api/audio/{job.id}/seam-preview?v={stamp}" if slot_id == "bgm" else None,
         # The interface matches the effect row by its label.
         "slot_label": spec["label"],
         "gain_db": job.meta.get("gain_db", 0.0),

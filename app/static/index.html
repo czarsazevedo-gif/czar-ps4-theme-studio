@@ -338,10 +338,22 @@
       <div class="bgm-row">
         <label class="btn btn-ghost">
           <span id="bgm-btn-label" data-i18n="snd.pick"></span>
-          <input type="file" id="bgm-file" accept=".at9" hidden>
+          <input type="file" id="bgm-file" accept=".wav,.mp3,.flac,.ogg,.m4a,.aac,.opus,.at9,audio/*" hidden>
         </label>
         <button id="bgm-clear" class="btn btn-ghost" data-i18n="snd.remove" hidden></button>
         <span id="bgm-info" class="bgm-info" data-i18n="snd.none"></span>
+      </div>
+
+      <div id="bgm-player-box" class="forge-audio-box" hidden>
+        <div class="forge-audio-players">
+          <label class="ctl-note">Prévia da música aplicada (ATRAC9 decodificado)
+            <audio id="bgm-player" controls preload="none"></audio>
+          </label>
+          <label class="ctl-note">Prévia da costura do loop (fim → início)
+            <audio id="bgm-seam-player" controls preload="none"></audio>
+          </label>
+        </div>
+        <p class="ctl-note" id="bgm-validation-badge"></p>
       </div>
 
       <div class="ctl" id="bgm-gain-row" hidden>
@@ -352,6 +364,76 @@
         <input type="range" id="bgm-gain" min="-24" max="12" value="0" step="0.5">
         <p class="ctl-note" id="bgm-gain-note"></p>
       </div>
+
+      <details class="forge-audio-studio" id="forge-at9-studio" open>
+        <summary>CZAR ATRAC9 Studio · Acabamento de loop, volume profissional e conversão nativa (48 kHz · 144 kbps)</summary>
+        <div class="forge-audio-grid">
+          <div class="ctl">
+            <label class="ctl-head" for="forge-audio-file"><span>Importar música para preparar (WAV, MP3, FLAC ou AT9)</span></label>
+            <div class="bgm-row">
+              <label class="btn btn-ghost">
+                <span>Selecionar arquivo</span>
+                <input type="file" id="forge-audio-file" accept=".wav,.mp3,.flac,.ogg,.m4a,.aac,.opus,.at9,audio/*" hidden>
+              </label>
+              <span id="forge-audio-src-info" class="ctl-note">Nenhum arquivo carregado na bancada.</span>
+            </div>
+          </div>
+
+          <div class="ctl">
+            <label class="ctl-head" for="forge-loop-mode"><span>CZAR Audio Loop Finisher</span></label>
+            <select id="forge-loop-mode" class="select">
+              <option value="whole">Loop integral (preservar música inteira)</option>
+              <option value="auto_refined">Ajuste automático de fronteira e fase</option>
+              <option value="manual_excerpt">Seleção manual de trecho (início/fim precisos)</option>
+            </select>
+            <div class="forge-audio-inline" id="forge-excerpt-row">
+              <label>Início (s) <input type="number" id="forge-loop-start" class="field" min="0" step="0.01" placeholder="0.00"></label>
+              <label>Fim (s) <input type="number" id="forge-loop-end" class="field" min="0" step="0.01" placeholder="auto"></label>
+              <label>Crossfade (ms) <input type="number" id="forge-loop-xfade" class="field" min="0" max="250" step="1" value="0"></label>
+            </div>
+            <div class="forge-audio-inline">
+              <label><input type="checkbox" id="forge-loop-trim"> Remover silêncio nas bordas</label>
+              <label><input type="checkbox" id="forge-loop-fade"> Autorizar fade curto (15 ms)</label>
+            </div>
+          </div>
+
+          <div class="ctl">
+            <label class="ctl-head" for="forge-volume-mode"><span>Controle de volume profissional</span></label>
+            <select id="forge-volume-mode" class="select">
+              <option value="original">Volume original (sem normalização silenciosa)</option>
+              <option value="ambient">Música ambiente PS4 (−28,0 LUFS · ref. −32,0 LKFS)</option>
+              <option value="manual">Ajuste manual (dB)</option>
+              <option value="assisted">Normalização assistida (alvo LUFS)</option>
+            </select>
+            <div class="forge-audio-inline">
+              <label>Ganho manual (dB) <input type="number" id="forge-volume-gain" class="field" min="-24" max="12" step="0.5" value="0"></label>
+              <label>Alvo LUFS <input type="number" id="forge-volume-lufs" class="field" min="-36" max="-12" step="0.5" value="-28"></label>
+            </div>
+            <p class="ctl-note" id="forge-volume-note">A prévia no navegador não replica o nivelamento interno do PS4 (bgmhome_loud no param.sfo).</p>
+          </div>
+
+          <div class="forge-audio-actions">
+            <button type="button" id="forge-audio-preview-btn" class="btn btn-ghost" disabled>Ouvir prévia antes/depois</button>
+            <button type="button" id="forge-bgm-apply" class="btn btn-primary" disabled>CONVERTER E APLICAR MÚSICA</button>
+          </div>
+
+          <div id="forge-audio-diagnostics" class="forge-audio-diag" hidden>
+            <p id="forge-audio-status" role="status"></p>
+            <div class="forge-audio-players" id="forge-audio-ab-players" hidden>
+              <label class="ctl-note">Antes (original)
+                <audio id="forge-player-before" controls preload="none"></audio>
+              </label>
+              <label class="ctl-note">Depois (ajustado)
+                <audio id="forge-player-after" controls preload="none"></audio>
+              </label>
+              <label class="ctl-note">Costura do loop (repetição)
+                <audio id="forge-player-seam" controls preload="none"></audio>
+              </label>
+            </div>
+            <pre id="forge-audio-metrics" class="forge-metrics-pre"></pre>
+          </div>
+        </div>
+      </details>
     </div>
 
     <h2 class="group-title"><span data-i18n="snd.sfx"></span> <span class="dim" data-i18n="snd.sfx.when"></span></h2>

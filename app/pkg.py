@@ -55,24 +55,32 @@ def tools_available() -> bool:
 
 
 def calc_loudness(path) -> float | None:
-    """Loudness in LKFS of a .wav or .at9, or None when it cannot be measured.
+    """Loudness in LKFS/LUFS of a .wav or .at9, or None when it cannot be measured.
 
     The PS4 uses it to level the theme's music; the reference theme carries it
     in its PUBTOOLINFO as `bgmhome_loud`.
-    For .at9 files ext/libatrac9.dll must sit next to the exe.
+    Uses orbis-pub-cmd.exe when available on Windows, and native FFmpeg EBU R128
+    (ITU-R BS.1770-4, where LUFS == LKFS) on Linux.
     """
-    if not tools_available():
-        return None
+    if tools_available():
+        try:
+            proc = subprocess.run(
+                [str(ORBIS_CMD), "file_calc_loudness", str(path)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=120, creationflags=NO_WINDOW,
+            )
+            match = re.search(r"(-?\d+\.\d+)\s*LKFS", proc.stdout.decode("utf-8", "replace"))
+            if match:
+                return float(match.group(1))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     try:
-        proc = subprocess.run(
-            [str(ORBIS_CMD), "file_calc_loudness", str(path)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=120, creationflags=NO_WINDOW,
-        )
-    except subprocess.TimeoutExpired:
+        from .forge.audio_validation import measure_loudness
+
+        return measure_loudness(Path(path)).integrated_lufs
+    except Exception:
         return None
-    match = re.search(r"(-?\d+\.\d+)\s*LKFS", proc.stdout.decode("utf-8", "replace"))
-    return float(match.group(1)) if match else None
+
 
 
 @dataclass
