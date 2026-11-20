@@ -218,18 +218,21 @@ async def forge_audio_inspect(
     try:
         if file is not None:
             original_name, suffix, data = await _read_music_upload(file)
-            src_path = stage / f"source{suffix}"
+            src_path = stage / f"original{suffix}"
             src_path.write_bytes(data)
         else:
             resolved, original_name, _is_lib = _resolve_input_source(
                 request, library_id=library_id, job_id=job_id
             )
             suffix = resolved.suffix.lower() or ".wav"
-            src_path = stage / f"source{suffix}"
+            src_path = stage / f"original{suffix}"
             shutil.copyfile(resolved, src_path)
 
         (stage / "meta.txt").write_text(f"{src_path.name}\n{original_name}\n", encoding="utf-8")
 
+        # Measure immutable source identity BEFORE generating any derived PCM preview!
+        original_bytes = src_path.stat().st_size
+        original_sha256 = _sha256_file(src_path)
         info = media.probe_audio(src_path)
         at9_validation = None
         if src_path.suffix.lower() == ".at9" or info.codec == "atrac9":
@@ -241,19 +244,23 @@ async def forge_audio_inspect(
                 )
 
         pcm = decode_to_float64_stereo(src_path, sample_rate=PS4_ATRAC9_SAMPLE_RATE, max_seconds=at9.MAX_SECONDS)
-        write_pcm16_wav(pcm, stage / "source.wav", sample_rate=PS4_ATRAC9_SAMPLE_RATE)
+        preview_orig = stage / "preview_original.wav"
+        write_pcm16_wav(pcm, preview_orig, sample_rate=PS4_ATRAC9_SAMPLE_RATE)
+        preview_sha256 = _sha256_file(preview_orig)
         render_loop_seam_preview_wav(pcm, stage / "seam.wav", sr=PS4_ATRAC9_SAMPLE_RATE)
 
         loud = measure_loudness(src_path)
         loop_analysis = analyze_audio_loop(pcm, sr=PS4_ATRAC9_SAMPLE_RATE)
-        sha256 = _sha256_file(src_path)
         stamp = int(time.time() * 1000)
         return {
             "staging_id": token,
             "name": original_name,
             "extension": src_path.suffix.lower(),
-            "bytes": src_path.stat().st_size,
-            "sha256": sha256,
+            "bytes": original_bytes,
+            "original_bytes": original_bytes,
+            "sha256": original_sha256,
+            "original_sha256": original_sha256,
+            "preview_sha256": preview_sha256,
             "codec": info.codec,
             "sample_rate": info.rate,
             "channels": info.channels,
@@ -262,7 +269,7 @@ async def forge_audio_inspect(
             "at9_validation": at9_validation,
             "loudness": loud.model_dump(),
             "loop_analysis": loop_analysis,
-            "preview_url": f"/api/forge/audio/preview/{token}/source.wav?v={stamp}",
+            "preview_url": f"/api/forge/audio/preview/{token}/preview_original.wav?v={stamp}",
             "seam_preview_url": f"/api/forge/audio/preview/{token}/seam.wav?v={stamp}",
             "can_convert": at9.available(),
             "browser_vs_ps4_note": BROWSER_VS_PS4_LOUDNESS_NOTE,
@@ -311,14 +318,15 @@ def forge_audio_preview_process(
         token = uuid.uuid4().hex[:24]
         stage = root / token
         stage.mkdir(parents=True, exist_ok=True)
-        copy_src = stage / f"source{src_path.suffix.lower() or '.wav'}"
+        copy_src = stage / f"original{src_path.suffix.lower() or '.wav'}"
         shutil.copyfile(src_path, copy_src)
         (stage / "meta.txt").write_text(f"{copy_src.name}\n{original_name}\n", encoding="utf-8")
         src_path = copy_src
 
     pcm_raw = decode_to_float64_stereo(src_path, sample_rate=PS4_ATRAC9_SAMPLE_RATE, max_seconds=at9.MAX_SECONDS)
-    if not (stage / "source.wav").is_file():
-        write_pcm16_wav(pcm_raw, stage / "source.wav", sample_rate=PS4_ATRAC9_SAMPLE_RATE)
+    preview_orig = stage / "preview_original.wav"
+    if not preview_orig.is_file():
+        write_pcm16_wav(pcm_raw, preview_orig, sample_rate=PS4_ATRAC9_SAMPLE_RATE)
 
     try:
         looped, loop_report = finish_audio_loop(
@@ -352,11 +360,12 @@ def forge_audio_preview_process(
     return {
         "staging_id": token,
         "name": original_name,
+        "original_sha256": _sha256_file(src_path),
         "loop_report": loop_report.model_dump(),
         "volume_params": vol_params,
         "before_loudness": before_loud.model_dump(),
         "after_loudness": after_loud.model_dump(),
-        "original_preview_url": f"/api/forge/audio/preview/{token}/source.wav?v={stamp}",
+        "original_preview_url": f"/api/forge/audio/preview/{token}/preview_original.wav?v={stamp}",
         "preview_url": f"/api/forge/audio/preview/{token}/processed.wav?v={stamp}",
         "seam_preview_url": f"/api/forge/audio/preview/{token}/seam.wav?v={stamp}",
         "browser_vs_ps4_note": BROWSER_VS_PS4_LOUDNESS_NOTE,
@@ -365,10 +374,12 @@ def forge_audio_preview_process(
 
 @router.get("/preview/{token}/{name}")
 def forge_audio_preview_file(token: str, name: str) -> FileResponse:
-    if name not in ALLOWED_PREVIEW_FILES:
+    if name not in (ALLOWED_PREVIEW_FILES | {"preview_original.wav"}):
         raise HTTPException(404, "Arquivo de prévia inválido.")
     folder = _stage_dir(token)
     target = folder / name
+    if name == "source.wav" and not target.is_file():
+        target = folder / "preview_original.wav"
     if not target.is_file():
         raise HTTPException(404, "Prévia ainda não gerada.")
     return FileResponse(target, media_type="audio/wav", headers={"Cache-Control": "private, no-store"})

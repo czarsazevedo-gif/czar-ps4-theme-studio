@@ -226,7 +226,8 @@ def _parse_params(
     composition_mode: str,
     animation_size: str,
 ) -> dict:
-    if use_saved_project and jobs.project_workspace.get() is not None:
+    ws = jobs.project_workspace.get()
+    if use_saved_project and ws is not None and (ws.parent / "manifest.json").is_file():
         return resolve_theme_inputs_from_saved_project()
     try:
         raw_slots = json.loads(slots or "{}")

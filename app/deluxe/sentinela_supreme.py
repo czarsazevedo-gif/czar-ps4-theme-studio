@@ -34,8 +34,7 @@ CLASS_REGIONAL = "ADEQUADO À RECONSTRUÇÃO REGIONAL"
 CLASS_UNSUITABLE = "INADEQUADO"
 
 
-def probe_source_extended(source: Path, duration: float, check: Callable[[], None] = lambda: None) -> dict:
-    """Read real timestamps across the video (up to 600 frames) for reliable VFR & FPS detection."""
+def _probe_pts_window(source: Path, interval: str, check: Callable[[], None]) -> tuple[dict, list[float]]:
     raw = io_media.command(
         [
             media.FFPROBE,
@@ -46,7 +45,7 @@ def probe_source_extended(source: Path, duration: float, check: Callable[[], Non
             "-select_streams",
             "v:0",
             "-read_intervals",
-            "%+#600",
+            interval,
             "-show_frames",
             "-show_entries",
             "stream=width,height,duration,avg_frame_rate,r_frame_rate,codec_name:frame=best_effort_timestamp_time,pkt_duration_time",
@@ -63,8 +62,53 @@ def probe_source_extended(source: Path, duration: float, check: Callable[[], Non
         for f in data.get("frames", [])
         if "best_effort_timestamp_time" in f
     ]
-    dts = np.diff(pts)
-    dts = dts[dts > 1e-6]
+    return stream, pts
+
+
+def probe_source_extended(source: Path, duration: float, check: Callable[[], None] = lambda: None) -> dict:
+    """Read real timestamps distributed across the full video duration for reliable early & late VFR detection."""
+    stream, pts0 = _probe_pts_window(source, "%+#240", check)
+    stream_dur = (
+        min(duration, float(stream["duration"]))
+        if stream.get("duration") not in {None, "N/A", "0"}
+        else duration
+    )
+
+    windows: list[list[float]] = [pts0] if pts0 else []
+    first_end = pts0[-1] if pts0 else 0.0
+
+    # If the initial 240-frame prefix does not cover the video (~92%), sample distributed windows across the full span!
+    if stream_dur > 0.5 and first_end < stream_dur * 0.92:
+        # 4 additional windows across remaining span including near-end so late VFR transitions are never missed.
+        fracs = (0.35, 0.60, 0.80, 0.92)
+        for frac in fracs:
+            start_t = max(first_end + 0.05, stream_dur * frac)
+            if start_t >= stream_dur - 0.05:
+                continue
+            try:
+                _st, w_pts = _probe_pts_window(source, f"{start_t:.3f}%+#120", check)
+            except Exception:
+                continue
+            if len(w_pts) >= 2:
+                windows.append(w_pts)
+
+    # Compute deltas strictly WITHIN each contiguous window (never across seek gaps!)
+    intra_dts_list: list[np.ndarray] = []
+    fps_by_window: list[float] = []
+    all_pts: list[float] = []
+    covered_span = 0.0
+    for w_pts in windows:
+        all_pts.extend(w_pts)
+        if len(w_pts) >= 2:
+            w_arr = np.diff(np.asarray(w_pts, dtype=np.float64))
+            w_arr = w_arr[w_arr > 1e-6]
+            if len(w_arr):
+                intra_dts_list.append(w_arr)
+                fps_by_window.append(round(float(1.0 / np.median(w_arr)), 4))
+                covered_span += float(w_pts[-1] - w_pts[0])
+
+    dts = np.concatenate(intra_dts_list) if intra_dts_list else np.array([], dtype=np.float64)
+
     try:
         declared = float(Fraction(stream.get("avg_frame_rate", "0")))
     except (ZeroDivisionError, ValueError):
@@ -73,15 +117,24 @@ def probe_source_extended(source: Path, duration: float, check: Callable[[], Non
         r_fps = float(Fraction(stream.get("r_frame_rate", "0")))
     except (ZeroDivisionError, ValueError):
         r_fps = 0.0
+
     med_dt = float(np.median(dts)) if len(dts) else 0.0
     measured = float(1.0 / med_dt) if med_dt > 0 else None
     vfr_cv = float(np.std(dts) / med_dt) if len(dts) >= 3 and med_dt > 0 else 0.0
     vfr_max_dev = float(np.max(np.abs(dts / med_dt - 1.0))) if len(dts) >= 2 and med_dt > 0 else 0.0
-    is_vfr = bool(len(dts) >= 3 and (vfr_max_dev > 0.12 or vfr_cv > 0.05))
-    stream_dur = (
-        min(duration, float(stream["duration"]))
-        if stream.get("duration") not in {None, "N/A", "0"}
-        else duration
+    window_fps_shift = (
+        (max(fps_by_window) / max(min(fps_by_window), 1e-6) - 1.0)
+        if len(fps_by_window) >= 2
+        else 0.0
+    )
+    is_vfr = bool(
+        (len(dts) >= 3 and (vfr_max_dev > 0.12 or vfr_cv > 0.05))
+        or window_fps_shift > 0.12
+    )
+    coverage_ratio = (
+        round(min(1.0, (max(all_pts) - min(all_pts)) / max(stream_dur, 1e-6)), 3)
+        if len(all_pts) >= 2
+        else 0.0
     )
     return {
         "duration": stream_dur,
@@ -91,10 +144,13 @@ def probe_source_extended(source: Path, duration: float, check: Callable[[], Non
         "fps": declared or measured or r_fps or 10.0,
         "rFrameRate": r_fps,
         "sampleFps": measured,
-        "timestamps": pts[:240],
-        "timestampCount": len(pts),
+        "timestamps": all_pts[:240],
+        "timestampCount": len(all_pts),
+        "windowsSampled": len(windows),
+        "fpsByWindow": fps_by_window,
+        "coverageRatio": coverage_ratio,
         "isVFR": is_vfr,
-        "vfrMaxDeviation": round(vfr_max_dev, 4),
+        "vfrMaxDeviation": round(max(vfr_max_dev, window_fps_shift), 4),
         "vfrCV": round(vfr_cv, 4),
     }
 

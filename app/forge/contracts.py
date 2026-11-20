@@ -151,10 +151,24 @@ class BundleValidationReport(ForgeModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+PkgVerificationLevel = Literal[
+    "failed",
+    "header_and_sc0_only",
+    "extracted_uncompared",
+    "full_bundle_verified",
+]
+
+
 class PkgValidationReport(ForgeModel):
     pkg_created: bool
     structure_validated: bool
     theme_type_valid: bool
+    verification_level: PkgVerificationLevel = "failed"
+    header_and_crypto_valid: bool = False
+    sc0_validated: bool = False
+    image0_extracted: bool = False
+    bundle_compared: bool = False
+    bundle_hashes_matched: bool = False
     content_id: str = ""
     title_id: str = ""
     volume_type: str = ""

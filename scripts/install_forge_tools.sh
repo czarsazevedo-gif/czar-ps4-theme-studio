@@ -85,8 +85,17 @@ install_liborbispkg() {
     python3 "${ROOT_DIR}/scripts/patches/liborbispkg-ps4-theme-iro-tag.py" "${repo_dir}"
 
     echo "[CZAR Forge] Compilando PkgTool.Core (.NET 8 Linux)..."
+    local dotnet_home="${TOOLS_DIR}/dotnet-home"
+    mkdir -p "${dotnet_home}/.nuget/packages" "${dotnet_home}/.config" "${dotnet_home}/.local/share"
     rm -rf "${out_dir}.tmp"
-    DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 "${dotnet_bin}" publish \
+    DOTNET_CLI_HOME="${dotnet_home}" \
+    NUGET_PACKAGES="${dotnet_home}/.nuget/packages" \
+    XDG_CONFIG_HOME="${dotnet_home}/.config" \
+    XDG_DATA_HOME="${dotnet_home}/.local/share" \
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1 \
+    "${dotnet_bin}" publish \
         "${repo_dir}/PkgTool.Core/PkgTool.Core.csproj" \
         -c Release -o "${out_dir}.tmp" --nologo
 

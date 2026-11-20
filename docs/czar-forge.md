@@ -41,3 +41,14 @@ Preservados integralmente sem alterações destrutivas:
 - Upload multipart canônico de até 512 MiB (sem upload fragmentado).
 - **Compatibilidade física no PS4 Slim (firmware 12.52)**: permanece explicitamente **`PENDENTE DE TESTE FÍSICO`** até validação real no console conforme [`docs/acceptance-ps4.md`](acceptance-ps4.md).
 
+## 5. Remediação da auditoria independente (`CZAR-AUD-001` a `CZAR-AUD-018`)
+
+Todos os 18 achados registrados na auditoria independente foram remediados e cobertos por ensaios reais sem atalhos em [`tests/test_audit_remediation.py`](../tests/test_audit_remediation.py):
+
+- **Identidade de take e prévias (`001`, `002`)**: validação obrigatória de fingerprint em `POST /api/ouroboros/deluxe/apply` (`HTTP 409` em caso de divergência), bloqueio preventivo do botão Aplicar em `ouroboros.js` ao alterar seleção/parâmetros e restauração exata de prévias Deluxe via `deluxe_preview/` ou decodificação direta de `deluxe_dds/*.dds` após `360p -> 540p -> 360p` (incluindo projetos duplicados).
+- **Proveniência de áudio, honestidade de PKG e isolamento (`003`, `004`, `005`)**: fonte WAV original preservada intacta (`original_sha256` / `original_bytes`), quatro regimes explícitos de verificação em `PkgReport.verification_level` e isolamento por cookie `HttpOnly; SameSite=Strict` para chamadas standalone `/api/forge/*`.
+- **Concorrência, arranque offline e saúde (`006`, `007`, `008`, `018`)**: exportação RAF executada fora do event loop em pool limitado com trava por job, contabilização exata de `dds_bytes`/`mdx_bytes`/resolução real, `GET /healthz` leve independente de ferramentas opcionais e `start.sh` desacoplado de compilação automática (`CZAR_AUTO_INSTALL_FORGE=0` por padrão, `tools/dotnet-home` isolado).
+- **Detecção VFR, calibrador e subprocessos (`009`, `010`, `011`, `012`)**: amostragem PTS em múltiplas janelas distribuídas para VFR tardio, cache limitado (64 MiB) por requisição no calibrador com resultados idênticos, drenagem contínua limitada a 256 KiB sem deadlock nem `ResourceWarning` e cancelamento propagado por grupo de processo (`kill_process_tree`) inclusive em `pkg_validate`/`pkg_extract`.
+- **Resiliência de reload/reinício e ergonomia touch (`013`, `014`, `015`, `016`, `017`)**: `GET /api/forge/pkg/active` com snapshot atômico `last-task.json` e persistência validada entre dois processos Uvicorn sucessivos, estado inicial honesto (`Adicione a imagem inicial`), texto honesto pós-DDS no Deluxe Finish e alvos interativos `>= 44 CSS px` com zero overflow horizontal em `1480×924` e `924×1480`.
+
+

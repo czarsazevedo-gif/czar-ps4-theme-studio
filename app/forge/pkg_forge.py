@@ -16,6 +16,7 @@ from ..config import PKG_TOOLS_DIR, PROJECT_ROOT
 from .bundle_validator import validate_theme_bundle
 from .contracts import BundleValidationReport, PkgValidationReport
 from .pkg_inspector import inspect_and_validate_pkg
+from .subproc import SubprocessTimeoutError, run_cancellable_process
 
 
 class PkgForgeCancelled(RuntimeError):
@@ -81,40 +82,19 @@ def pkg_forge_info() -> dict:
 def _run_cancellable(
     cmd: list[str],
     *,
-    timeout: int,
+    timeout: float,
     check: Callable[[], None],
     register_proc: Callable[[subprocess.Popen | None], None],
 ) -> tuple[int, str]:
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        creationflags=media.NO_WINDOW,
-    )
-    register_proc(proc)
-    started = time.monotonic()
     try:
-        while True:
-            check()
-            rc = proc.poll()
-            if rc is not None:
-                out = (proc.stdout.read() if proc.stdout else b"").decode("utf-8", "replace")
-                return rc, out
-            if time.monotonic() - started > timeout:
-                proc.kill()
-                proc.wait(timeout=5)
-                raise PkgForgeError(f"O empacotador excedeu o tempo limite ({timeout}s).")
-            time.sleep(0.1)
-    except BaseException:
-        if proc.poll() is None:
-            proc.kill()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-        raise
-    finally:
-        register_proc(None)
+        return run_cancellable_process(
+            cmd,
+            timeout=timeout,
+            check=check,
+            register_proc=register_proc,
+        )
+    except SubprocessTimeoutError as exc:
+        raise PkgForgeError(f"O empacotador excedeu o tempo limite ({timeout:g}s).") from exc
 
 
 def build_and_validate_theme_pkg(
@@ -213,14 +193,17 @@ def build_and_validate_theme_pkg(
             passcode=meta.passcode,
             builder_backend=backend,
             pkgtool_bin=pkgtool_bin,
+            check=check,
+            register_proc=register_proc,
         )
         log_steps.append(
             {
                 "label": "pkg_independent_validate",
                 "seconds": round(time.monotonic() - t_val, 2),
                 "detail": (
+                    f"level={pkg_report.verification_level} "
                     f"IRO_TAG hdr={pkg_report.iro_tag_header} sfo={pkg_report.iro_tag_sfo} "
-                    f"CATEGORY={pkg_report.category} hashes={'OK' if pkg_report.extracted_match else 'FAIL'}"
+                    f"CATEGORY={pkg_report.category} hashes={'OK' if pkg_report.bundle_hashes_matched else 'FAIL'}"
                 ),
             }
         )

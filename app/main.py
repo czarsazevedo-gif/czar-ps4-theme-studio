@@ -7,13 +7,17 @@ else keeps working.
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import hashlib
 import json
 import math
 import shutil
 import tempfile
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -22,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 
 from pydantic import BaseModel, ConfigDict
 
-from . import at9, compositor, jobs, library, mdx, media, ouroboros, pkg, projects, raf, theme, theme_xml, vag
+from . import at9, compositor, dxt1, jobs, library, mdx, media, ouroboros, pkg, projects, raf, theme, theme_xml, vag
 from .forge import audio_router as forge_audio
 from .forge import bundle_service as forge_bundle
 from .forge import pkg_forge, pkg_router as forge_pkg, sfo as forge_sfo
@@ -158,7 +162,35 @@ def _budget(frame_count: int, size: tuple[int, int] = ANIMATED_SIZE) -> dict:
     }
 
 
-# --- System info ----------------------------------------------------------
+# --- System info & health -------------------------------------------------
+
+_RAF_EXPORT_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="czar-raf-export")
+_RAF_JOB_LOCKS_GUARD = threading.Lock()
+_RAF_JOB_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _job_lock(key: str) -> threading.Lock:
+    with _RAF_JOB_LOCKS_GUARD:
+        lock = _RAF_JOB_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _RAF_JOB_LOCKS[key] = lock
+        return lock
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    """Lightweight operational readiness probe (independent of optional Forge tools)."""
+    return {
+        "ok": True,
+        "status": "ok",
+        "editor": True,
+        "ffmpeg": bool(media.FFMPEG),
+        "ffprobe": bool(media.FFPROBE),
+        "atrac9_encoder": at9.available(),
+        "pkg_forge": pkg.tools_available() or pkg_forge.pkg_forge_info()["available"],
+    }
+
 
 @app.get("/api/system")
 def system_info() -> dict:
@@ -199,22 +231,90 @@ def system_info() -> dict:
 
 # --- Animated background --------------------------------------------------
 
+def _restore_deluxe_previews(job: jobs.Job, frame_count: int, size: tuple[int, int]) -> list[Path] | None:
+    """Restore exact lossless WebP previews of the Deluxe decoded DDS frames (CZAR-AUD-002).
+
+    Prevents stale extracted frames from another resolution (e.g. 360p -> 540p -> 360p)
+    from masquerading as the immutable Deluxe preview.
+    """
+    from PIL import Image
+
+    deluxe_prev_dir = job.root / "deluxe_preview"
+    deluxe_dds_dir = job.root / "deluxe_dds"
+
+    has_immutable_prev = (
+        deluxe_prev_dir.is_dir()
+        and all((deluxe_prev_dir / f"{i:02d}.webp").is_file() for i in range(frame_count))
+    )
+    has_dds = (
+        deluxe_dds_dir.is_dir()
+        and all((deluxe_dds_dir / theme.frame_name(i)).is_file() for i in range(frame_count))
+    )
+    if not has_immutable_prev and not has_dds:
+        # Legacy fallback: only accept existing preview_dir files if every frame has exact dimensions AND preview_source=="deluxe"
+        if job.meta.get("preview_source") != "deluxe":
+            return None
+        existing = [job.preview_dir / f"{i:02d}.webp" for i in range(frame_count)]
+        if not all(p.is_file() for p in existing):
+            return None
+        for p in existing:
+            with Image.open(p) as im:
+                if im.size != tuple(size):
+                    return None
+        return existing
+
+    job.preview_dir.mkdir(parents=True, exist_ok=True)
+    for stale in job.preview_dir.glob("*.webp"):
+        stale.unlink(missing_ok=True)
+
+    restored: list[Path] = []
+    if has_immutable_prev:
+        dims_ok = True
+        for i in range(frame_count):
+            with Image.open(deluxe_prev_dir / f"{i:02d}.webp") as im:
+                if im.size != tuple(size):
+                    dims_ok = False
+                    break
+        if dims_ok:
+            for i in range(frame_count):
+                dst = job.preview_dir / f"{i:02d}.webp"
+                shutil.copyfile(deluxe_prev_dir / f"{i:02d}.webp", dst)
+                restored.append(dst)
+            return restored
+
+    if has_dds:
+        deluxe_prev_dir.mkdir(exist_ok=True)
+        for i in range(frame_count):
+            rgba = dxt1.decode_dds((deluxe_dds_dir / theme.frame_name(i)).read_bytes())
+            im = Image.fromarray(rgba[..., :3])
+            dst = job.preview_dir / f"{i:02d}.webp"
+            im.save(dst, "WEBP", lossless=True, method=0)
+            shutil.copyfile(dst, deluxe_prev_dir / f"{i:02d}.webp")
+            restored.append(dst)
+        return restored
+
+    return None
+
+
 def _build_animated_preview(job: jobs.Job, frame_count: int,
                             size: tuple[int, int] = ANIMATED_SIZE) -> dict:
     info = media.probe(job.source)
     deluxe = job.meta.get("deluxe")
-    reuse_deluxe = (
+    deluxe_match = (
         isinstance(deluxe, dict)
         and deluxe.get("frames") == frame_count
         and list(deluxe.get("size") or []) == list(size)
-        and all((job.preview_dir / f"{i:02d}.webp").is_file() for i in range(frame_count))
     )
+    restored = _restore_deluxe_previews(job, frame_count, size) if deluxe_match else None
+    reuse_deluxe = restored is not None
     if reuse_deluxe:
-        frames = [job.preview_dir / f"{i:02d}.webp" for i in range(frame_count)]
+        frames = restored
+        job.meta["preview_source"] = "deluxe"
     else:
         frames = media.extract_preview_frames(
             job.source, job.preview_dir, frame_count, size, info.duration
         )
+        job.meta["preview_source"] = "extracted"
     job.meta["size"] = list(size)
 
     job.meta.update(
@@ -256,7 +356,9 @@ async def animated_upload(
 ) -> dict:
     data = await _read_upload(file, VIDEO_EXTS)
     job = jobs.create("animated", file.filename or "source", data)
-    return _prepare_animated_upload(job, frames, size)
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(_RAF_EXPORT_POOL, ctx.run, _prepare_animated_upload, job, frames, size)
 
 
 def _prepare_animated_upload(job: jobs.Job, frames: int, size: str) -> dict:
@@ -270,7 +372,15 @@ async def animated_reframe(job_id: str, frames: int = Form(...),
     """Regenerates the preview with a different frame count or resolution."""
     job = _get_job("animated", job_id)
     sz = _parse_size(size or "x".join(str(v) for v in (job.meta.get("size") or ANIMATED_SIZE)))
-    return _build_animated_preview(job, _clamp_frames(frames, sz), sz)
+    clamped = _clamp_frames(frames, sz)
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+
+    def _run():
+        with _job_lock(str(job.root)):
+            return _build_animated_preview(job, clamped, sz)
+
+    return await loop.run_in_executor(_RAF_EXPORT_POOL, ctx.run, _run)
 
 
 @app.get("/api/animated/{job_id}/preview/{name}")
@@ -293,7 +403,7 @@ async def animated_export(
     composition: str | None = Form(None),
     animation_size: str = Form(""),
 ) -> dict:
-    """Converts to .dds, writes the full RAF scene and assembles the .zip."""
+    """Converts to .dds, writes the full RAF scene and assembles the .zip without blocking the event loop."""
     job = _get_job("animated", job_id)
     state = compositor.load_composition(composition)
     has_overlay = bool(state and state.surface("animated"))
@@ -310,22 +420,34 @@ async def animated_export(
         raise HTTPException(422, "A composição ultrapassa o orçamento RAF da resolução selecionada.")
     if has_overlay and not math.isfinite(wait_seconds):
         raise HTTPException(422, "A temporização da composição é inválida.")
-    overlay = _render_animation_overlay(state, size)
+
     started = time.time()
     zip_path = job.out_dir / "background.raf.zip"
-    try:
-        if has_overlay:
-            # Keep the last successful ZIP while the new scene is rendered.
-            with tempfile.TemporaryDirectory(dir=job.out_dir) as staging:
+
+    def _run_export() -> tuple[int, int, str, int]:
+        with _job_lock(str(job.root)):
+            overlay = _render_animation_overlay(state, size)
+            job.out_dir.mkdir(parents=True, exist_ok=True)
+            # Always stage into a temporary directory and atomically replace background.raf.zip
+            # so any failure/interruption preserves the last valid ZIP intact (CZAR-AUD-006).
+            with tempfile.TemporaryDirectory(dir=job.out_dir, prefix=".raf-stage-") as staging:
                 work = Path(staging)
-                total_bytes, written, index_xml = _write_raf_export(job, work, frame_count, size, wait, backend, overlay)
+                dds_total, written_count, xml_text, mdx_sz = _write_raf_export(
+                    job, work, frame_count, size, wait, backend, overlay
+                )
                 (work / zip_path.name).replace(zip_path)
-        else:
-            total_bytes, written, index_xml = _write_raf_export(job, job.out_dir, frame_count, size, wait, backend)
+                return dds_total, written_count, xml_text, mdx_sz
+
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    try:
+        dds_bytes, written, index_xml, mdx_bytes = await loop.run_in_executor(
+            _RAF_EXPORT_POOL, ctx.run, _run_export
+        )
     except OSError as exc:
         if has_overlay:
             raise HTTPException(503, "Não foi possível gravar o RAF composto. Confira o espaço em disco.") from exc
-        raise
+        raise HTTPException(503, "Não foi possível gravar o arquivo RAF. Confira o espaço em disco.") from exc
 
     return {
         "job_id": job.id,
@@ -333,11 +455,14 @@ async def animated_export(
         "frames": written,
         "wait": wait,
         "backend": backend,
-        "dds_bytes": total_bytes,
+        "size": list(size),
+        "dds_bytes": dds_bytes,
+        "mdx_bytes": mdx_bytes,
+        "scene_bytes": dds_bytes + mdx_bytes + len(index_xml.encode("utf-8")),
         "zip_bytes": zip_path.stat().st_size,
         "elapsed": round(time.time() - started, 2),
         "index_xml": index_xml,
-        "budget": _budget(written, size if has_overlay else ANIMATED_SIZE),
+        "budget": _budget(written, size),
     }
 
 
@@ -348,7 +473,7 @@ def _write_raf_export(job, destination, frame_count, size, wait, backend, overla
             stale.unlink()
     raf_dir.mkdir(parents=True, exist_ok=True)
 
-    total_bytes = 0
+    dds_bytes = 0
     written = 0
     names: list[str] = []
 
@@ -373,7 +498,7 @@ def _write_raf_export(job, destination, frame_count, size, wait, backend, overla
             blob = (dds_dir / name).read_bytes()
             (raf_dir / name).write_bytes(blob)
             names.append(name)
-            total_bytes += len(blob)
+            dds_bytes += len(blob)
             written += 1
     elif (
         deluxe_match
@@ -392,7 +517,7 @@ def _write_raf_export(job, destination, frame_count, size, wait, backend, overla
             name = theme.frame_name(index)
             (raf_dir / name).write_bytes(blob)
             names.append(name)
-            total_bytes += len(blob)
+            dds_bytes += len(blob)
             written += 1
     else:
         info = media.probe(job.source)
@@ -401,7 +526,7 @@ def _write_raf_export(job, destination, frame_count, size, wait, backend, overla
             name = theme.frame_name(index)
             (raf_dir / name).write_bytes(blob)
             names.append(name)
-            total_bytes += len(blob)
+            dds_bytes += len(blob)
             written += 1
 
     if written != frame_count:
@@ -411,13 +536,13 @@ def _write_raf_export(job, destination, frame_count, size, wait, backend, overla
     half_w, half_h = raf.plane_half_size()
     plane = mdx.quad_model(node_name=raf.MODEL_ID, half_w=half_w, half_h=half_h)
     (raf_dir / raf.MODEL_REAL_FILE).write_bytes(plane)
-    total_bytes += len(plane)
+    mdx_bytes = len(plane)
 
     index_xml = raf.build_scene(names, wait)
     theme.write_index_xml(raf_dir / "index.xml", index_xml)
 
     theme.zip_raf_folder(raf_dir, destination / "background.raf.zip")
-    return total_bytes, written, index_xml
+    return dds_bytes, written, index_xml, mdx_bytes
 
 
 @app.get("/api/animated/{job_id}/download")

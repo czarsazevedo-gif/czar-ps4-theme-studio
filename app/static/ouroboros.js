@@ -85,19 +85,90 @@ function stop() {
   animation = 0;
   by("play").textContent = "Reproduzir";
 }
+let lastDeluxeRender = null;
+
+function currentDeluxeRenderSpec() {
+  const val = by("video").value || "";
+  const [kind, id] = val.split("/");
+  const resIdx = Number(by("dlx-res").value);
+  return {
+    kind: kind || "",
+    id: id || "",
+    start: Number(by("dlx-start").value) || 0,
+    end: Number(by("dlx-end").value) || 1.0,
+    frames: Math.min(RES_CAPS[resIdx] || 48, Math.max(4, Number(by("dlx-frames").value) || 16)),
+    resolution: resIdx,
+    wait: Number(by("dlx-wait").value) || 0.067,
+    mode: by("dlx-mode").value,
+    deluxeFinish: Boolean(by("dlx-finish-toggle").checked),
+    stabilizeCamera: Boolean(by("dlx-stab-toggle").checked),
+    speedScale: Number(by("dlx-speed").value) || 1.0,
+    recipe: regionState.length ? buildRecipePayload() : null,
+  };
+}
+
+function deluxeSpecSignature(spec) {
+  if (!spec) return "";
+  return JSON.stringify({
+    kind: spec.kind,
+    id: spec.id,
+    start: Number(Number(spec.start).toFixed(4)),
+    end: Number(Number(spec.end).toFixed(4)),
+    frames: Number(spec.frames),
+    resolution: Number(spec.resolution),
+    wait: Number(Number(spec.wait).toFixed(5)),
+    mode: spec.mode,
+    deluxeFinish: Boolean(spec.deluxeFinish),
+    stabilizeCamera: Boolean(spec.stabilizeCamera),
+    speedScale: Number(Number(spec.speedScale).toFixed(3)),
+    recipe: spec.recipe || null,
+  });
+}
+
+function syncDeluxeApplyState() {
+  const btn = by("dlx-apply");
+  const statusEl = by("dlx-apply-status");
+  if (!btn || !statusEl) return;
+  if (!lastDeluxeRender) {
+    btn.hidden = true;
+    btn.disabled = true;
+    btn.dataset.stale = "false";
+    return;
+  }
+  btn.hidden = false;
+  const matches = deluxeSpecSignature(currentDeluxeRenderSpec()) === lastDeluxeRender.signature;
+  if (matches) {
+    btn.disabled = busy;
+    btn.dataset.stale = "false";
+    if (statusEl.dataset.appliedKey !== lastDeluxeRender.key) {
+      statusEl.textContent = `Render pronto para aplicar: ${lastDeluxeRender.label}.`;
+    }
+  } else {
+    btn.disabled = true;
+    btn.dataset.stale = "true";
+    statusEl.dataset.appliedKey = "";
+    statusEl.textContent =
+      `Esta configuração exige novo render antes de aplicar. O render disponível na prévia é ${lastDeluxeRender.label}.`;
+  }
+}
+
 function release() {
   stop();
   frames.forEach((f) => f.close());
   frames = [];
   index = 0;
   lastDeluxeKey = null;
+  lastDeluxeRender = null;
   by("player").hidden = true;
   by("original").pause();
   by("original").removeAttribute("src");
   by("original").load();
   by("artifacts").hidden = true;
   by("dlx-apply").hidden = true;
+  by("dlx-apply").disabled = true;
+  by("dlx-apply").dataset.stale = "false";
   by("dlx-apply-status").textContent = "";
+  by("dlx-apply-status").dataset.appliedKey = "";
   by("dlx-diff-fig").hidden = true;
   by("dlx-metrics-table").replaceChildren();
   by("dlx-telemetry").textContent = "";
@@ -172,6 +243,7 @@ function setButtonsDisabled(flag) {
   by("dlx-calibrate").disabled = flag || !by("video").value || !by("project").value;
   by("dlx-render").disabled = flag || !by("video").value || !by("project").value;
   by("dlx-save-recipe").disabled = flag || !by("project").value;
+  syncDeluxeApplyState();
 }
 
 function updateTimelineReadout() {
@@ -182,6 +254,7 @@ function updateTimelineReadout() {
   const f = Number(by("dlx-frames").value) || 16;
   const w = Number(by("dlx-wait").value) || 0.067;
   by("dlx-timeline-read").textContent = `Trecho: ${fmt(s)} s → ${fmt(e)} s (janela ${fmt(dur)} s · zoom ${fmt(z)}×) · Saída: ${f} quadros × ${fmt(w * 1000)} ms = ${fmt(f * w)} s`;
+  syncDeluxeApplyState();
 }
 
 function selectSource() {
@@ -442,11 +515,36 @@ async function operate(kind, payload) {
       } else if (isDeluxe) {
         lastDeluxeKey = t.key;
         const post = r.finalPostDds;
-        const stepsTxt = r.finish?.appliedSteps?.length ? r.finish.appliedSteps.join(", ") : "nenhum ajuste extra necessário";
+        const applied = r.finish?.appliedSteps || [];
+        const rejected = r.finish?.rejectedSteps || [];
+        const verdictTxt = post.passed
+          ? "APROVADO pós-DDS"
+          : "REPROVADO/CONDICIONAL pós-DDS (aplicação manual opcional)";
+        let finishTxt;
+        if (!r.finish?.enabled) {
+          finishTxt = "desativado";
+        } else if (applied.length) {
+          finishTxt = `aplicados: ${applied.join(", ")}`;
+        } else if (post.passed) {
+          finishTxt = "nenhum ajuste extra aplicado (resultado aprovado pós-DDS)";
+        } else {
+          finishTxt = "nenhum ajuste aplicado (resultado permaneceu reprovado pós-DDS; candidatos não melhoraram as métricas)";
+        }
+        if (rejected.length) {
+          finishTxt += ` · rejeitados: ${rejected.join(", ")}`;
+        }
+        lastDeluxeRender = {
+          key: t.key,
+          signature: deluxeSpecSignature(payload),
+          spec: structuredClone(payload),
+          label: `${r.size.join("×")} · ${r.frames}q · wait ${fmt(r.wait * 1000)} ms · ${fmt(payload.start)}→${fmt(payload.end)}s`,
+        };
         by("measurement").textContent =
-          `Deluxe Pós-DDS · ${r.size.join(" × ")} · ${r.frames} quadros · wait ${fmt(r.wait)} s (${fmt(r.duration)} s) · ${fmt(r.bytes)} B reais · Estratégia: ${r.strategyUsed} · Acabamento: ${stepsTxt} · SSIM junção: ${fmt(post.metrics.visualSimilarity.seamSsim)} · Problemas: ${post.issues.length ? post.issues.join(" ") : "nenhum"}.`;
+          `Deluxe Pós-DDS [${verdictTxt}] · ${r.size.join(" × ")} · ${r.frames} quadros · wait ${fmt(r.wait)} s (${fmt(r.duration)} s) · ${fmt(r.bytes)} B reais · Estratégia: ${r.strategyUsed} · Acabamento: ${finishTxt} · SSIM junção: ${fmt(post.metrics.visualSimilarity.seamSsim)} · Problemas: ${post.issues.length ? post.issues.join(" ") : "nenhum"}.`;
         by("artifacts").hidden = false;
         by("dlx-apply").hidden = false;
+        by("dlx-apply-status").dataset.appliedKey = "";
+        syncDeluxeApplyState();
         by("dlx-diff-fig").hidden = false;
         by("original").src = url("/api/ouroboros/genesis-source/" + payload.kind + "/" + payload.id);
         const refUrl = url("/api/ouroboros/deluxe/artifact/" + t.key + "/source.png");
@@ -513,6 +611,7 @@ function syncRegionUi() {
     list.append(li);
   });
   drawRegionCanvas();
+  syncDeluxeApplyState();
 }
 
 function drawRegionCanvas() {
@@ -679,36 +778,30 @@ by("dlx-calibrate").onclick = () => {
   });
 };
 by("dlx-render").onclick = () => {
-  const [kind, id] = by("video").value.split("/");
-  const resIdx = Number(by("dlx-res").value);
-  const mode = by("dlx-mode").value;
-  operate("deluxe/render", {
-    kind,
-    id,
-    start: Number(by("dlx-start").value) || 0,
-    end: Number(by("dlx-end").value) || 1.0,
-    frames: Math.min(RES_CAPS[resIdx], Math.max(4, Number(by("dlx-frames").value) || 16)),
-    resolution: resIdx,
-    wait: Number(by("dlx-wait").value) || 0.067,
-    mode,
-    deluxeFinish: by("dlx-finish-toggle").checked,
-    stabilizeCamera: by("dlx-stab-toggle").checked,
-    speedScale: Number(by("dlx-speed").value) || 1.0,
-    recipe: regionState.length ? buildRecipePayload() : null,
-  });
+  operate("deluxe/render", currentDeluxeRenderSpec());
 };
 by("dlx-apply").onclick = async () => {
-  if (!lastDeluxeKey) return;
+  if (!lastDeluxeRender) return;
+  const spec = currentDeluxeRenderSpec();
+  if (deluxeSpecSignature(spec) !== lastDeluxeRender.signature) {
+    syncDeluxeApplyState();
+    return;
+  }
   by("dlx-apply").disabled = true;
   by("dlx-apply-status").textContent = "Aplicando loop Deluxe ao projeto…";
   try {
-    const res = await request("/api/ouroboros/deluxe/apply", { key: lastDeluxeKey });
+    const res = await request("/api/ouroboros/deluxe/apply", {
+      key: lastDeluxeRender.key,
+      expected: spec,
+    });
+    by("dlx-apply-status").dataset.appliedKey = lastDeluxeRender.key;
     by("dlx-apply-status").textContent =
-      `Aplicado ao projeto! Revisão ${res.revision} · Job ${res.jobId} · ${res.frames} quadros · ${fmt(res.ddsBytes)} B DDS (equivalência RAF garantida).`;
+      `Aplicado ao projeto! Revisão ${res.revision} · Job ${res.jobId} · ${res.size.join("×")} · ${res.frames} quadros · ${fmt(res.ddsBytes)} B DDS (equivalência RAF garantida).`;
   } catch (e) {
+    by("dlx-apply-status").dataset.appliedKey = "";
     by("dlx-apply-status").textContent = "Erro ao aplicar: " + e.message;
   } finally {
-    by("dlx-apply").disabled = false;
+    syncDeluxeApplyState();
   }
 };
 by("dlx-undo").onclick = () => {
@@ -745,6 +838,13 @@ by("dlx-res").onchange = () => {
 };
 ["dlx-start", "dlx-end", "dlx-zoom", "dlx-frames", "dlx-wait"].forEach((id) => {
   by(id).oninput = updateTimelineReadout;
+});
+["dlx-mode", "dlx-finish-toggle", "dlx-stab-toggle", "dlx-speed"].forEach((id) => {
+  const el = by(id);
+  if (el) {
+    el.onchange = syncDeluxeApplyState;
+    el.oninput = syncDeluxeApplyState;
+  }
 });
 
 by("cancel").onclick = () =>

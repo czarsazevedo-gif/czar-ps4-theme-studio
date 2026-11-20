@@ -17,7 +17,7 @@ import struct
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .. import media, pkg
 from .contracts import (
@@ -29,6 +29,7 @@ from .contracts import (
     PkgValidationReport,
 )
 from .sfo import parse_param_sfo
+from .subproc import SubprocessTimeoutError, run_cancellable_process
 
 CNT_MAGIC = b"\x7fCNT"
 ENTRY_DIGESTS = 0x00000001
@@ -266,45 +267,56 @@ def _extract_pkg_image0(
     *,
     passcode: str,
     pkgtool_bin: Path | None,
+    check: Callable[[], None] = lambda: None,
+    register_proc: Callable[[subprocess.Popen | None], None] = lambda *_: None,
 ) -> tuple[bool, str]:
-    """Extract outer/inner PFS (Image0) files using external pkgtool or orbis-pub-cmd."""
+    """Extract outer/inner PFS (Image0) files using external pkgtool or orbis-pub-cmd with cancellation support."""
+    check()
     if pkgtool_bin is not None and pkgtool_bin.is_file():
-        proc = subprocess.run(
-            [str(pkgtool_bin), "pkg_extract", "--passcode", passcode, str(pkg_path), str(dest_dir)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=300,
-            creationflags=media.NO_WINDOW,
-        )
-        out = proc.stdout.decode("utf-8", "replace")
-        if proc.returncode == 0:
-            return True, out
-        return False, out
+        try:
+            rc, out = run_cancellable_process(
+                [str(pkgtool_bin), "pkg_extract", "--passcode", passcode, str(pkg_path), str(dest_dir)],
+                timeout=300,
+                check=check,
+                register_proc=register_proc,
+            )
+            return rc == 0, out
+        except SubprocessTimeoutError as exc:
+            return False, str(exc)
     if pkg.tools_available():
-        proc = subprocess.run(
-            [str(pkg.ORBIS_CMD), "img_extract", "--passcode", passcode, str(pkg_path), str(dest_dir)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=300,
-            creationflags=media.NO_WINDOW,
-        )
-        out = proc.stdout.decode("utf-8", "replace")
-        return proc.returncode == 0, out
+        try:
+            rc, out = run_cancellable_process(
+                [str(pkg.ORBIS_CMD), "img_extract", "--passcode", passcode, str(pkg_path), str(dest_dir)],
+                timeout=300,
+                check=check,
+                register_proc=register_proc,
+            )
+            return rc == 0, out
+        except SubprocessTimeoutError as exc:
+            return False, str(exc)
     return False, "Nenhum extrator PFS disponível no servidor."
 
 
-def _run_pkgtool_validate(pkg_path: Path, pkgtool_bin: Path | None) -> tuple[bool | None, str]:
+def _run_pkgtool_validate(
+    pkg_path: Path,
+    pkgtool_bin: Path | None,
+    *,
+    check: Callable[[], None] = lambda: None,
+    register_proc: Callable[[subprocess.Popen | None], None] = lambda *_: None,
+) -> tuple[bool | None, str]:
     if pkgtool_bin is None or not pkgtool_bin.is_file():
         return None, ""
-    proc = subprocess.run(
-        [str(pkgtool_bin), "pkg_validate", str(pkg_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=180,
-        creationflags=media.NO_WINDOW,
-    )
-    out = proc.stdout.decode("utf-8", "replace")
-    failed = proc.returncode != 0 or ("FAIL" in out.upper() and "NOKEY" not in out.upper())
+    check()
+    try:
+        rc, out = run_cancellable_process(
+            [str(pkgtool_bin), "pkg_validate", str(pkg_path)],
+            timeout=180,
+            check=check,
+            register_proc=register_proc,
+        )
+    except SubprocessTimeoutError as exc:
+        return False, str(exc)
+    failed = rc != 0 or ("FAIL" in out.upper() and "NOKEY" not in out.upper())
     return (not failed), out
 
 
@@ -315,6 +327,8 @@ def inspect_and_validate_pkg(
     passcode: str = PS4_PKG_DEFAULT_PASSCODE,
     builder_backend: str = "",
     pkgtool_bin: Path | None = None,
+    check: Callable[[], None] = lambda: None,
+    register_proc: Callable[[subprocess.Popen | None], None] = lambda *_: None,
 ) -> PkgValidationReport:
     """Full independent PKG inspection, cryptographic digest verification, Sc0/param.sfo check,
     extraction, and byte-for-byte SHA-256 comparison against the source theme bundle."""
@@ -323,11 +337,13 @@ def inspect_and_validate_pkg(
     files_list: list[dict] = []
     hash_mismatches: list[str] = []
 
+    check()
     if not pkg_path.is_file() or pkg_path.stat().st_size == 0:
         return PkgValidationReport(
             pkg_created=False,
             structure_validated=False,
             theme_type_valid=False,
+            verification_level="failed",
             builder_backend=builder_backend,
             validator_backend="czar-python-pkg-inspector",
             errors=["Arquivo .pkg ausente ou vazio."],
@@ -343,6 +359,7 @@ def inspect_and_validate_pkg(
             pkg_created=True,
             structure_validated=False,
             theme_type_valid=False,
+            verification_level="failed",
             pkg_bytes=pkg_bytes,
             pkg_sha256=pkg_sha256,
             builder_backend=builder_backend,
@@ -351,6 +368,7 @@ def inspect_and_validate_pkg(
         )
 
     # 1. Verify binary header fields & cryptographic digests independently
+    header_errors_start = len(errors)
     if parsed["package_size"] != parsed["file_size"]:
         errors.append(
             f"Tamanho do arquivo ({parsed['file_size']:,} B) difere de package_size ({parsed['package_size']:,} B)."
@@ -391,8 +409,10 @@ def inspect_and_validate_pkg(
         )
     if not pkg.CONTENT_ID_RE.match(content_id):
         errors.append(f"CONTENT_ID inválido no cabeçalho PKG: '{content_id}'.")
+    header_and_crypto_valid = len(errors) == header_errors_start
 
     # 3. Independently parse Sc0/param.sfo extracted directly from raw PKG bytes
+    sc0_errors_start = len(errors)
     sc0_blobs: dict[str, bytes] = parsed["sc0_blobs"]
     category = ""
     title_id = ""
@@ -440,25 +460,43 @@ def inspect_and_validate_pkg(
                     "sha256": hashlib.sha256(blob).hexdigest(),
                 }
             )
+    sc0_validated = len(errors) == sc0_errors_start
 
     # 4. Cross-check with pkg_validate when available
     validator_backend = "czar-python-pkg-inspector"
-    pv_ok, pv_out = _run_pkgtool_validate(pkg_path, pkgtool_bin)
+    check()
+    pv_ok, pv_out = _run_pkgtool_validate(
+        pkg_path, pkgtool_bin, check=check, register_proc=register_proc
+    )
     if pv_ok is not None:
         validator_backend = "czar-python-pkg-inspector+liborbispkg-validate"
         if not pv_ok:
             errors.append(f"Validador auxiliar pkg_validate reportou falha: {pv_out[:300]}")
 
-    # 5. Extract Image0 PFS and compare SHA-256 hashes against expected source bundle
-    extracted_match = False
+    # 5. Extract Image0 PFS and compare SHA-256 hashes against expected source bundle (when provided)
+    image0_extracted = False
+    bundle_compared = False
+    bundle_hashes_matched = False
+
+    check()
     with tempfile.TemporaryDirectory(prefix="czar-pkg-extract-") as td:
         ex_dir = Path(td)
-        ok_ex, ex_out = _extract_pkg_image0(pkg_path, ex_dir, passcode=passcode, pkgtool_bin=pkgtool_bin)
+        ok_ex, ex_out = _extract_pkg_image0(
+            pkg_path,
+            ex_dir,
+            passcode=passcode,
+            pkgtool_bin=pkgtool_bin,
+            check=check,
+            register_proc=register_proc,
+        )
         if not ok_ex:
             if expected_content_dir is not None:
                 errors.append(f"Falha ao extrair Image0 do PKG para comparação de hashes: {ex_out[:300]}")
             else:
-                warnings.append("Extração de Image0 não executada (extrator indisponível ou passcode diferente).")
+                warnings.append(
+                    "Extração de Image0 não executada (extrator indisponível ou passcode diferente); "
+                    "apenas cabeçalho, digests e Sc0 foram verificados."
+                )
         else:
             # Locate extracted root (orbis-pub-cmd extracts to Image0/, LibOrbisPkg extracts to uroot/)
             if (ex_dir / "Image0").is_dir():
@@ -487,6 +525,7 @@ def inspect_and_validate_pkg(
                     }
                 )
 
+            image0_extracted = True
             if "theme.xml" not in extracted_image0:
                 errors.append("Image0/theme.xml ausente após extração do PKG.")
 
@@ -499,6 +538,7 @@ def inspect_and_validate_pkg(
 
             # Compare every file against expected source bundle directory!
             if expected_content_dir is not None and expected_content_dir.is_dir():
+                bundle_compared = True
                 expected_image0: dict[str, str] = {}
                 expected_sc0: dict[str, str] = {}
                 for p in sorted(expected_content_dir.rglob("*")):
@@ -534,9 +574,7 @@ def inspect_and_validate_pkg(
                 if hash_mismatches:
                     errors.append(f"Divergência entre PKG extraído e bundle ({len(hash_mismatches)} itens).")
                 else:
-                    extracted_match = True
-            else:
-                extracted_match = len(extracted_image0) > 0 and "theme.xml" in extracted_image0
+                    bundle_hashes_matched = True
 
     theme_type_valid = (
         content_type_hdr == PS4_PKG_CONTENT_TYPE_AC
@@ -544,12 +582,33 @@ def inspect_and_validate_pkg(
         and category == PS4_THEME_CATEGORY
         and iro_tag_sfo == PS4_THEME_IRO_TAG
     )
-    structure_validated = len(errors) == 0 and theme_type_valid
+
+    # CZAR-AUD-004: strict, honest verification tiers — NEVER mark structure_validated=True
+    # when Image0 could not be extracted, and NEVER mark extracted_match=True without bundle comparison!
+    base_ok = len(errors) == 0 and theme_type_valid and header_and_crypto_valid and sc0_validated
+    if not base_ok:
+        verification_level = "failed"
+        structure_validated = False
+    elif not image0_extracted:
+        verification_level = "header_and_sc0_only"
+        structure_validated = False
+    elif bundle_compared and bundle_hashes_matched:
+        verification_level = "full_bundle_verified"
+        structure_validated = True
+    else:
+        verification_level = "extracted_uncompared"
+        structure_validated = True
 
     return PkgValidationReport(
         pkg_created=True,
         structure_validated=structure_validated,
         theme_type_valid=theme_type_valid,
+        verification_level=verification_level,
+        header_and_crypto_valid=header_and_crypto_valid,
+        sc0_validated=sc0_validated,
+        image0_extracted=image0_extracted,
+        bundle_compared=bundle_compared,
+        bundle_hashes_matched=bundle_hashes_matched,
         content_id=content_id,
         title_id=title_id,
         volume_type=PS4_THEME_VOLUME_TYPE if theme_type_valid else "invalid",
@@ -561,7 +620,7 @@ def inspect_and_validate_pkg(
         pkg_bytes=pkg_bytes,
         pkg_sha256=pkg_sha256,
         files=files_list,
-        extracted_match=extracted_match,
+        extracted_match=bundle_hashes_matched,
         hash_mismatches=hash_mismatches,
         physical_compatibility="pending",
         builder_backend=builder_backend,

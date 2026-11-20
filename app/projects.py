@@ -145,6 +145,29 @@ async def scope_jobs(request: Request, call_next):
         return JSONResponse({"detail": "Abra um projeto antes de aplicar a mídia."}, status_code=400)
     if path in STATELESS_CATALOG_PATHS:
         return await call_next(request)
+    if project is None and path.startswith("/api/forge/"):
+        session = owner(request)
+        minted = False
+        if session is None:
+            session = secrets.token_hex(32)
+            minted = True
+        standalone_ws = ROOT / session / "_standalone_forge"
+        token = jobs.project_workspace.set(standalone_ws)
+        try:
+            response = await call_next(request)
+        finally:
+            jobs.project_workspace.reset(token)
+        response.headers["Cache-Control"] = "private, no-store"
+        if minted:
+            response.set_cookie(
+                COOKIE,
+                session,
+                httponly=True,
+                samesite="strict",
+                secure=request.url.scheme == "https",
+                max_age=60 * 60 * 24 * 365,
+            )
+        return response
     if project is None or not (library_apply or project_tool or path.startswith(
         ("/api/animated/", "/api/slot/", "/api/audio/", "/api/convert/", "/api/package/", "/api/forge/")
     )):
@@ -267,7 +290,7 @@ def copy_jobs(source: Path, destination: Path, state: Editor) -> None:
         if job.kind == "slot":
             shutil.copyfile(job.preview_dir / "preview.webp", target / "preview" / "preview.webp")
         if job.kind == "animated" and job.meta.get("deluxe"):
-            for sub in ("preview", "deluxe_frames", "deluxe_dds"):
+            for sub in ("preview", "deluxe_preview", "deluxe_frames", "deluxe_dds"):
                 src_sub = job.root / sub
                 if src_sub.is_dir():
                     dst_sub = target / sub

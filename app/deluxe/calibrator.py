@@ -151,62 +151,90 @@ def calibrate_interval(
         raise ValueError("Intervalo temporal inválido para calibração.")
 
     configs: list[dict] = []
-    # Cache rendered proxy evaluations per (frames, size) so we don't re-decode redundantly
+    # Request-local bounded frame cache keyed by (frames, render_sz) so shared proxy
+    # extractions across 720p/540p/360p are decoded once per request without growing RAM unboundedly (CZAR-AUD-010).
     eval_fn = evaluate_post_dds if verify_dds else evaluate_loop
+    max_cache_bytes = 64 * 1024 * 1024
+    extract_cache: dict[tuple[int, tuple[int, int]], np.ndarray] = {}
+    cache_order: list[tuple[int, tuple[int, int]]] = []
+    cache_bytes = 0
 
-    for size in sizes:
-        cap = max_frames_for(size)
-        seen_counts: set[int] = set()
-        for w_sec in waits_sec:
-            if not (MIN_WAIT_SECONDS <= w_sec <= MAX_WAIT_SECONDS):
-                continue
-            # Natural frame count preserving the source's true temporal speed: N ≈ span / wait
-            nat_n = int(round(span / w_sec))
-            # Allow clamping to cap ONLY if resulting speed change stays reasonable (within 0.65x..1.45x)
-            n = max(4, min(cap, nat_n))
-            if n * dds_bytes_for(*size) > RAF_SIZE_LIMIT:
-                continue
-            actual_wait = float(f"{w_sec:.6g}")
-            playback_dur = n * actual_wait
-            speed_ratio = span / max(playback_dur, 1e-6)
-            # Never arbitrarily speed up slow sources or slow down fast sources!
-            if not (0.65 <= speed_ratio <= 1.45):
-                continue
-            if n in seen_counts and abs(speed_ratio - 1.0) > 0.15:
-                continue
-            seen_counts.add(n)
+    def _get_frames(n_frames: int, render_sz: tuple[int, int]) -> np.ndarray:
+        nonlocal cache_bytes
+        ckey = (n_frames, render_sz)
+        cached = extract_cache.get(ckey)
+        if cached is not None:
+            return cached
+        arr = np.array(io_media.extract(source_path, start, end, n_frames, render_sz, folder, check))
+        arr_bytes = int(arr.nbytes)
+        if arr_bytes <= max_cache_bytes:
+            while cache_bytes + arr_bytes > max_cache_bytes and cache_order:
+                evict_key = cache_order.pop(0)
+                evicted = extract_cache.pop(evict_key, None)
+                if evicted is not None:
+                    cache_bytes -= int(evicted.nbytes)
+            extract_cache[ckey] = arr
+            cache_order.append(ckey)
+            cache_bytes += arr_bytes
+        return arr
 
-            check()
-            try:
-                # Render at actual output size when verify_dds=True, or 240p-equivalent proxy scaled cleanly
-                render_sz = size if verify_dds else (min(size[0], 320), min(size[1], 180))
-                rendered = np.array(io_media.extract(source_path, start, end, n, render_sz, folder, check))
-            except io_media.MotionError:
-                continue
-
-            ev = eval_fn(rendered, actual_wait)
-            scored = _score_configuration(
-                ev,
-                size=size,
-                frames=n,
-                wait=actual_wait,
-                source_span=span,
-                source_fps=source_fps,
-            )
-            configs.append(scored)
-
-    if not configs:
-        # Fallback: compute best-fit natural config per resolution using exact span / N
+    try:
         for size in sizes:
             cap = max_frames_for(size)
-            n = max(4, min(cap, int(round(span * min(source_fps, 15.0)))))
-            w_sec = float(f"{np.clip(span / n, MIN_WAIT_SECONDS, MAX_WAIT_SECONDS):.6g}")
-            render_sz = size if verify_dds else (min(size[0], 320), min(size[1], 180))
-            rendered = np.array(io_media.extract(source_path, start, end, n, render_sz, folder, check))
-            ev = eval_fn(rendered, w_sec)
-            configs.append(
-                _score_configuration(ev, size=size, frames=n, wait=w_sec, source_span=span, source_fps=source_fps)
-            )
+            seen_counts: set[int] = set()
+            for w_sec in waits_sec:
+                if not (MIN_WAIT_SECONDS <= w_sec <= MAX_WAIT_SECONDS):
+                    continue
+                # Natural frame count preserving the source's true temporal speed: N ≈ span / wait
+                nat_n = int(round(span / w_sec))
+                # Allow clamping to cap ONLY if resulting speed change stays reasonable (within 0.65x..1.45x)
+                n = max(4, min(cap, nat_n))
+                if n * dds_bytes_for(*size) > RAF_SIZE_LIMIT:
+                    continue
+                actual_wait = float(f"{w_sec:.6g}")
+                playback_dur = n * actual_wait
+                speed_ratio = span / max(playback_dur, 1e-6)
+                # Never arbitrarily speed up slow sources or slow down fast sources!
+                if not (0.65 <= speed_ratio <= 1.45):
+                    continue
+                if n in seen_counts and abs(speed_ratio - 1.0) > 0.15:
+                    continue
+                seen_counts.add(n)
+
+                check()
+                try:
+                    # Render at actual output size when verify_dds=True, or 240p-equivalent proxy scaled cleanly
+                    render_sz = size if verify_dds else (min(size[0], 320), min(size[1], 180))
+                    rendered = _get_frames(n, render_sz)
+                except io_media.MotionError:
+                    continue
+
+                ev = eval_fn(rendered, actual_wait)
+                scored = _score_configuration(
+                    ev,
+                    size=size,
+                    frames=n,
+                    wait=actual_wait,
+                    source_span=span,
+                    source_fps=source_fps,
+                )
+                configs.append(scored)
+
+        if not configs:
+            # Fallback: compute best-fit natural config per resolution using exact span / N
+            for size in sizes:
+                cap = max_frames_for(size)
+                n = max(4, min(cap, int(round(span * min(source_fps, 15.0)))))
+                w_sec = float(f"{np.clip(span / n, MIN_WAIT_SECONDS, MAX_WAIT_SECONDS):.6g}")
+                render_sz = size if verify_dds else (min(size[0], 320), min(size[1], 180))
+                rendered = _get_frames(n, render_sz)
+                ev = eval_fn(rendered, w_sec)
+                configs.append(
+                    _score_configuration(ev, size=size, frames=n, wait=w_sec, source_span=span, source_fps=source_fps)
+                )
+    finally:
+        extract_cache.clear()
+        cache_order.clear()
 
     recommendations = {
         "best_fluidity": max(configs, key=lambda c: c["scores"]["fluidity"]),

@@ -51,6 +51,13 @@ class RenderRequest(DeluxeSource):
 class ApplyRequest(Model):
     key: AssetId
     displayName: str | None = Field(default=None, max_length=120)
+    expected: RenderRequest | None = None
+
+
+def _render_fingerprint(sha: str, item: RenderRequest, resolved_recipe: RegionalRecipe | None) -> str:
+    sig_payload = item.model_dump()
+    sig_payload["resolvedRecipe"] = resolved_recipe.model_dump() if resolved_recipe else None
+    return io_media.fingerprint([DELUXE_VERSION, "render", sha, sig_payload])
 
 
 @router.post("/analyze", status_code=202)
@@ -140,9 +147,7 @@ def deluxe_render(request: Request, item: RenderRequest):
 
     def prepare(task):
         sha = io_media.digest(path, task.check)
-        sig_payload = item.model_dump()
-        sig_payload["resolvedRecipe"] = resolved_recipe.model_dump() if resolved_recipe else None
-        key = io_media.fingerprint([DELUXE_VERSION, "render", sha, sig_payload])
+        key = _render_fingerprint(sha, item, resolved_recipe)
 
         def calculate(folder: Path):
             res = render_deluxe_loop(
@@ -163,7 +168,7 @@ def deluxe_render(request: Request, item: RenderRequest):
                 progress=task.progress,
                 check=task.check,
             )
-            res.update(source=item.model_dump(), name=name, sha256=sha)
+            res.update(key=key, source=item.model_dump(), name=name, sha256=sha)
             return res
 
         return key, calculate
@@ -172,15 +177,44 @@ def deluxe_render(request: Request, item: RenderRequest):
 
 
 @router.post("/apply")
-def deluxe_apply(item: ApplyRequest):
+def deluxe_apply(request: Request, item: ApplyRequest):
     from .. import ouroboros as core
 
     root = core.workspace()
     folder, report = core.record(root, item.key)
     if report.get("type") != "deluxe_render":
         raise HTTPException(422, "Renderize o resultado Deluxe antes de aplicar ao projeto.")
+
+    # CZAR-AUD-001: verify that the rendered key actually matches the active selection when provided.
+    if item.expected is not None:
+        exp = item.expected
+        path, _duration, _name = core.source(request, core.Source(kind=exp.kind, id=exp.id))
+        resolved_recipe = exp.recipe
+        if resolved_recipe is None and exp.recipeId:
+            try:
+                resolved_recipe = load_recipe(root, exp.recipeId)
+            except (FileNotFoundError, ValueError) as exc:
+                raise HTTPException(404, "Receita regional não encontrada neste projeto.") from exc
+        sha = io_media.digest(path, lambda: None)
+        expected_key = _render_fingerprint(sha, exp, resolved_recipe)
+        expected_size = list(ANIMATED_SIZES[exp.resolution])
+        if (
+            expected_key != item.key
+            or int(report.get("frames", -1)) != exp.frames
+            or list(report.get("size") or []) != expected_size
+            or abs(float(report.get("wait", -1.0)) - float(exp.wait)) > 1e-4
+        ):
+            raise HTTPException(
+                409,
+                "A seleção atual não corresponde ao take renderizado. Renderize esta configuração antes de aplicar ao projeto.",
+            )
+
+    report_with_key = dict(report)
+    report_with_key.setdefault("key", item.key)
     try:
-        return apply_deluxe_to_project(root, folder, report, display_name=item.displayName, acquire_lock=False)
+        return apply_deluxe_to_project(
+            root, folder, report_with_key, display_name=item.displayName, acquire_lock=False
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     except OSError as exc:

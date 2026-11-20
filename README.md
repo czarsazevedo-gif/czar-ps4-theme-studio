@@ -4,14 +4,14 @@
 
 Na branch **`feature/czar-audio-pkg-forge-v1`**, o Studio reúne o pipeline completo de finalização de temas PS4 em Linux (GitHub Codespaces), pronto para uso touch no Chrome do **Galaxy Tab S10 Ultra**:
 
-1. **Preparar ferramentas externas nativas Linux (no Codespace)**:
+1. **Preparar ferramentas externas opcionais (no Codespace) e iniciar o servidor**:
    ```bash
    python3 -m pip install -r requirements.txt
-   ./scripts/install_forge_tools.sh all
+   ./scripts/install_forge_tools.sh all   # opcional: compila psgfx-at9 (ATRAC9) e liborbispkg (PKG)
    PYTHONPATH=. python3 scripts/diagnose_forge.py
-   ./start.sh
+   ./start.sh                             # inicia o editor mesmo offline; sonda de prontidão em /healthz
    ```
-   Abra a porta **8000** com visibilidade **Privada** no painel **Portas**.
+   Abra a porta **8000** com visibilidade **Privada** no painel **Portas** (sonda leve em `GET /healthz`). O `./start.sh` nunca bloqueia a abertura do editor se alguma ferramenta opcional do Forge ainda não estiver compilada (para instalar automaticamente ao subir, use `CZAR_AUTO_INSTALL_FORGE=1 ./start.sh`).
 2. **CZAR ATRAC9 Studio (aba Áudio)**: importe `WAV`, `MP3`, `FLAC` ou `.at9` PS4 válido, ajuste loop (**CZAR Audio Loop Finisher** com prévia da costura e comparação antes/depois) e volume (`original`, `ambient`, `manual`, `assisted` com medição EBU R128 `bgmhome_loud`), e toque em **CONVERTER E APLICAR MÚSICA** para codificar em ATRAC9 real (48 kHz, estéreo, 144 kbps, `configData fe 74 0b f0`, bloco `smpl`) com validação independente via FFmpeg. Efeitos `se_decide`, `se_cursor` e `se_cancel` são convertidos para VAG com prévia reproduzível.
 3. **CZAR FORGE (aba Empacotar)**: utilize os botões **VALIDAR MEU TEMA**, **EXPORTAR RECURSOS**, **GERAR PKG**, **BAIXAR PKG** e **VER RELATÓRIO**. O empacotador nativo Linux gera `.pkg` (`pkg_ps4_theme`, `IRO_TAG=2` no `param.sfo` e no offset `0x98` do cabeçalho binário, `CATEGORY=ac`, passcode `0×32`) com verificação criptográfica, extração de `Image0` e comparação SHA-256 arquivo a arquivo contra o bundle.
 4. **Compatibilidade física no PS4 Slim (firmware 12.52)**: a validação em Linux comprova estrutura, metadados e hashes, mas **não substitui o teste físico no console**. Todo pacote permanece em estado **`PENDENTE DE TESTE FÍSICO`** até conclusão do roteiro em [`docs/acceptance-ps4.md`](docs/acceptance-ps4.md).

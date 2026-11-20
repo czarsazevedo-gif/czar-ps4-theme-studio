@@ -1481,7 +1481,7 @@ function forgeRefreshSummary(counts) {
   if (forgeState.lastBundle) {
     forgeSetCard("bundle", `ZIP · ${fmtBytes(forgeState.lastBundle.bytes)}`, "is-ok");
   } else {
-    forgeSetCard("bundle", home ? "Pronto para exportar" : "Aguardando tema", "");
+    forgeSetCard("bundle", home ? "Pronto para exportar" : "Adicione a imagem inicial", home ? "" : "is-warn");
   }
 
   if (forgeState.lastPkg) {
@@ -1492,8 +1492,16 @@ function forgeRefreshSummary(counts) {
       valid ? `${fmtBytes(forgeState.lastPkg.pkg_bytes)} · Validado` : "Falhou",
       valid ? "is-ok" : "is-fail",
     );
+  } else if (!sys.pkg_tools) {
+    forgeSetCard("pkg", "Empacotador ausente", "is-warn");
+  } else if (!home) {
+    forgeSetCard("pkg", "Adicione a imagem inicial", "is-warn");
+  } else if (forgeState.busy) {
+    forgeSetCard("pkg", "Empacotando…", "is-warn");
+  } else if (forgeState.lastValidation && !forgeState.lastValidation.valid) {
+    forgeSetCard("pkg", "Corrija erros de validação", "is-fail");
   } else {
-    forgeSetCard("pkg", sys.pkg_tools ? "Pronto para gerar" : "Empacotador ausente", sys.pkg_tools ? "" : "is-warn");
+    forgeSetCard("pkg", "Pronto para gerar", "");
   }
 
   const busy = forgeState.busy;
@@ -1632,6 +1640,16 @@ async function forgeExportBundle() {
   }
 }
 
+function forgeVerificationLabel(level) {
+  const map = {
+    full_bundle_verified: "Completa (Cabeçalho + Sc0 + Image0 extraído + SHA-256 ↔ Bundle)",
+    extracted_uncompared: "Parcial (Cabeçalho + Sc0 + Image0 extraído · sem bundle de referência)",
+    header_and_sc0_only: "Parcial (Somente Cabeçalho + Sc0 · Image0 não extraído)",
+    failed: "Reprovada",
+  };
+  return map[level] || String(level || "Indeterminada");
+}
+
 function forgeRenderPkgResult(record) {
   const pr = record.pkg_report || {};
   const valid = Boolean(pr.structure_validated);
@@ -1642,6 +1660,7 @@ function forgeRenderPkgResult(record) {
     <div class="forge-report-kv">
       <div><span>Arquivo</span><code>${forgeEsc(record.pkg_name || "")}</code></div>
       <div><span>Tipo / Volume</span><b>${forgeEsc(pr.volume_type || "pkg_ps4_theme")}</b></div>
+      <div><span>Nível de verificação</span><b>${forgeEsc(forgeVerificationLabel(pr.verification_level))}</b></div>
       <div><span>IRO_TAG</span><b>cabeçalho 0x98 = ${forgeEsc(pr.iro_tag_header)} · SFO = ${forgeEsc(pr.iro_tag_sfo)}</b></div>
       <div><span>CATEGORY</span><b>${forgeEsc(pr.category || "ac")}</b></div>
       <div><span>bgmhome_loud</span><b>${pr.bgmhome_loud ? `${forgeEsc(pr.bgmhome_loud)} LKFS` : "Não aplicável (sem música)"}</b></div>
@@ -1654,6 +1673,10 @@ function forgeRenderPkgResult(record) {
 }
 
 async function forgePollPkg(taskId) {
+  if (forgeState.pollTimer) {
+    clearTimeout(forgeState.pollTimer);
+    forgeState.pollTimer = null;
+  }
   try {
     const d = await api(`/api/forge/pkg/jobs/${encodeURIComponent(taskId)}`);
     if ($("forge-progress-stage")) $("forge-progress-stage").textContent = d.stage || "Processando…";
@@ -1661,8 +1684,8 @@ async function forgePollPkg(taskId) {
     if ($("forge-progress-bar")) $("forge-progress-bar").value = d.percent ?? 0;
     if ($("forge-progress-elapsed")) $("forge-progress-elapsed").textContent = `${(d.elapsed ?? 0).toFixed(1)}s`;
 
-    if (d.status === "queued" || d.status === "running") {
-      if ((d.percent ?? 0) >= 70 || (d.stage || "").toLowerCase().includes("validando")) {
+    if (d.status === "processing" || d.status === "validating" || d.status === "queued" || d.status === "running") {
+      if (d.status === "validating" || (d.percent ?? 0) >= 70 || (d.stage || "").toLowerCase().includes("validando")) {
         forgeSetStatus("VALIDANDO");
       } else {
         forgeSetStatus("PROCESSANDO");
@@ -1684,7 +1707,7 @@ async function forgePollPkg(taskId) {
       forgeRenderPkgResult(d);
       forgeSetStatus("PENDENTE DE TESTE FÍSICO");
       toast(`PKG pronto (${fmtBytes(d.pkg_bytes || 0)}) · Pendente de teste físico no PS4.`, "ok");
-      await forgeLoadHistory();
+      await forgeLoadHistory(false);
     } else if (d.status === "cancelled") {
       forgeSetStatus("PRONTO");
       toast("Empacotamento PKG cancelado.");
@@ -1742,14 +1765,41 @@ async function forgeCancelPkg() {
   }
 }
 
-async function forgeLoadHistory() {
+async function forgeLoadHistory(checkActive = true) {
   if (!$("forge-history-card")) return;
   try {
+    // CZAR-AUD-013: First check whether this project/session has an active in-flight PKG build
+    // so reloading or re-entering the Package tab immediately resumes progress and unlocks download on completion.
+    if (checkActive) {
+      try {
+        const act = await api("/api/forge/pkg/active");
+        const running = act?.active;
+        if (running && (running.status === "processing" || running.status === "validating")) {
+          const alreadyTracking = forgeState.busy && forgeState.activeTaskId === running.task_id;
+          forgeState.busy = true;
+          forgeState.activeTaskId = running.task_id;
+          if ($("forge-progress-box")) {
+            $("forge-progress-box").hidden = false;
+            $("forge-progress-stage").textContent = running.stage || "Processando…";
+            $("forge-progress-pct").textContent = `${running.percent ?? 0}%`;
+            $("forge-progress-bar").value = running.percent ?? 0;
+            $("forge-progress-elapsed").textContent = `${(running.elapsed ?? 0).toFixed(1)}s`;
+          }
+          forgeSetStatus(running.status === "validating" ? "VALIDANDO" : "PROCESSANDO");
+          refreshChecklist();
+          if (!alreadyTracking) {
+            forgePollPkg(running.task_id);
+          }
+        }
+      } catch { /* ignore active check failure */ }
+    }
+
     const d = await api("/api/forge/pkg/history");
     const items = d.items || [];
     forgeState.history = items;
     if (!items.length) {
       $("forge-history-card").hidden = true;
+      refreshChecklist();
       return;
     }
     $("forge-history-card").hidden = false;
@@ -1758,7 +1808,7 @@ async function forgeLoadHistory() {
         <div>
           <b><code>${forgeEsc(it.pkg_name)}</code></b>
           <div class="dim" style="font-size:12px">
-            ${fmtBytes(it.pkg_bytes || 0)} · IRO_TAG ${forgeEsc(it.iro_tag_header)}/${forgeEsc(it.iro_tag_sfo)} · CATEGORY ${forgeEsc(it.category || "ac")} · ${it.structure_validated ? "Validado" : "Falhou"} · Pendente de teste físico
+            ${fmtBytes(it.pkg_bytes || 0)} · IRO_TAG ${forgeEsc(it.iro_tag_header ?? 2)}/${forgeEsc(it.iro_tag_sfo ?? 2)} · CATEGORY ${forgeEsc(it.category || "ac")} · ${it.structure_validated ? "Validado" : "Falhou"} · Pendente de teste físico
           </div>
         </div>
         <div class="forge-history-actions">
@@ -1767,7 +1817,7 @@ async function forgeLoadHistory() {
         </div>
       </div>`).join("");
 
-    if (!forgeState.lastPkg && items[0]?.pkg_id) {
+    if (items[0]?.pkg_id && (!forgeState.lastPkg || (!forgeState.busy && forgeState.lastPkg.pkg_id !== items[0].pkg_id))) {
       try {
         const rep = await api(`/api/forge/pkg/${encodeURIComponent(items[0].pkg_id)}/report`);
         forgeState.lastPkg = {
@@ -1779,9 +1829,9 @@ async function forgeLoadHistory() {
         if (rep.pkg_report?.structure_validated && !forgeState.busy) {
           forgeSetStatus("PENDENTE DE TESTE FÍSICO");
         }
-        refreshChecklist();
       } catch { /* ignore transient history report fetch */ }
     }
+    refreshChecklist();
   } catch { /* standalone or uninitialized workspace */ }
 }
 
@@ -1812,10 +1862,15 @@ async function forgeOpenReport(pkgId = "") {
         <td>${fmtBytes(f.bytes || 0)}</td>
         <td><code>${forgeEsc((f.sha256 || "").slice(0, 16))}…</code></td>
       </tr>`).join("");
+    const cmpText = pr.bundle_compared
+      ? (pr.bundle_hashes_matched ? "100% correspondente (SHA-256)" : "Divergente do bundle")
+      : (pr.image0_extracted ? "Image0 extraído (sem bundle de referência)" : "Image0 não extraído");
     parts.push(`
       <div class="forge-report-kv">
         <div><span>PKG CRIADO</span><b>${pr.pkg_created ? "Sim" : "Não"}</b></div>
         <div><span>ESTRUTURA VALIDADA</span><b>${pr.structure_validated ? "Sim" : "Não"}</b></div>
+        <div><span>NÍVEL DE VERIFICAÇÃO</span><b>${forgeEsc(forgeVerificationLabel(pr.verification_level))}</b></div>
+        <div><span>CABEÇALHO &amp; Sc0</span><b>Cabeçalho: ${pr.header_and_crypto_valid ? "OK" : "Falhou"} · Sc0: ${pr.sc0_validated ? "OK" : "Falhou"}</b></div>
         <div><span>TIPO DE TEMA</span><b>${forgeEsc(pr.volume_type)}</b></div>
         <div><span>CONTENT_ID</span><code>${forgeEsc(pr.content_id)}</code></div>
         <div><span>TITLE_ID</span><code>${forgeEsc(pr.title_id)}</code></div>
@@ -1823,7 +1878,7 @@ async function forgeOpenReport(pkgId = "") {
         <div><span>CATEGORY</span><b>${forgeEsc(pr.category)}</b></div>
         <div><span>bgmhome_loud</span><b>${pr.bgmhome_loud ? `${forgeEsc(pr.bgmhome_loud)} LKFS` : "Não aplicável"}</b></div>
         <div><span>SHA-256 do PKG</span><code>${forgeEsc(pr.pkg_sha256 || "")}</code></div>
-        <div><span>Extração ↔ Bundle (SHA-256)</span><b>${pr.extracted_match ? "100% correspondente" : "Divergente / não extraído"}</b></div>
+        <div><span>Extração ↔ Bundle (SHA-256)</span><b>${forgeEsc(cmpText)}</b></div>
         <div><span>Builder / Validador</span><code>${forgeEsc(pr.builder_backend)} / ${forgeEsc(pr.validator_backend)}</code></div>
         <div><span>COMPATIBILIDADE FÍSICA</span><b>PENDENTE DE TESTE FÍSICO (PS4 Slim 12.52)</b></div>
       </div>

@@ -6,6 +6,7 @@ numbers scattered around the code.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # --- Resolutions the PS4 requires -----------------------------------------
@@ -53,7 +54,11 @@ MAX_WAIT_SECONDS = 5.0
 
 # --- Paths ----------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-WORKSPACE = PROJECT_ROOT / "workspace"
+WORKSPACE = (
+    Path(os.environ["CZAR_WORKSPACE"]).expanduser().resolve()
+    if os.environ.get("CZAR_WORKSPACE")
+    else PROJECT_ROOT / "workspace"
+)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # Destination folder inside the theme, exactly as the PS4 expects it.

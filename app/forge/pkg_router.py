@@ -40,6 +40,7 @@ from .pkg_forge import (
     pkg_forge_info,
 )
 from .pkg_inspector import inspect_and_validate_pkg
+from .subproc import kill_process_tree
 
 router = APIRouter(prefix="/api/forge")
 
@@ -113,11 +114,35 @@ class PkgTask:
 _tasks: dict[str, PkgTask] = {}
 
 
-def _forge_store_root(ws: Path | None = None) -> Path:
+def _forge_store_root(ws: Path | None = None, *, create: bool = True) -> Path:
     base = ws or jobs.project_workspace.get() or jobs.WORKSPACE
     root = base / "pkg-forge-v1"
-    root.mkdir(parents=True, exist_ok=True)
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def _persist_task_snapshot(task: PkgTask) -> None:
+    try:
+        store_root = _forge_store_root(task.workspace, create=True)
+        snap = task.public()
+        snap["updated_at"] = time.time()
+        tmp = store_root / f".last-task-{uuid.uuid4().hex[:8]}.tmp"
+        tmp.write_text(json.dumps(snap, indent=2), encoding="utf-8")
+        tmp.replace(store_root / "last-task.json")
+    except OSError:
+        pass
+
+
+def _load_last_task_snapshot(ws: Path) -> dict | None:
+    path = _forge_store_root(ws, create=False) / "last-task.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
 
 
 def _prune_old_tasks() -> None:
@@ -134,18 +159,25 @@ def _execute_pkg_task(task: PkgTask, params: dict) -> None:
     stage_dir = store_root / f".staging-{pkg_id}"
     final_dir = store_root / pkg_id
     try:
+        _persist_task_snapshot(task)
         stage_dir.mkdir(parents=True, exist_ok=True)
         task.progress("Montando árvore canônica do tema e param.sfo", 10)
+        _persist_task_snapshot(task)
         content_dir, gp4_path, meta, included, _pre_report = assemble_theme_tree(stage_dir, params)
 
         task.check()
         pkg_out_dir = stage_dir / "pkg"
+
+        def _on_progress(stage_txt: str, pct: int) -> None:
+            task.progress(stage_txt, pct)
+            _persist_task_snapshot(task)
+
         pkg_path, bundle_report, pkg_report, log_steps = build_and_validate_theme_pkg(
             content_dir,
             gp4_path,
             meta,
             pkg_out_dir,
-            progress=task.progress,
+            progress=_on_progress,
             check=task.check,
             register_proc=task.register_proc,
         )
@@ -185,12 +217,14 @@ def _execute_pkg_task(task: PkgTask, params: dict) -> None:
             task.pkg_report = record["pkg_report"]
             task.log = log_steps
             task.finished_at = time.time()
+        _persist_task_snapshot(task)
     except PkgForgeCancelled as exc:
         with _lock:
             task.status = "cancelled"
             task.stage = "Cancelado"
             task.error = str(exc)
             task.finished_at = time.time()
+        _persist_task_snapshot(task)
     except (PkgForgeError, HTTPException) as exc:
         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
         with _lock:
@@ -198,12 +232,14 @@ def _execute_pkg_task(task: PkgTask, params: dict) -> None:
             task.stage = "Falhou"
             task.error = str(detail)
             task.finished_at = time.time()
+        _persist_task_snapshot(task)
     except Exception as exc:
         with _lock:
             task.status = "failed"
             task.stage = "Falhou"
             task.error = f"Erro interno ao empacotar: {exc}"
             task.finished_at = time.time()
+        _persist_task_snapshot(task)
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
         shutil.rmtree(store_root / f".publish-{pkg_id}", ignore_errors=True)
@@ -290,6 +326,7 @@ def forge_pkg_build(
             raise HTTPException(429, "O servidor está empacotando o limite máximo de 2 temas simultâneos.")
         task = PkgTask(id=uuid.uuid4().hex[:24], workspace=ws)
         _tasks[task.id] = task
+        _persist_task_snapshot(task)
 
     if sync:
         _execute_pkg_task(task, params)
@@ -302,14 +339,43 @@ def forge_pkg_build(
     return JSONResponse(status_code=202, content=task.public())
 
 
+@router.get("/pkg/active")
+def forge_pkg_active() -> dict:
+    """Return any in-flight PKG task for the current project/session, or the latest persisted terminal snapshot."""
+    ws = jobs.project_workspace.get() or jobs.WORKSPACE
+    with _lock:
+        _prune_old_tasks()
+        for t in _tasks.values():
+            if t.workspace == ws and t.status in {"processing", "validating"}:
+                pub = t.public()
+                return {"active": pub, "latest": pub}
+
+    snap = _load_last_task_snapshot(ws)
+    if snap and snap.get("status") in {"processing", "validating"}:
+        # Process restarted while a prior job was running; never pretend it is still running.
+        snap = dict(snap)
+        snap["status"] = "interrupted"
+        snap["stage"] = "Interrompido após reinício do servidor"
+        snap["error"] = "O empacotamento em andamento foi interrompido por reinício do servidor."
+    return {"active": None, "latest": snap}
+
+
 @router.get("/pkg/jobs/{task_id}")
 def forge_pkg_job_status(task_id: str) -> dict:
     ws = jobs.project_workspace.get() or jobs.WORKSPACE
     with _lock:
         task = _tasks.get(task_id)
-        if task is None or task.workspace != ws:
-            raise HTTPException(404, "Tarefa de empacotamento não encontrada neste projeto.")
-        return task.public()
+        if task is not None and task.workspace == ws:
+            return task.public()
+    snap = _load_last_task_snapshot(ws)
+    if snap and snap.get("task_id") == task_id:
+        if snap.get("status") in {"processing", "validating"}:
+            snap = dict(snap)
+            snap["status"] = "interrupted"
+            snap["stage"] = "Interrompido após reinício do servidor"
+            snap["error"] = "O empacotamento foi interrompido por reinício do servidor."
+        return snap
+    raise HTTPException(404, "Tarefa de empacotamento não encontrada neste projeto.")
 
 
 @router.post("/pkg/jobs/{task_id}/cancel")
@@ -320,18 +386,16 @@ def forge_pkg_job_cancel(task_id: str) -> dict:
         if task is None or task.workspace != ws:
             raise HTTPException(404, "Tarefa de empacotamento não encontrada neste projeto.")
         task.stop.set()
-        if task.active_proc is not None and task.active_proc.poll() is None:
-            try:
-                task.active_proc.kill()
-            except OSError:
-                pass
+        kill_process_tree(task.active_proc)
         return task.public()
 
 
 @router.get("/pkg/history")
 def forge_pkg_history() -> dict:
     """List persisted validated PKG builds for the active project (survives server restarts)."""
-    root = _forge_store_root()
+    root = _forge_store_root(create=False)
+    if not root.is_dir():
+        return {"items": []}
     items = []
     for child in root.iterdir():
         if not child.is_dir() or not PKG_ID_RE.fullmatch(child.name):
@@ -341,6 +405,7 @@ def forge_pkg_history() -> dict:
             continue
         try:
             rec = json.loads(rep_file.read_text(encoding="utf-8"))
+            pr = rec.get("pkg_report", {})
             items.append(
                 {
                     "pkg_id": rec["pkg_id"],
@@ -351,9 +416,13 @@ def forge_pkg_history() -> dict:
                     "created_at": rec.get("created_at", 0),
                     "download": f"/api/forge/pkg/{rec['pkg_id']}/download",
                     "report_url": f"/api/forge/pkg/{rec['pkg_id']}/report",
-                    "structure_validated": rec.get("pkg_report", {}).get("structure_validated", False),
-                    "theme_type_valid": rec.get("pkg_report", {}).get("theme_type_valid", False),
-                    "physical_compatibility": rec.get("pkg_report", {}).get("physical_compatibility", "pending"),
+                    "iro_tag_header": pr.get("iro_tag_header"),
+                    "iro_tag_sfo": pr.get("iro_tag_sfo"),
+                    "category": pr.get("category", ""),
+                    "verification_level": pr.get("verification_level", "full_bundle_verified"),
+                    "structure_validated": pr.get("structure_validated", False),
+                    "theme_type_valid": pr.get("theme_type_valid", False),
+                    "physical_compatibility": pr.get("physical_compatibility", "pending"),
                 }
             )
         except (OSError, ValueError, KeyError):
@@ -365,7 +434,7 @@ def forge_pkg_history() -> dict:
 def _load_persisted_pkg(pkg_id: str) -> tuple[Path, dict]:
     if not PKG_ID_RE.fullmatch(pkg_id or ""):
         raise HTTPException(404, "Identificador de PKG inválido.")
-    folder = _forge_store_root() / pkg_id
+    folder = _forge_store_root(create=False) / pkg_id
     rep_file = folder / "report.json"
     if not rep_file.is_file():
         raise HTTPException(404, "PKG não encontrado neste projeto.")

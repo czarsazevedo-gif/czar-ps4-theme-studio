@@ -1160,3 +1160,42 @@ input[type=range]:disabled { opacity: .45; cursor: default; }
 }
 .forge-files-table code { font-size: 11.5px; }
 
+/* ================= TOUCH TARGET REFINEMENTS (>= 44 CSS px · CZAR-AUD-015) ================= */
+.select,
+.field,
+.btn,
+.lang-select,
+.forge-audio-inline input[type="number"],
+.forge-audio-grid select {
+  min-height: 44px;
+}
+a.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.lang-select {
+  padding: 10px 12px;
+}
+.btn-icon {
+  min-width: 44px;
+  min-height: 44px;
+  width: 44px;
+  height: 44px;
+}
+.color-row input[type="color"] {
+  min-height: 44px;
+  height: 44px;
+  min-width: 44px;
+}
+.color-row label,
+.forge-audio-inline label {
+  min-height: 44px;
+  justify-content: center;
+}
+.mode-opt .mode-face,
+.tab {
+  min-height: 44px;
+}
+
+

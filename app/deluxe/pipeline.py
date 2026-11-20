@@ -427,6 +427,7 @@ def apply_deluxe_to_project(
         job_stage = stage_parent / f"animated-{job_id}"
         job_stage.mkdir()
         (job_stage / "preview").mkdir()
+        (job_stage / "deluxe_preview").mkdir()
         (job_stage / "out").mkdir()
         (job_stage / "deluxe_frames").mkdir()
         (job_stage / "deluxe_dds").mkdir()
@@ -437,6 +438,7 @@ def apply_deluxe_to_project(
 
         for i in range(frames):
             shutil.copyfile(result_folder / f"{i:02d}.webp", job_stage / "preview" / f"{i:02d}.webp")
+            shutil.copyfile(result_folder / f"{i:02d}.webp", job_stage / "deluxe_preview" / f"{i:02d}.webp")
             shutil.copyfile(png_src / f"{i:02d}.png", job_stage / "deluxe_frames" / f"{i:02d}.png")
             shutil.copyfile(dds_src / theme.frame_name(i), job_stage / "deluxe_dds" / theme.frame_name(i))
         shutil.copyfile(raf_src, job_stage / "out" / "background.raf.zip")
@@ -449,6 +451,7 @@ def apply_deluxe_to_project(
             "source_size": list(size),
             "codec": "h264",
             "fps_used": round(1.0 / wait, 6),
+            "preview_source": "deluxe",
             "deluxe": {
                 "version": DELUXE_VERSION,
                 "resultKey": report.get("key", ""),

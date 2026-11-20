@@ -45,19 +45,25 @@ class Job:
         return self.root / "job.json"
 
     def save(self) -> None:
-        self.meta_path.write_text(
-            json.dumps(
-                {
-                    "id": self.id,
-                    "kind": self.kind,
-                    "source": self.source.name,
-                    "original_name": self.original_name,
-                    "meta": self.meta,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        payload = json.dumps(
+            {
+                "id": self.id,
+                "kind": self.kind,
+                "source": self.source.name,
+                "original_name": self.original_name,
+                "meta": self.meta,
+            },
+            indent=2,
+        ).encode("utf-8")
+        tmp = self.root / f".job-{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            with tmp.open("wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            tmp.replace(self.meta_path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def _safe_suffix(filename: str) -> str:
