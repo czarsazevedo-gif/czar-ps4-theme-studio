@@ -317,14 +317,15 @@ def evaluate_loop(
     med_int_acc = float(np.median(int_acc_arr)) if len(int_acc_arr) else 0.0
     flow_err_ratio = float(seam_flow_err / max(med_int_acc, 0.25))
 
-    # Direction & reversal at seam
+    # Direction & reversal at seam (require genuine structural motion, not DXT1a/photometric noise)
+    min_moving_px = max(36, int(0.015 * valid_seam.size))
     opp_fracs = []
     cos_means = []
     for adj in (f_before, f_after):
         ma = np.hypot(adj[..., 0], adj[..., 1])
         ms = np.hypot(f_seam[..., 0], f_seam[..., 1])
-        moving = valid_seam & (ma > 0.3) & (ms > 0.3)
-        if int(moving.sum()) >= 12:
+        moving = valid_seam & (ma > 0.45) & (ms > 0.45)
+        if int(moving.sum()) >= min_moving_px:
             cos = (adj[..., 0][moving] * f_seam[..., 0][moving] + adj[..., 1][moving] * f_seam[..., 1][moving]) / (
                 ma[moving] * ms[moving] + 1e-6
             )
