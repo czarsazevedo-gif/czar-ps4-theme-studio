@@ -122,6 +122,8 @@ def probe_source_extended(source: Path, duration: float, check: Callable[[], Non
     measured = float(1.0 / med_dt) if med_dt > 0 else None
     vfr_cv = float(np.std(dts) / med_dt) if len(dts) >= 3 and med_dt > 0 else 0.0
     vfr_max_dev = float(np.max(np.abs(dts / med_dt - 1.0))) if len(dts) >= 2 and med_dt > 0 else 0.0
+    dup_ts = int(np.sum(dts < med_dt * 0.45)) if len(dts) >= 2 and med_dt > 0 else 0
+    drop_ts = int(np.sum(dts > med_dt * 1.75)) if len(dts) >= 2 and med_dt > 0 else 0
     window_fps_shift = (
         (max(fps_by_window) / max(min(fps_by_window), 1e-6) - 1.0)
         if len(fps_by_window) >= 2
@@ -152,6 +154,8 @@ def probe_source_extended(source: Path, duration: float, check: Callable[[], Non
         "isVFR": is_vfr,
         "vfrMaxDeviation": round(max(vfr_max_dev, window_fps_shift), 4),
         "vfrCV": round(vfr_cv, 4),
+        "duplicateTimestamps": dup_ts,
+        "droppedTimestamps": drop_ts,
     }
 
 
@@ -369,18 +373,39 @@ def analyze_levels(
     oscillatory_frac = float((cell_class == "oscillatory").mean())
     photometric_frac = float((cell_class == "photometric").mean())
 
-    # Camera motion aggregation: true camera pan moves the whole scene (not a fixed camera with static sky!)
+    # Camera motion aggregation: distinguish fixed camera vs jitter vs smooth pan/travelling vs zoom/rotation
     cam_txs = [c["tx"] for c in cam_steps]
     cam_tys = [c["ty"] for c in cam_steps]
+    cam_rots = [c["rotationDeg"] for c in cam_steps]
+    cam_scales = [c["scale"] for c in cam_steps]
     cam_disps = [math.hypot(tx, ty) for tx, ty in zip(cam_txs, cam_tys)]
     cam_moving_frac = float(np.mean([c["cameraMoving"] for c in cam_steps])) if cam_steps else 0.0
     cam_inliers = float(np.mean([c["inlierRatio"] for c in cam_steps])) if cam_steps else 0.0
+    cam_quads = float(np.mean([c.get("inlierQuadrants", 0) for c in cam_steps])) if cam_steps else 0.0
+    cam_med_disp = float(np.median(cam_disps)) if cam_disps else 0.0
+    cam_jitter = float(np.std(cam_disps)) if len(cam_disps) >= 2 else 0.0
+    cam_zoom_dev = float(max((abs(s - 1.0) for s in cam_scales), default=0.0))
+    cam_max_rot = float(max((abs(r) for r in cam_rots), default=0.0))
+
     camera_moving = bool(
         static_frac < 0.18
-        and cam_moving_frac >= 0.55
-        and cam_inliers >= 0.65
-        and float(np.median(cam_disps)) > 0.45
+        and cam_moving_frac >= 0.50
+        and (
+            (cam_inliers >= 0.65 and cam_med_disp > 0.45)
+            or (cam_inliers >= 0.42 and cam_quads >= 2.8 and cam_med_disp > 0.70)
+        )
     )
+    if not camera_moving:
+        camera_class = "tremor_leve" if (cam_jitter > 0.45 and cam_med_disp > 0.20) else "estavel"
+    elif cam_zoom_dev > 0.012 or cam_max_rot > 0.6:
+        camera_class = "zoom_ou_rotacao"
+    elif cam_jitter > max(0.85, cam_med_disp * 0.75):
+        camera_class = "instavel_tremor"
+    else:
+        camera_class = "panoramica_ou_travelling"
+
+    max_lum_step = float(np.max(np.abs(lum_diff))) if len(lum_diff) else 0.0
+    lum_range = float(np.ptp(lum_curve))
 
     level_a = {
         "samples": n,
@@ -392,10 +417,14 @@ def analyze_levels(
         "medianMae": round(med_mae, 4),
         "meanSpeedPx": round(float(np.mean(cont_speeds)), 4),
         "maxAccelPx": round(float(np.max(step_accels)), 4),
-        "luminanceRangeL": round(float(np.ptp(lum_curve)), 4),
+        "luminanceRangeL": round(lum_range, 4),
+        "maxLumStep": round(max_lum_step, 4),
         "maxChromaStep": round(float(np.max(chroma_step)) if len(chroma_step) else 0.0, 4),
         "cameraMoving": camera_moving,
-        "cameraMedianDispPx": round(float(np.median(cam_disps)) if cam_disps else 0.0, 4),
+        "cameraClass": camera_class,
+        "cameraMedianDispPx": round(cam_med_disp, 4),
+        "cameraJitterPx": round(cam_jitter, 4),
+        "cameraZoomDev": round(cam_zoom_dev, 5),
         "cameraInlierRatio": round(cam_inliers, 3),
         "subpixelMotionDetected": subpixel_motion,
         "subpixelMedianShiftPx": round(sp_med, 4),
@@ -635,6 +664,74 @@ def analyze_levels(
     d2L = np.abs(np.diff(dL_int)) if len(dL_int) >= 2 else np.array([0.0])
     artificial_flicker = bool(alt_rate > 0.55 and float(np.median(d2L)) > 1.8)
 
+    if artificial_flicker:
+        lighting_stability = "flicker_artificial"
+    elif max_lum_step > 6.5:
+        lighting_stability = "mudanca_brusca"
+    elif lum_range > 8.0:
+        lighting_stability = "variacao_suave"
+    else:
+        lighting_stability = "consistente"
+    level_a["lightingStability"] = lighting_stability
+    level_c["cameraMotion"]["cameraClass"] = camera_class
+    level_c["cameraMotion"]["jitterPx"] = round(cam_jitter, 4)
+    level_c["cameraMotion"]["zoomDeviation"] = round(cam_zoom_dev, 5)
+
+    # ==================== VISUAL & TECHNICAL QUALITY AUDIT ====================
+    sample_idx = np.linspace(0, n - 1, min(n, 8), dtype=int)
+    sharp_vals = [float(np.var(cv2.Laplacian(grays[i], cv2.CV_32F, ksize=3))) for i in sample_idx]
+    med_sharp = float(np.median(sharp_vals)) if sharp_vals else 0.0
+    # High-frequency noise estimate (median absolute difference against 3x3 median filter)
+    noise_vals = [
+        float(np.median(np.abs(grays[i].astype(np.float32) - cv2.medianBlur(grays[i], 3).astype(np.float32))))
+        for i in sample_idx
+    ]
+    med_noise = float(np.median(noise_vals)) if noise_vals else 0.0
+    # 8x8 macroblock boundary ratio on luminance (compression blocking cue)
+    block_ratios = []
+    for i in sample_idx:
+        gf = grays[i].astype(np.float32)
+        dx_g = np.abs(np.diff(gf, axis=1))
+        dy_g = np.abs(np.diff(gf, axis=0))
+        if dx_g.shape[1] >= 16 and dy_g.shape[0] >= 16:
+            bx = float(dx_g[:, 7::8].mean())
+            ix = float(dx_g[:, 3::8].mean())
+            by = float(dy_g[7::8, :].mean())
+            iy = float(dy_g[3::8, :].mean())
+            block_ratios.append(0.5 * ((bx / max(ix, 0.5)) + (by / max(iy, 0.5))))
+    blocking_ratio = float(np.median(block_ratios)) if block_ratios else 1.0
+
+    src_w = int((source_info or {}).get("width") or w)
+    src_h = int((source_info or {}).get("height") or h)
+    aspect_ratio = src_w / max(src_h, 1)
+    aspect_diff = abs(aspect_ratio - (16.0 / 9.0))
+    crop_needed = bool(aspect_diff > 0.08)
+    portrait_source = bool(src_h > src_w)
+    sharp_label = "alta" if med_sharp >= 260.0 else ("adequada" if med_sharp >= 75.0 else ("suave" if med_sharp >= 25.0 else "borrada"))
+    compression_label = "alta_compressao" if blocking_ratio > 1.38 else ("moderada" if blocking_ratio > 1.18 else "limpa")
+    noise_label = "alto" if med_noise > 3.5 else ("moderado" if med_noise > 1.6 else "baixo")
+    motion_blur_risk = bool(med_sharp < 45.0 and float(cont_speeds.mean()) > 1.2)
+
+    level_quality = {
+        "sharpnessVar": round(med_sharp, 2),
+        "sharpnessLabel": sharp_label,
+        "noiseMad": round(med_noise, 3),
+        "noiseLabel": noise_label,
+        "blockingRatio": round(blocking_ratio, 3),
+        "compressionLabel": compression_label,
+        "motionBlurRisk": motion_blur_risk,
+        "sourceWidth": src_w,
+        "sourceHeight": src_h,
+        "aspectRatio": round(aspect_ratio, 4),
+        "matchesPs416x9": not crop_needed,
+        "cropNeeded": crop_needed,
+        "portraitSource": portrait_source,
+        "resolutionTier": (
+            "1080p_ou_superior" if src_w >= 1900 and src_h >= 1060
+            else ("720p_hd" if src_w >= 1260 and src_h >= 700 else "inferior_a_720p")
+        ),
+    }
+
     spatial_rep = _detect_spatial_repetition(rgb, flows_fwd)
 
     true_recurrence = bool(best_lag is not None and not ping_pong and not cuts and best_lag_flow_cos > 0.35)
@@ -700,7 +797,7 @@ def analyze_levels(
             conf = 0.82
             reasons.append("Múltiplos cortes abruptos comprometem continuidade temporal.")
         elif camera_moving and not true_recurrence:
-            cls = CLASS_CORRECTABLE if float(np.median(cam_disps)) < 4.0 else CLASS_UNSUITABLE
+            cls = CLASS_CORRECTABLE if cam_med_disp < 4.0 else CLASS_UNSUITABLE
             conf = 0.72
             reasons.append("Deslocamento global de câmera detectado; exige estabilização e reconstrução.")
         elif true_recurrence and best_lag is not None and best_lag > cap:
@@ -713,6 +810,20 @@ def analyze_levels(
             cls = CLASS_SYNTHESIS if (progressive_frac >= 0.25 and kin_global["coherence"] >= 0.6) else CLASS_CORRECTABLE
             conf = round(float(np.clip(0.45 + 0.35 * mean_flow_conf, 0.35, 0.85)), 3)
             reasons.append("Movimento contínuo sem fechamento natural exato; candidato à reconstrução ou síntese direcional.")
+        elif (
+            oscillatory_frac >= 0.22
+            and transient_frac < 0.08
+            and not cuts
+            and not ping_pong
+            and not artificial_flicker
+            and float(cont_speeds.mean()) >= 0.30
+        ):
+            # Continuous stochastic / turbulent dynamic textures (e.g., campfire flames, rain, turbulent ripples)
+            cls = CLASS_CORRECTABLE
+            conf = round(float(np.clip(0.42 + 0.25 * mean_flow_conf, 0.35, 0.72)), 3)
+            reasons.append(
+                "Textura dinâmica turbulenta/oscilatória contínua (ex.: fogo, chuva ou espuma); requer ponte de transição ou seleção cuidadosa de costura."
+            )
         else:
             cls = CLASS_UNSUITABLE
             conf = 0.65
@@ -746,6 +857,7 @@ def analyze_levels(
         "levelC": level_c,
         "levelD": level_d,
         "levelE": per_resolution,
+        "levelQuality": level_quality,
     }
 
 

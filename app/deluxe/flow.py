@@ -115,6 +115,47 @@ def compute_bidirectional_flow(
     )
 
 
+def compute_flow_capped(
+    frame_a: np.ndarray,
+    frame_b: np.ndarray,
+    *,
+    max_width: int = 384,
+    method: str = "farneback",
+    fb_alpha: float = 0.05,
+    fb_beta: float = 0.75,
+) -> FlowResult:
+    """Compute bidirectional flow at <= `max_width` and smoothly upsample to native pixel units."""
+    h, w = frame_a.shape[:2]
+    if w <= max_width:
+        return compute_bidirectional_flow(frame_a, frame_b, method=method, fb_alpha=fb_alpha, fb_beta=fb_beta)
+    scale = max_width / float(w)
+    nw = max(32, int(round(w * scale / 2)) * 2)
+    nh = max(32, int(round(h * scale / 2)) * 2)
+    sa = cv2.resize(frame_a, (nw, nh), interpolation=cv2.INTER_AREA)
+    sb = cv2.resize(frame_b, (nw, nh), interpolation=cv2.INTER_AREA)
+    fr = compute_bidirectional_flow(sa, sb, method=method, fb_alpha=fb_alpha, fb_beta=fb_beta)
+    sx = w / float(nw)
+    sy = h / float(nh)
+    fwd = np.stack(
+        [
+            cv2.resize(fr.fwd[..., 0], (w, h), interpolation=cv2.INTER_LINEAR) * sx,
+            cv2.resize(fr.fwd[..., 1], (w, h), interpolation=cv2.INTER_LINEAR) * sy,
+        ],
+        axis=-1,
+    ).astype(np.float32)
+    bwd = np.stack(
+        [
+            cv2.resize(fr.bwd[..., 0], (w, h), interpolation=cv2.INTER_LINEAR) * sx,
+            cv2.resize(fr.bwd[..., 1], (w, h), interpolation=cv2.INTER_LINEAR) * sy,
+        ],
+        axis=-1,
+    ).astype(np.float32)
+    fb_err = cv2.resize(fr.fb_error, (w, h), interpolation=cv2.INTER_LINEAR) * float(0.5 * (sx + sy))
+    conf = np.clip(cv2.resize(fr.confidence, (w, h), interpolation=cv2.INTER_LINEAR), 0.0, 1.0).astype(np.float32)
+    occ = cv2.resize(fr.occluded.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+    return FlowResult(fwd=fwd, bwd=bwd, fb_error=fb_err.astype(np.float32), occluded=occ, confidence=conf)
+
+
 def estimate_subpixel_shift(frame_a: np.ndarray, frame_b: np.ndarray) -> tuple[float, float, float]:
     """Estimate global subpixel translation (dx, dy) and response using Hann-windowed phase correlation."""
     ga = to_gray_u8(frame_a).astype(np.float32)
@@ -141,6 +182,7 @@ def estimate_camera_motion(
     pts_a = cv2.goodFeaturesToTrack(ga, maxCorners=200, qualityLevel=0.02, minDistance=6, blockSize=5)
     inlier_ratio = 0.0
     matrix = None
+    inlier_quadrants = 0
     if pts_a is not None and len(pts_a) >= 12:
         pts_b, st, _ = cv2.calcOpticalFlowPyrLK(ga, gb, pts_a, None, winSize=(15, 15), maxLevel=3)
         good = (st.ravel() == 1) if st is not None else np.zeros(len(pts_a), bool)
@@ -159,6 +201,10 @@ def estimate_camera_motion(
                 )
                 if matrix is not None and inliers is not None:
                     inlier_ratio = float(inliers.mean())
+                    inl_pts = p0[inliers.ravel().astype(bool)]
+                    if len(inl_pts):
+                        q_set = {(int(pt[0] >= w * 0.5), int(pt[1] >= h * 0.5)) for pt in inl_pts}
+                        inlier_quadrants = len(q_set)
 
     # Fallback to flow-grid RANSAC when sparse corners are scarce (e.g., smooth fog/water)
     if matrix is None and flow is not None:
@@ -179,6 +225,10 @@ def estimate_camera_motion(
             )
             if matrix is not None and inliers is not None:
                 inlier_ratio = float(inliers.mean())
+                inl_pts = p0[inliers.ravel().astype(bool)]
+                if len(inl_pts):
+                    q_set = {(int(pt[0] >= w * 0.5), int(pt[1] >= h * 0.5)) for pt in inl_pts}
+                    inlier_quadrants = len(q_set)
 
     if matrix is None:
         return {
@@ -187,6 +237,7 @@ def estimate_camera_motion(
             "rotationDeg": 0.0,
             "scale": 1.0,
             "inlierRatio": 0.0,
+            "inlierQuadrants": 0,
             "cameraMoving": False,
             "matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
         }
@@ -200,9 +251,10 @@ def estimate_camera_motion(
     center_dx = (a00 * cx + a01 * cy + tx) - cx
     center_dy = (a10 * cx + a11 * cy + ty) - cy
     disp = float(np.hypot(center_dx, center_dy))
+    # Support parallax-rich travelling cameras (inliers >= 0.42 across >= 3 quadrants with clear displacement)
     moving = bool(
-        inlier_ratio >= 0.55
-        and (disp > 0.35 or abs(rot_deg) > 0.15 or abs(scale - 1.0) > 0.004)
+        (inlier_ratio >= 0.55 and (disp > 0.35 or abs(rot_deg) > 0.15 or abs(scale - 1.0) > 0.004))
+        or (inlier_ratio >= 0.42 and inlier_quadrants >= 3 and (disp > 0.65 or abs(rot_deg) > 0.25 or abs(scale - 1.0) > 0.007))
     )
     return {
         "tx": round(center_dx, 4),
@@ -210,6 +262,7 @@ def estimate_camera_motion(
         "rotationDeg": round(rot_deg, 4),
         "scale": round(scale, 5),
         "inlierRatio": round(inlier_ratio, 3),
+        "inlierQuadrants": int(inlier_quadrants),
         "cameraMoving": moving,
         "matrix": [[round(a00, 6), round(a01, 6), round(tx, 4)], [round(a10, 6), round(a11, 6), round(ty, 4)]],
     }

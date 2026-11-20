@@ -36,26 +36,55 @@ def _psnr(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _ssim_gray(a: np.ndarray, b: np.ndarray) -> float:
+    """Exact uniform-window SSIM matching skimage (ddof=1) using OpenCV float32 boxFilter (~3.5x faster)."""
     h, w = a.shape[:2]
     win = min(7, h if h % 2 == 1 else h - 1, w if w % 2 == 1 else w - 1)
     if win < 3:
         return 1.0 - float(np.abs(a.astype(np.float32) - b.astype(np.float32)).mean()) / 255.0
-    return float(skimage_ssim(a, b, data_range=255, win_size=win))
+    af = a.astype(np.float32, copy=False)
+    bf = b.astype(np.float32, copy=False)
+    c1 = (0.01 * 255.0) ** 2
+    c2 = (0.03 * 255.0) ** 2
+    k = (win, win)
+    n_el = float(win * win)
+    cov_norm = n_el / (n_el - 1.0)
+    ux = cv2.boxFilter(af, -1, k, borderType=cv2.BORDER_REFLECT)
+    uy = cv2.boxFilter(bf, -1, k, borderType=cv2.BORDER_REFLECT)
+    uxx = cv2.boxFilter(af * af, -1, k, borderType=cv2.BORDER_REFLECT)
+    uyy = cv2.boxFilter(bf * bf, -1, k, borderType=cv2.BORDER_REFLECT)
+    uxy = cv2.boxFilter(af * bf, -1, k, borderType=cv2.BORDER_REFLECT)
+    vx = np.maximum(0.0, (uxx - ux * ux) * cov_norm)
+    vy = np.maximum(0.0, (uyy - uy * uy) * cov_norm)
+    vxy = (uxy - ux * uy) * cov_norm
+    smap = ((2.0 * ux * uy + c1) * (2.0 * vxy + c2)) / ((ux * ux + uy * uy + c1) * (vx + vy + c2))
+    pad = win // 2
+    if pad > 0 and smap.shape[0] > 2 * pad and smap.shape[1] > 2 * pad:
+        return float(smap[pad:-pad, pad:-pad].mean())
+    return float(smap.mean())
 
 
-def _ms_ssim_gray(a: np.ndarray, b: np.ndarray) -> float:
-    """Fast 3-scale multi-scale SSIM approximation on grayscale frames."""
+def _ssim_and_ms_ssim_gray(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
+    """Compute full-res SSIM and 3-scale MS-SSIM in a single pass (eliminates duplicate scale-0 work)."""
     weights = (0.4, 0.35, 0.25)
     scores = []
     ca, cb = a, b
-    for w_scale in weights:
-        scores.append((w_scale, _ssim_gray(ca, cb)))
+    s0 = 1.0
+    for idx, w_scale in enumerate(weights):
+        s = _ssim_gray(ca, cb)
+        if idx == 0:
+            s0 = s
+        scores.append((w_scale, s))
         if min(ca.shape[:2]) < 24:
             break
         ca = cv2.pyrDown(ca)
         cb = cv2.pyrDown(cb)
     total_w = sum(w_s for w_s, _ in scores)
-    return float(sum(w_s * s for w_s, s in scores) / max(total_w, 1e-6))
+    return s0, float(sum(w_s * s for w_s, s in scores) / max(total_w, 1e-6))
+
+
+def _ms_ssim_gray(a: np.ndarray, b: np.ndarray) -> float:
+    """Fast 3-scale multi-scale SSIM approximation on grayscale frames."""
+    return _ssim_and_ms_ssim_gray(a, b)[1]
 
 
 def _robust_z(value: float, samples: np.ndarray, floor: float = 0.25) -> float:
@@ -248,8 +277,7 @@ def evaluate_loop(
         j = (i + 1) % n
         mae_all[i] = float(np.abs(rgb[i].astype(np.float32) - rgb[j].astype(np.float32)).mean())
         psnr_all[i] = _psnr(rgb[i], rgb[j])
-        ssim_all[i] = _ssim_gray(grays[i], grays[j])
-        ms_ssim_all[i] = _ms_ssim_gray(grays[i], grays[j])
+        ssim_all[i], ms_ssim_all[i] = _ssim_and_ms_ssim_gray(grays[i], grays[j])
         edge_diff_all[i] = float(np.abs(edges[i] - edges[j]).mean())
         lum_step_all[i] = float(L_chan[j].mean() - L_chan[i].mean())
         ab_i = ab_chan[i].mean(axis=(0, 1))
@@ -751,21 +779,78 @@ def evaluate_post_dds(
     return post_report
 
 
+def evaluate_ten_cycles(eval_report: dict) -> dict:
+    """Audit continuous 10-cycle playback (no artificial pauses) from a circular post-DDS evaluation."""
+    n = int(eval_report.get("frames") or 0)
+    wait = float(eval_report.get("wait") or 0.1)
+    cycle_sec = round(n * wait, 4)
+    total_sec = round(cycle_sec * 10.0, 3)
+    m = eval_report.get("metrics") or {}
+    vs = m.get("visualSimilarity") or {}
+    fc = m.get("flowContinuity") or {}
+    vc = m.get("velocityContinuity") or {}
+    rv = m.get("reversals") or {}
+    fz = m.get("freezes") or {}
+    fl = m.get("flicker") or {}
+    gh = m.get("ghosting") or {}
+
+    dir_ok = (not fc.get("directionMeasured")) or (
+        float(fc.get("seamDirectionCosine", 1.0)) >= 0.40 and float(fc.get("seamOppositeFraction", 0.0)) <= 0.28
+    )
+    seam_visible = bool(
+        float(vs.get("seamRatio", 1.0)) > 1.75
+        or float(vs.get("localSeamExcess", 0.0)) > 1.8
+        or (fc.get("directionMeasured") and not dir_ok)
+        or float(vc.get("relativeJump", 0.0)) > 0.55
+    )
+    rep_per_min = round(60.0 / max(cycle_sec, 0.05), 1)
+    repetition_risk = "alta" if cycle_sec < 0.9 else ("moderada" if cycle_sec < 1.6 else "baixa")
+    continuous_ok = bool(
+        eval_report.get("passed")
+        and not seam_visible
+        and not rv.get("detected")
+        and not fz.get("detected")
+        and not fl.get("artificialFlicker")
+        and not gh.get("detected")
+    )
+    return {
+        "cycles": 10,
+        "framesPerCycle": n,
+        "totalFramesPlayed": n * 10,
+        "wrapTransitions": 10,
+        "cycleDurationSec": cycle_sec,
+        "tenCycleDurationSec": total_sec,
+        "repetitionsPerMinute": rep_per_min,
+        "repetitionRisk": repetition_risk,
+        "seamVisibleRisk": seam_visible,
+        "directionalContinuityOk": dir_ok,
+        "continuousTenCyclePass": continuous_ok,
+    }
+
+
 def compare_before_after(before: dict, after: dict) -> dict:
-    """Scientific before/after comparison matrix. Rejects refinements that worsen key metrics."""
+    """Scientific before/after comparison matrix. Rejects refinements that worsen perceptual or directional continuity."""
     bm = before["metrics"]
     am = after["metrics"]
+
+    b_spd = float(bm["velocityContinuity"]["internalMedianSpeedPx"])
+    a_spd = float(am["velocityContinuity"]["internalMedianSpeedPx"])
+    motion_retention = float(a_spd / max(b_spd, 0.15)) if b_spd >= 0.25 else 1.0
 
     comparisons = {
         "seamMae": (bm["visualSimilarity"]["seamMae"], am["visualSimilarity"]["seamMae"], "lower"),
         "seamSsim": (bm["visualSimilarity"]["seamSsim"], am["visualSimilarity"]["seamSsim"], "higher"),
         "seamFlowErrorPx": (bm["flowContinuity"]["seamFlowErrorPx"], am["flowContinuity"]["seamFlowErrorPx"], "lower"),
+        "seamDirectionCosine": (bm["flowContinuity"]["seamDirectionCosine"], am["flowContinuity"]["seamDirectionCosine"], "higher"),
+        "seamOppositeFraction": (bm["flowContinuity"]["seamOppositeFraction"], am["flowContinuity"]["seamOppositeFraction"], "lower"),
         "velocityJump": (bm["velocityContinuity"]["relativeJump"], am["velocityContinuity"]["relativeJump"], "lower"),
+        "edgeRatio": (bm["edgeConsistency"]["edgeRatio"], am["edgeConsistency"]["edgeRatio"], "lower"),
         "seamDeltaL": (abs(bm["luminanceContinuity"]["seamDeltaL"]), abs(am["luminanceContinuity"]["seamDeltaL"]), "lower"),
         "seamDeltaChroma": (bm["chromaticContinuity"]["seamDeltaChroma"], am["chromaticContinuity"]["seamDeltaChroma"], "lower"),
         "flickerScore": (bm["flicker"]["score"], am["flicker"]["score"], "lower"),
         "ghostingScore": (bm["ghosting"]["score"], am["ghosting"]["score"], "lower"),
         "sharpnessRetention": (bm["texturePreservation"]["sharpnessRetention"], am["texturePreservation"]["sharpnessRetention"], "higher"),
+        "motionRetention": (1.0, round(min(motion_retention, 2.0), 4), "higher"),
     }
 
     matrix = {}
@@ -787,7 +872,8 @@ def compare_before_after(before: dict, after: dict) -> dict:
         elif worsened:
             regressions.append(name)
 
-    # Hard rejection triggers: introducing reversal, freeze, severe ghosting, or >25% sharpness loss
+    # Hard rejection triggers: never accept reversals, freezes, ghosting, blur, protected drift,
+    # directional degradation, or artificial motion dampening!
     hard_reject = []
     if am["reversals"]["detected"] and not bm["reversals"]["detected"]:
         hard_reject.append("Introduziu reversão artificial.")
@@ -802,21 +888,41 @@ def compare_before_after(before: dict, after: dict) -> dict:
     if am["staticIntegrity"]["checked"] and am["staticIntegrity"]["maxAbsDiff"] > bm["staticIntegrity"]["maxAbsDiff"] + 2.0:
         hard_reject.append("Corrompeu região estática protegida.")
 
-    # Net seam score comparison
-    b_seam_cost = (
-        bm["visualSimilarity"]["seamRatio"]
-        + bm["flowContinuity"]["flowErrorRatio"] * 0.6
-        + bm["ghosting"]["score"] * 2.0
-        + bm["flicker"]["score"] * 0.5
-        + len(before["issues"]) * 1.5
-    )
-    a_seam_cost = (
-        am["visualSimilarity"]["seamRatio"]
-        + am["flowContinuity"]["flowErrorRatio"] * 0.6
-        + am["ghosting"]["score"] * 2.0
-        + am["flicker"]["score"] * 0.5
-        + len(after["issues"]) * 1.5
-    )
+    # Directional degradation gate (prevents improving static appearance while breaking motion direction!)
+    if am["flowContinuity"]["directionMeasured"] and bm["flowContinuity"]["directionMeasured"]:
+        b_cos = float(bm["flowContinuity"]["seamDirectionCosine"])
+        a_cos = float(am["flowContinuity"]["seamDirectionCosine"])
+        b_opp = float(bm["flowContinuity"]["seamOppositeFraction"])
+        a_opp = float(am["flowContinuity"]["seamOppositeFraction"])
+        if (a_cos < b_cos - 0.18 and a_cos < 0.50) or (a_opp > b_opp + 0.14 and a_opp > 0.25):
+            hard_reject.append("Piorou a continuidade direcional do movimento na junção.")
+
+    # Artificial motion-dampening gate (never shrink genuine movement to artificially improve seam scores!)
+    if b_spd >= 0.45 and a_spd < b_spd * 0.62 and (bm["visualSimilarity"]["internalMedianMae"] >= 1.2):
+        hard_reject.append("Reduziu artificialmente a amplitude de movimento para mascarar a costura.")
+
+    def _perceptual_cost(rep: dict) -> float:
+        rm = rep["metrics"]
+        fc = rm["flowContinuity"]
+        dir_pen = (
+            (1.0 - max(-1.0, min(1.0, float(fc["seamDirectionCosine"])))) * 1.15
+            + float(fc["seamOppositeFraction"]) * 2.10
+            if fc["directionMeasured"]
+            else 0.0
+        )
+        return (
+            float(rm["visualSimilarity"]["seamRatio"])
+            + float(fc["flowErrorRatio"]) * 0.60
+            + dir_pen
+            + float(rm["velocityContinuity"]["relativeJump"]) * 0.85
+            + max(0.0, float(rm["edgeConsistency"]["edgeRatio"]) - 1.0) * 0.60
+            + float(rm["ghosting"]["score"]) * 2.00
+            + float(rm["flicker"]["score"]) * 0.50
+            + len(rep["issues"]) * 1.50
+        )
+
+    b_seam_cost = _perceptual_cost(before)
+    a_seam_cost = _perceptual_cost(after)
 
     accepted = (not hard_reject) and (a_seam_cost <= b_seam_cost + 0.05)
     return {

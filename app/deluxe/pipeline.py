@@ -241,8 +241,10 @@ def render_deluxe_loop(
 
     progress("Aplicando Ouroboros Deluxe Finish e validando após DDS DXT1a", 65)
     check()
-    # Baseline post-DDS of raw extracted frames for true before/after scientific matrix
-    raw_post_dds = evaluate_post_dds(raw_frames, wait, protected_mask=protected_mask)
+    # Baseline post-DDS of raw extracted frames (compute blobs once if candidate == raw_frames!)
+    same_as_raw = candidate_frames is raw_frames
+    raw_full = evaluate_post_dds(raw_frames, wait, protected_mask=protected_mask, return_blobs=same_as_raw)
+    raw_post_dds = raw_full["report"] if same_as_raw else raw_full
 
     if deluxe_finish:
         fin = apply_deluxe_finish(
@@ -250,6 +252,7 @@ def render_deluxe_loop(
             wait,
             protected_mask=protected_mask,
             reference_frames=raw_frames,
+            precomputed_baseline=raw_full if same_as_raw else None,
         )
         final_frames = fin["frames"]
         dds_blobs = fin["ddsBlobs"]
@@ -261,6 +264,12 @@ def render_deluxe_loop(
             "rejectedSteps": fin["rejectedSteps"],
             "beforeAfterFinish": fin["comparison"],
         }
+    elif same_as_raw:
+        final_frames = candidate_frames
+        dds_blobs = raw_full["blobs"]
+        decoded_frames = raw_full["decoded"]
+        final_post_dds = raw_post_dds
+        finish_meta = {"enabled": False, "appliedSteps": [], "rejectedSteps": []}
     else:
         ev_res = evaluate_post_dds(
             candidate_frames, wait, protected_mask=protected_mask, reference_frames=raw_frames, return_blobs=True
@@ -272,6 +281,8 @@ def render_deluxe_loop(
         finish_meta = {"enabled": False, "appliedSteps": [], "rejectedSteps": []}
 
     overall_cmp = compare_before_after(raw_post_dds, final_post_dds)
+    from .metrics import evaluate_ten_cycles
+    ten_cycle = evaluate_ten_cycles(final_post_dds)
 
     progress("Gravando prévias lossless dos DDS decodificados e cena RAF canônica", 88)
     check()
@@ -315,6 +326,7 @@ def render_deluxe_loop(
         "diffStats": {k: v for k, v in diff_info.items() if k != "heatmap"},
         "baselinePostDds": raw_post_dds,
         "finalPostDds": final_post_dds,
+        "tenCycleAudit": ten_cycle,
         "beforeAfterRaw": overall_cmp,
         "ddsHashes": dds_hashes,
         "recipe": {

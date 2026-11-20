@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from . import DELUXE_VERSION
-from .flow import compute_bidirectional_flow, estimate_camera_motion, to_gray_u8, warp_frame
+from .flow import compute_flow_capped, estimate_camera_motion, to_gray_u8, warp_frame
 from .genesis_supreme import SynthesisRejected, _align_protected_dxt1, estimate_2d_flow_field, synthesize_periodic_2d
 from .metrics import compare_before_after, evaluate_loop, evaluate_post_dds
 
@@ -57,20 +57,38 @@ def multiband_blend(img_a: np.ndarray, img_b: np.ndarray, mask_a: np.ndarray, le
     return np.clip(np.rint(out), 0, 255).astype(np.uint8)
 
 
-def _optimal_seam_mask(img_a: np.ndarray, img_b: np.ndarray, blend_pos: float, vertical: bool = True) -> np.ndarray:
-    """Compute a dynamic-programming minimum-cost spatial seam mask between two content pieces (Graphcut-inspired)."""
+def _optimal_seam_mask(
+    img_a: np.ndarray,
+    img_b: np.ndarray,
+    blend_pos: float,
+    vertical: bool = True,
+    *,
+    a_on_low_side: bool = True,
+    max_dp_dim: int = 240,
+) -> np.ndarray:
+    """Compute a fast minimum-cost spatial seam mask (Graphcut-inspired DP) at <= 240px and smoothly upsample."""
     h, w = img_a.shape[:2]
-    diff = np.abs(img_a.astype(np.float32) - img_b.astype(np.float32)).mean(axis=-1)
-    # Also include gradient mismatch so seams avoid cutting across sharp object edges
-    ga = cv2.Sobel(to_gray_u8(img_a), cv2.CV_32F, 1, 0, ksize=3) ** 2 + cv2.Sobel(to_gray_u8(img_a), cv2.CV_32F, 0, 1, ksize=3) ** 2
-    gb = cv2.Sobel(to_gray_u8(img_b), cv2.CV_32F, 1, 0, ksize=3) ** 2 + cv2.Sobel(to_gray_u8(img_b), cv2.CV_32F, 0, 1, ksize=3) ** 2
+    scale = min(1.0, max_dp_dim / float(max(h, w)))
+    if scale < 0.99:
+        sw = max(24, int(round(w * scale)))
+        sh = max(24, int(round(h * scale)))
+        sa = cv2.resize(img_a, (sw, sh), interpolation=cv2.INTER_AREA)
+        sb = cv2.resize(img_b, (sw, sh), interpolation=cv2.INTER_AREA)
+    else:
+        sa, sb = img_a, img_b
+
+    diff = np.abs(sa.astype(np.float32) - sb.astype(np.float32)).mean(axis=-1)
+    g_a = to_gray_u8(sa)
+    g_b = to_gray_u8(sb)
+    ga = cv2.Sobel(g_a, cv2.CV_32F, 1, 0, ksize=3) ** 2 + cv2.Sobel(g_a, cv2.CV_32F, 0, 1, ksize=3) ** 2
+    gb = cv2.Sobel(g_b, cv2.CV_32F, 1, 0, ksize=3) ** 2 + cv2.Sobel(g_b, cv2.CV_32F, 0, 1, ksize=3) ** 2
     cost = diff + 0.02 * np.abs(np.sqrt(ga) - np.sqrt(gb))
 
     if not vertical:
         cost = cost.T
     ch, cw = cost.shape
 
-    # Constrain seam near blend_pos with a gentle quadratic guide so the seam sweeps smoothly across time
+    # Constrain seam near blend_pos with a gentle quadratic guide so the seam sweeps smoothly WITH motion
     center = int(np.clip(round(blend_pos * (cw - 1)), 0, cw - 1))
     xs = np.arange(cw, dtype=np.float32)
     guide = ((xs - center) / max(cw * 0.22, 4.0)) ** 2 * 18.0
@@ -94,10 +112,13 @@ def _optimal_seam_mask(img_a: np.ndarray, img_b: np.ndarray, blend_pos: float, v
         seam_x[r] = int(np.clip(seam_x[r + 1] + back[r + 1, seam_x[r + 1]], 0, cw - 1))
 
     grid_x = np.arange(cw)[None, :]
-    mask = (grid_x < seam_x[:, None]).astype(np.float32)
+    mask = (grid_x < seam_x[:, None]).astype(np.float32) if a_on_low_side else (grid_x >= seam_x[:, None]).astype(np.float32)
     if not vertical:
         mask = mask.T
-    return mask
+    if mask.shape != (h, w):
+        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.GaussianBlur(mask, (5, 5), 1.0)
+    return np.clip(mask, 0.0, 1.0).astype(np.float32)
 
 
 # ==================== LEVEL 2: PHOTOMETRIC HARMONIZATION ====================
@@ -117,7 +138,6 @@ def level2_photometric_harmonize(
     means = labs.mean(axis=(1, 2))  # (N, 3)
     stds = np.maximum(labs.std(axis=(1, 2)), 1.0)  # (N, 3)
 
-    # Expected natural step between adjacent frames vs observed wrap jump
     # Remove the secular linear trend from frame 0 to frame N-1 so frame N-1 aligns seamlessly to frame 0
     end_to_start_diff = means[-1] - means[0]
     std_ratio_end = np.clip(stds[0] / stds[-1], 0.85, 1.18)
@@ -128,26 +148,18 @@ def level2_photometric_harmonize(
     small_0 = cv2.resize(labs[0, ..., 0], (gw, gh), interpolation=cv2.INTER_AREA)
     small_end = cv2.resize(labs[-1, ..., 0], (gw, gh), interpolation=cv2.INTER_AREA)
     spatial_drift = cv2.resize(small_end - small_0, (w, h), interpolation=cv2.INTER_LINEAR)
-    # Remove global mean already handled globally
     spatial_drift -= float(spatial_drift.mean())
-    # Clamp localized correction so we never over-distort legitimate spatial motion
     spatial_drift = np.clip(spatial_drift, -14.0, 14.0)
 
     prot = None if protected_mask is None else _align_protected_dxt1(protected_mask)
 
     for i in range(n):
-        # Centered ramp: -0.5 at i=0 -> +0.5 at i=N-1 (spreads correction symmetrically, minimizing max distortion!)
-        # Actually pinning frame 0 keeps exact compatibility with reference frame 0 while distributing over 0..N-1:
-        # Ramp s in [0, 1] with smoothstep-free linear progression so derivative dL/dt stays constant across seam!
         s = i / float(n)
         corrected = labs[i].copy()
-        # Global mean alignment (subtracts secular linear drift)
         corrected -= (s * end_to_start_diff)[None, None, :]
-        # Gentle contrast/std alignment on L* channel only
         c_scale = 1.0 + s * (float(std_ratio_end[0]) - 1.0)
         l_mean = float(corrected[..., 0].mean())
         corrected[..., 0] = (corrected[..., 0] - l_mean) * c_scale + l_mean
-        # Gentle localized lighting ramp correction (capped)
         corrected[..., 0] -= s * spatial_drift * 0.65
 
         corrected = np.clip(corrected, 0.0, 255.0).astype(np.uint8)
@@ -167,7 +179,11 @@ def level3_motion_compensated_seam(
     window: int | None = None,
     min_confidence: float = 0.35,
 ) -> tuple[np.ndarray, dict]:
-    """Align boundary motion across the seam using confidence- & occlusion-gated bidirectional optical flow."""
+    """Align boundary motion across the seam using direction-safe, occlusion-gated bidirectional optical flow.
+
+    Strictly projects the residual warp so tail frames NEVER reverse direction or stall below 40%
+    of the natural step velocity!
+    """
     rgb = np.asarray(frames, dtype=np.uint8)
     n, h, w, _ = rgb.shape
     if n < 6:
@@ -175,9 +191,8 @@ def level3_motion_compensated_seam(
 
     # First apply gentle photometric harmonization so optical flow isn't fooled by brightness drift
     harm = level2_photometric_harmonize(rgb, protected_mask=protected_mask)
-    fr = compute_bidirectional_flow(harm[-1], harm[0])
+    fr = compute_flow_capped(harm[-1], harm[0], max_width=384)
 
-    # Check if correspondence is trustworthy enough to warp!
     reliable = (fr.confidence >= min_confidence) & (~fr.occluded)
     prot = None if protected_mask is None else _align_protected_dxt1(protected_mask)
     if prot is not None:
@@ -191,8 +206,7 @@ def level3_motion_compensated_seam(
             "reason": "Confiança insuficiente do optical flow na junção; warping recusado com segurança.",
         }
 
-    # Gate & smooth the boundary residual flow so low-confidence / occluded zones are NEVER distorted
-    gate = (fr.confidence * (~fr.occluded).astype(np.float32))
+    gate = fr.confidence * (~fr.occluded).astype(np.float32)
     gate = np.where(gate >= min_confidence, gate, 0.0).astype(np.float32)
     if prot is not None:
         gate[prot] = 0.0
@@ -200,31 +214,44 @@ def level3_motion_compensated_seam(
     if prot is not None:
         gate[prot] = 0.0
 
-    # Clamp maximum warp magnitude to avoid extreme geometric stretching
-    max_warp = max(6.0, min(h, w) * 0.08)
+    max_warp = max(6.0, min(h, w) * 0.07)
     dx = np.clip(fr.fwd[..., 0] * gate, -max_warp, max_warp)
     dy = np.clip(fr.fwd[..., 1] * gate, -max_warp, max_warp)
-    # Subtract the expected single-step forward displacement (so we align F[N-1] to ONE step before F[0],
-    # NOT identical to F[0] — avoiding a freeze at the seam!)
-    fr_step = compute_bidirectional_flow(harm[-2], harm[-1])
-    step_dx = fr_step.fwd[..., 0] * gate
-    step_dy = fr_step.fwd[..., 1] * gate
+
+    # Measure natural step velocity right before and right after the seam
+    fr_step_prev = compute_flow_capped(harm[-2], harm[-1], max_width=384)
+    fr_step_next = compute_flow_capped(harm[0], harm[1], max_width=384)
+    step_dx = 0.5 * (fr_step_prev.fwd[..., 0] + fr_step_next.fwd[..., 0]) * gate
+    step_dy = 0.5 * (fr_step_prev.fwd[..., 1] + fr_step_next.fwd[..., 1]) * gate
+
     # Residual alignment needed so F[N-1] sits one natural step behind F[0]
-    res_flow = np.stack([dx - step_dx, dy - step_dy], axis=-1).astype(np.float32)
+    res_x = dx - step_dx
+    res_y = dy - step_dy
+
+    win = window if window is not None else min(5, max(2, n // 3))
+    # Direction-safety constraint: per-frame warp delta (res / win) MUST NOT cancel or reverse step!
+    # Require dot(step + res / win, step) >= 0.40 * |step|^2 wherever |step| > 0.35 px.
+    step_mag2 = step_dx * step_dx + step_dy * step_dy
+    moving = step_mag2 > (0.35 * 0.35)
+    if np.any(moving):
+        proj = (res_x * step_dx + res_y * step_dy) / np.maximum(step_mag2, 1e-6)
+        min_allowed_proj = -0.55 * float(win)
+        excess_back = np.where(moving & (proj < min_allowed_proj), min_allowed_proj - proj, 0.0)
+        res_x = res_x + excess_back * step_dx
+        res_y = res_y + excess_back * step_dy
+
+    res_flow = np.stack([res_x, res_y], axis=-1).astype(np.float32)
     res_flow[..., 0] = cv2.GaussianBlur(res_flow[..., 0], (9, 9), 2.0)
     res_flow[..., 1] = cv2.GaussianBlur(res_flow[..., 1], (9, 9), 2.0)
     if prot is not None:
         res_flow[prot] = 0.0
 
-    win = window if window is not None else min(5, max(2, n // 3))
     out = harm.copy()
     for k in range(win):
         idx = n - win + k
         t = (k + 1) / float(win)
-        # Smooth cubic ease-in across the tail window
         weight = t * t * (3.0 - 2.0 * t)
         warped = warp_frame(harm[idx], res_flow * weight, border_mode=cv2.BORDER_REFLECT_101)
-        # Blend warped pixels only where gate is active; keep original elsewhere
         out[idx] = multiband_blend(warped, harm[idx], np.clip(gate * 1.4, 0.0, 1.0), levels=3)
         if prot is not None:
             out[idx][prot] = rgb[0][prot]
@@ -257,7 +284,6 @@ def stabilize_camera_sequence(frames: Sequence[np.ndarray] | np.ndarray) -> tupl
     if max_shift < 0.5:
         return rgb.copy(), {"applied": False, "maxShiftPx": round(max_shift, 3)}
 
-    # Stabilize towards reference frame 0 while keeping border fill clean (reflect + subtle zoom if small)
     out = np.empty_like(rgb)
     out[0] = rgb[0]
     cx, cy = w * 0.5, h * 0.5
@@ -265,7 +291,6 @@ def stabilize_camera_sequence(frames: Sequence[np.ndarray] | np.ndarray) -> tupl
         m = cv2.getRotationMatrix2D((cx, cy), -cum_rot[i], 1.0)
         m[0, 2] -= cum_tx[i]
         m[1, 2] -= cum_ty[i]
-        # BORDER_REFLECT_101 prevents any black empty borders
         out[i] = cv2.warpAffine(rgb[i], m, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
 
     return out, {
@@ -290,14 +315,11 @@ def remove_transient_region(
     if not m_bool.any():
         return rgb.copy()
 
-    # Temporal median across all frames cleanly recovers background wherever object was transient
     median_plate = np.median(rgb, axis=0).astype(np.uint8)
-    # Also compute an inpainted fallback for pixels where object lingered >50% of frames
     mask_u8 = (m_bool.astype(np.uint8) * 255)
     dilated = cv2.dilate(mask_u8, np.ones((5, 5), np.uint8), iterations=1)
     inpainted_plate = cv2.inpaint(median_plate, dilated, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
 
-    # Decide per-pixel whether median plate differs strongly from surrounding border (object lingered)
     border_ring = (dilated > 0) & (~m_bool)
     if border_ring.any():
         ring_med = median_plate[border_ring].astype(np.float32).mean(axis=0)
@@ -314,6 +336,51 @@ def remove_transient_region(
     return out
 
 
+def _bridge_pair_upstream(
+    outgoing: np.ndarray,
+    incoming: np.ndarray,
+    alpha_t: float,
+    *,
+    dom_vx: float,
+    dom_vy: float,
+    prot: np.ndarray | None,
+    ref_frame0: np.ndarray,
+) -> np.ndarray:
+    """Stitch `outgoing` -> `incoming` with a DP spatial seam sweeping strictly ALONG dominant motion.
+
+    When flow moves +x (left->right), `incoming` enters from x=0 and sweeps rightward (`blend_pos=alpha_t`)
+    so the transition rides WITH the current rather than against it! Same for -x, +y (waterfall), and -y (smoke).
+    """
+    vertical_seam = abs(dom_vx) >= abs(dom_vy)
+    positive_dir = (dom_vx >= 0.0) if vertical_seam else (dom_vy >= 0.0)
+
+    fr = compute_flow_capped(outgoing, incoming, max_width=384)
+    # Gate cross-warp strictly to small local correspondences that don't oppose dominant flow
+    max_local = max(4.0, min(outgoing.shape[:2]) * 0.045)
+    valid = (fr.confidence > 0.35) & (~fr.occluded)
+    mag = np.hypot(fr.fwd[..., 0], fr.fwd[..., 1])
+    valid = valid & (mag <= max_local * 2.5)
+    w_fwd = np.clip(fr.fwd * valid[..., None], -max_local, max_local)
+    w_bwd = np.clip(fr.bwd * valid[..., None], -max_local, max_local)
+
+    w_out = warp_frame(outgoing, w_fwd * (alpha_t * 0.55))
+    w_in = warp_frame(incoming, w_bwd * ((1.0 - alpha_t) * 0.55))
+
+    if positive_dir:
+        # Incoming piece occupies low side (x < seam_x or y < seam_y) and sweeps forward 0 -> 1
+        seam_incoming = _optimal_seam_mask(w_in, w_out, blend_pos=alpha_t, vertical=vertical_seam, a_on_low_side=True)
+    else:
+        # Flow moves negative: incoming piece enters from high side (right/bottom) and sweeps 1 -> 0
+        seam_incoming = _optimal_seam_mask(w_in, w_out, blend_pos=1.0 - alpha_t, vertical=vertical_seam, a_on_low_side=False)
+
+    # Outgoing weight mask = 1 - incoming weight (spatial seam dominates -> minimal double exposure!)
+    mask_out = np.clip(0.78 * (1.0 - seam_incoming) + 0.22 * (1.0 - alpha_t), 0.0, 1.0)
+    stitched = multiband_blend(w_out, w_in, mask_out, levels=4)
+    if prot is not None:
+        stitched[prot] = ref_frame0[prot]
+    return stitched
+
+
 def level4_content_bridge_reconstruct(
     frames: Sequence[np.ndarray] | np.ndarray,
     *,
@@ -322,14 +389,9 @@ def level4_content_bridge_reconstruct(
     protected_mask: np.ndarray | None = None,
     stabilize_camera: bool = False,
     transient_mask: np.ndarray | None = None,
+    prefer: str = "lead_in",
 ) -> tuple[np.ndarray, dict]:
-    """Reconstruct a seamless unidirectional loop using content-piece transition bridging + multiband/seam stitching.
-
-    When `lead_in` (frames immediately BEFORE frame 0) or `lead_out` (frames immediately AFTER frame N-1)
-    are available from the source recording, builds real key transition bridge pieces directly from the
-    source's own content, flow-warped along the forward direction and stitched via optimal DP seam +
-    Laplacian multiband blending (preventing crossfade ghosting and preserving one-way flow).
-    """
+    """Reconstruct a seamless unidirectional loop using upstream-aligned content-piece transition bridging."""
     work = np.asarray(frames, dtype=np.uint8).copy()
     if work.shape[-1] == 4:
         work = work[..., :3]
@@ -347,79 +409,50 @@ def level4_content_bridge_reconstruct(
     work = level2_photometric_harmonize(work, protected_mask=protected_mask)
     prot = None if protected_mask is None else _align_protected_dxt1(protected_mask)
 
-    # Determine content bridge source pieces:
-    # Ideal case: `lead_in` contains K real source frames immediately preceding work[0]
-    # (so lead_in[-1] naturally flows forward into work[0]!).
-    # Alternate case: `lead_out` contains K real source frames immediately following work[-1]
-    # (so work[-1] naturally flows forward into lead_out[0]!).
-    # Fallback when neither extra buffer is supplied: use the tail/head overlap inside `work` itself
-    # paired with forward flow-aligned warping.
     bridge_k = min(6, max(2, n // 3))
     out = work.copy()
 
-    if lead_in is not None and len(lead_in) >= 2:
-        li = np.asarray(lead_in, dtype=np.uint8)
-        if li.shape[-1] == 4:
-            li = li[..., :3]
-        k_use = min(bridge_k, len(li), n - 2)
-        li_tail = li[-k_use:]
-        # Estimate dominant horizontal vs vertical flow direction to orient the optimal spatial seam
-        fr_dom = compute_bidirectional_flow(work[0], work[1])
-        vertical_seam = abs(float(fr_dom.fwd[..., 0].mean())) >= abs(float(fr_dom.fwd[..., 1].mean()))
+    # Estimate dominant motion vector across head & tail to align seam sweep strictly WITH the motion!
+    fr_head = compute_flow_capped(work[0], work[1], max_width=240)
+    fr_tail = compute_flow_capped(work[-2], work[-1], max_width=240)
+    dom_vx = 0.5 * (float(fr_head.fwd[..., 0].mean()) + float(fr_tail.fwd[..., 0].mean()))
+    dom_vy = 0.5 * (float(fr_head.fwd[..., 1].mean()) + float(fr_tail.fwd[..., 1].mean()))
 
-        for j in range(k_use):
-            idx = n - k_use + j
-            alpha_t = (j + 1) / float(k_use + 1)  # strictly progressive 0 -> 1 toward head piece!
-            piece_tail = work[idx]
-            piece_head = li_tail[j]
-            # Bidirectional flow align piece_tail <-> piece_head to eliminate double-edge ghosting
-            fr = compute_bidirectional_flow(piece_tail, piece_head)
-            valid = (fr.confidence > 0.30) & (~fr.occluded)
-            w_tail = warp_frame(piece_tail, fr.fwd * (alpha_t * 0.75 * valid[..., None]))
-            w_head = warp_frame(piece_head, fr.bwd * ((1.0 - alpha_t) * 0.75 * valid[..., None]))
-            # Optimal DP spatial seam sweeping progressively across the frame + multiband pyramid stitch
-            seam_mask = _optimal_seam_mask(w_tail, w_head, blend_pos=1.0 - alpha_t, vertical=vertical_seam)
-            # Combine spatial seam with gentle global temporal weighting so transition is imperceptible
-            combined_mask = np.clip(0.65 * seam_mask + 0.35 * (1.0 - alpha_t), 0.0, 1.0)
-            stitched = multiband_blend(w_tail, w_head, combined_mask, levels=4)
-            if prot is not None:
-                stitched[prot] = work[0][prot]
-            out[idx] = stitched
-        meta["applied"] = True
-        meta["bridgeType"] = "lead_in_content_pieces"
-        meta["bridgeFrames"] = k_use
-        return out, meta
+    order = ("lead_in", "lead_out") if prefer != "lead_out" else ("lead_out", "lead_in")
+    for which in order:
+        if which == "lead_in" and lead_in is not None and len(lead_in) >= 2:
+            li = np.asarray(lead_in, dtype=np.uint8)
+            if li.shape[-1] == 4:
+                li = li[..., :3]
+            k_use = min(bridge_k, len(li), n - 2)
+            li_tail = li[-k_use:]
+            for j in range(k_use):
+                idx = n - k_use + j
+                alpha_t = (j + 1) / float(k_use + 1)
+                out[idx] = _bridge_pair_upstream(
+                    work[idx], li_tail[j], alpha_t, dom_vx=dom_vx, dom_vy=dom_vy, prot=prot, ref_frame0=work[0]
+                )
+            meta["applied"] = True
+            meta["bridgeType"] = "lead_in_content_pieces"
+            meta["bridgeFrames"] = k_use
+            return out, meta
 
-    if lead_out is not None and len(lead_out) >= 2:
-        lo = np.asarray(lead_out, dtype=np.uint8)
-        if lo.shape[-1] == 4:
-            lo = lo[..., :3]
-        k_use = min(bridge_k, len(lo), n - 2)
-        lo_head = lo[:k_use]
-        fr_dom = compute_bidirectional_flow(work[0], work[1])
-        vertical_seam = abs(float(fr_dom.fwd[..., 0].mean())) >= abs(float(fr_dom.fwd[..., 1].mean()))
+        if which == "lead_out" and lead_out is not None and len(lead_out) >= 2:
+            lo = np.asarray(lead_out, dtype=np.uint8)
+            if lo.shape[-1] == 4:
+                lo = lo[..., :3]
+            k_use = min(bridge_k, len(lo), n - 2)
+            lo_head = lo[:k_use]
+            for j in range(k_use):
+                alpha_t = (j + 1) / float(k_use + 1)
+                out[j] = _bridge_pair_upstream(
+                    lo_head[j], work[j], alpha_t, dom_vx=dom_vx, dom_vy=dom_vy, prot=prot, ref_frame0=work[0]
+                )
+            meta["applied"] = True
+            meta["bridgeType"] = "lead_out_content_pieces"
+            meta["bridgeFrames"] = k_use
+            return out, meta
 
-        for j in range(k_use):
-            # Blend outgoing continuation piece into the opening k_use frames so work[-1] -> out[0] is seamless!
-            alpha_t = (j + 1) / float(k_use + 1)  # 0 (mostly lo_head) -> 1 (mostly work[j])
-            piece_out = lo_head[j]
-            piece_in = work[j]
-            fr = compute_bidirectional_flow(piece_out, piece_in)
-            valid = (fr.confidence > 0.30) & (~fr.occluded)
-            w_out = warp_frame(piece_out, fr.fwd * (alpha_t * 0.75 * valid[..., None]))
-            w_in = warp_frame(piece_in, fr.bwd * ((1.0 - alpha_t) * 0.75 * valid[..., None]))
-            seam_mask = _optimal_seam_mask(w_out, w_in, blend_pos=1.0 - alpha_t, vertical=vertical_seam)
-            combined_mask = np.clip(0.65 * seam_mask + 0.35 * (1.0 - alpha_t), 0.0, 1.0)
-            stitched = multiband_blend(w_out, w_in, combined_mask, levels=4)
-            if prot is not None:
-                stitched[prot] = work[0][prot]
-            out[j] = stitched
-        meta["applied"] = True
-        meta["bridgeType"] = "lead_out_content_pieces"
-        meta["bridgeFrames"] = k_use
-        return out, meta
-
-    # Self-contained bridge when no extra lead_in/lead_out exists: flow-guided seam compensation + multiband
     comp, comp_meta = level3_motion_compensated_seam(work, protected_mask=protected_mask)
     meta.update(comp_meta)
     meta["bridgeType"] = "internal_flow_bridge"
@@ -445,13 +478,8 @@ def level6_multi_region_reconstruct(
 ) -> tuple[np.ndarray, dict]:
     """Compose independently reconstructed/synthesized regions into a single unified cyclic animation.
 
-    Each item in `region_specs` may specify:
-      - `id`: str
-      - `mask`: bool ndarray (H, W)
-      - `strategy`: "protect" | "animate" | "remove_transient" | "fix_seam" | "adjust_motion"
-      - `speedScale`: float (default 1.0)
-      - `directionXY`: optional [dx, dy] override
-      - `featherPx`: int (default 6)
+    Estimates normalized per-region optical flow strictly inside each animated region's mask so
+    adjacent layers with distinct speeds (e.g. slow clouds + fast river) never cross-contaminate!
     """
     rgb = np.asarray(frames, dtype=np.uint8)
     if rgb.shape[-1] == 4:
@@ -460,7 +488,6 @@ def level6_multi_region_reconstruct(
 
     specs = list(region_specs or [])
     if not specs and sentinela_report is not None:
-        # Auto-build regional plan from Sentinela Level B
         for reg in sentinela_report.get("levelB", {}).get("regions", []):
             beh = reg["behavior"]
             strat = {
@@ -483,7 +510,6 @@ def level6_multi_region_reconstruct(
     if not specs:
         return rgb.copy(), {"applied": False, "regionsProcessed": 0}
 
-    # Combine all protected regions into a master static protection mask (aligned to 4x4 DXT1 blocks!)
     protected_master = np.zeros((h, w), dtype=bool)
     for sp in specs:
         if sp.get("strategy") == "protect":
@@ -493,11 +519,10 @@ def level6_multi_region_reconstruct(
             protected_master |= m
     protected_aligned = _align_protected_dxt1(protected_master) if protected_master.any() else None
 
-    # Base canvas starts with photometrically harmonized frames (and clean protected frame 0)
     canvas = level2_photometric_harmonize(rgb, protected_mask=protected_aligned)
     base_plate = rgb[0].copy()
 
-    # Estimate global 2D flow field once if any region uses "animate" or "adjust_motion"
+    # Estimate raw flow once if needed, then re-normalize independently inside each animated region
     need_flow = any(sp.get("strategy") in {"animate", "adjust_motion"} for sp in specs)
     global_flow = None
     if need_flow:
@@ -517,7 +542,6 @@ def level6_multi_region_reconstruct(
         feather = int(sp.get("featherPx", 6))
 
         if strat == "protect":
-            # Applied strictly at the end so nothing can overwrite protected pixels
             processed.append({"id": sp.get("id", "protect"), "strategy": "protect", "area": round(float(m.mean()), 4)})
             continue
 
@@ -534,11 +558,14 @@ def level6_multi_region_reconstruct(
                 flow_reg = np.zeros((h, w, 2), dtype=np.float32)
                 flow_reg[..., 0] = float(dir_override[0])
                 flow_reg[..., 1] = float(dir_override[1])
-            elif global_flow is not None:
-                flow_reg = global_flow.copy()
             else:
-                continue
-            # Ensure motion stays strictly inside this region
+                try:
+                    flow_reg, _ = estimate_2d_flow_field(rgb, mask=m, protected_mask=protected_aligned)
+                except SynthesisRejected:
+                    if global_flow is None:
+                        continue
+                    flow_reg = global_flow.copy()
+
             synth_reg = synthesize_periodic_2d(
                 base_plate,
                 flow_reg,
@@ -574,7 +601,6 @@ def level6_multi_region_reconstruct(
                 canvas[i] = multiband_blend(repaired[i], canvas[i], soft, levels=3)
             processed.append({"id": sp.get("id", "seam"), "strategy": "fix_seam", "area": round(float(m.mean()), 4)})
 
-    # Final hard lock of protected static regions
     if protected_aligned is not None:
         for i in range(n):
             canvas[i][protected_aligned] = base_plate[protected_aligned]
@@ -633,30 +659,45 @@ def reconstruct_best(
     l2 = level2_photometric_harmonize(src, protected_mask=protected_mask)
     candidates.append(("level2_photometric_harmonize", l2, {}))
 
-    # Level 3: Bidirectional optical flow seam compensation
+    # Level 3: Direction-safe bidirectional optical flow seam compensation
     l3, l3_meta = level3_motion_compensated_seam(src, protected_mask=protected_mask)
     if l3_meta.get("applied"):
         candidates.append(("level3_motion_compensated_seam", l3, l3_meta))
 
-    # Level 4: Content-piece transition bridge / camera stab / transient removal
-    if lead_in is not None or lead_out is not None or stabilize_camera or transient_mask is not None:
-        l4, l4_meta = level4_content_bridge_reconstruct(
+    # Level 4: Upstream-aligned content-piece transition bridge (evaluate BOTH lead_in and lead_out when present!)
+    if lead_in is not None or stabilize_camera or transient_mask is not None:
+        l4_in, l4_in_meta = level4_content_bridge_reconstruct(
             src,
             lead_in=lead_in,
+            lead_out=lead_out if lead_in is None else None,
+            protected_mask=protected_mask,
+            stabilize_camera=stabilize_camera,
+            transient_mask=transient_mask,
+            prefer="lead_in",
+        )
+        if l4_in_meta.get("applied") or l4_in_meta.get("stabilized") or l4_in_meta.get("transientRemoved"):
+            candidates.append(("level4_content_bridge", l4_in, l4_in_meta))
+
+    if lead_out is not None and lead_in is not None:
+        l4_out, l4_out_meta = level4_content_bridge_reconstruct(
+            src,
+            lead_in=None,
             lead_out=lead_out,
             protected_mask=protected_mask,
             stabilize_camera=stabilize_camera,
             transient_mask=transient_mask,
+            prefer="lead_out",
         )
-        if l4_meta.get("applied") or l4_meta.get("stabilized") or l4_meta.get("transientRemoved"):
-            candidates.append(("level4_content_bridge", l4, l4_meta))
+        if l4_out_meta.get("applied"):
+            candidates.append(("level4_content_bridge_lead_out", l4_out, l4_out_meta))
 
-    # Level 5: Dynamic texture synthesis (dual-phase Eulerian advection)
+    # Level 5: Anti-ghosting dynamic texture synthesis (dual-phase Eulerian advection at true 1.0x velocity)
     try:
         flow_f, f_stats = estimate_2d_flow_field(src, protected_mask=protected_mask)
         if f_stats["p90SpeedPx"] >= 0.30 and f_stats["temporalCoherence"] >= 0.45:
-            mean_sp = max(f_stats["meanSpeedPx"], 0.35)
-            cyc = float(np.clip((max(1.0, min(mean_sp * 1.15, 6.0)) * n * 0.55) / mean_sp, 3.0, 14.0))
+            h_s, w_s = src.shape[1:3]
+            max_safe_span = (0.44 * min(h_s, w_s)) / max(float(f_stats["p90SpeedPx"]), 1.0)
+            cyc = float(np.clip(float(n), 4.0, min(28.0, max(4.0, max_safe_span))))
             l5 = synthesize_periodic_2d(
                 src[0], flow_f, n, base_frame_b=src[n // 2] if n >= 3 else None, protected_mask=protected_mask, cycle_steps=cyc, align_dxt1_blocks=True
             )

@@ -145,7 +145,10 @@ def compute_multicriteria_cost(
         + 1.50 * artifact
     )
 
-    # Classification for this specific take
+    # Classification for this specific take (strict directional gate prevents opposite-flow takes from CLASS_NATURAL!)
+    dir_ok_natural = (not fc["directionMeasured"]) or (
+        fc["seamDirectionCosine"] >= 0.45 and fc["seamOppositeFraction"] <= 0.25
+    )
     has_hard_defect = bool(
         is_static
         or rv["detected"]
@@ -157,6 +160,7 @@ def compute_multicriteria_cost(
         take_class = CLASS_UNSUITABLE
     elif (
         not has_hard_defect
+        and dir_ok_natural
         and appearance < 0.55
         and motion < 0.65
         and structural < 0.65
@@ -172,6 +176,9 @@ def compute_multicriteria_cost(
     else:
         take_class = CLASS_UNSUITABLE
 
+    # Perceptible repetition risk for short loops (< 1.2s repeats > 50 times/minute on PS4 home screen)
+    repetition_risk = "alta" if duration_sec < 0.9 else ("moderada" if duration_sec < 1.6 else "baixa")
+
     return {
         "appearanceError": round(appearance, 4),
         "motionError": round(motion, 4),
@@ -184,6 +191,7 @@ def compute_multicriteria_cost(
         "artifactPenalty": round(artifact, 4),
         "totalCost": round(total, 4),
         "classification": take_class,
+        "repetitionRisk": repetition_risk,
         "isStatic": is_static,
     }
 
@@ -196,13 +204,21 @@ def _generate_seeds(
     source_fps: float,
     source_duration: float,
 ) -> list[tuple[float, float, float, int, float]]:
-    """Generate diverse candidate (rough_score, start, end, frame_count, wait) tuples across full span."""
+    """Generate diverse candidate (rough_score, start, end, frame_count, wait) tuples across full span.
+
+    Uses Schödl et al. (2000) Video Textures multi-frame temporal neighborhood filtering combined
+    with signed temporal-derivative (motion-phase) matching so opposite-phase seams (e.g. swaying
+    foliage moving left at start and right at end) are rejected before shortlisting.
+    """
     cap = max_frames_for(size)
     # 40x22 descriptor for fast vectorized lag bank
     desc = frames[:, ::4, ::4].astype(np.float32)
     n_desc = len(desc)
     if n_desc < 4:
         return []
+
+    # Signed temporal derivative (motion phase descriptor): captures direction of motion at every instant!
+    vel = np.diff(desc, axis=0)  # (n_desc - 1, h', w', 3)
 
     # Build cadence candidates from canonical waits + source-native wait
     waits = sorted(
@@ -224,20 +240,44 @@ def _generate_seeds(
                 lags_to_check.setdefault(lag, []).append((cnt, w))
 
     # Cumulative motion activity to reject dead static windows
-    step_act = np.abs(np.diff(desc, axis=0)).mean(axis=(1, 2, 3))
+    step_act = np.abs(vel).mean(axis=(1, 2, 3))
     cum_act = np.r_[0.0, np.cumsum(step_act)]
+
+    # 4-tap Video Textures binomial temporal kernel [0.15, 0.35, 0.35, 0.15]
+    vt_kernel = np.array([0.15, 0.35, 0.35, 0.15], dtype=np.float32)
 
     options: list[tuple[float, float, float, int, float]] = []
     for lag, configs in sorted(lags_to_check.items()):
         dist = np.abs(desc[:-lag] - desc[lag:]).mean(axis=(1, 2, 3))
         if len(dist) == 0:
             continue
-        # Compare both endpoint pair and forward neighborhood (Video Textures criterion)
-        if len(dist) >= 2:
+        # Multi-frame temporal neighborhood filter (Schödl et al. Video Textures criterion)
+        if len(dist) >= 4:
+            padded = np.pad(dist, (1, 2), mode="edge")
+            app_cost = np.convolve(padded, vt_kernel, mode="valid")[: len(dist)]
+        elif len(dist) >= 2:
             nbr = 0.5 * (dist[:-1] + dist[1:])
-            seam_cost = np.r_[nbr, dist[-1]]
+            app_cost = np.r_[nbr, dist[-1]]
         else:
-            seam_cost = dist
+            app_cost = dist
+
+        # Signed temporal-derivative (motion phase) cost: penalizes opposite direction at start vs end!
+        if lag < len(vel):
+            vel_dist = np.abs(vel[:-lag] - vel[lag:]).mean(axis=(1, 2, 3))
+            if len(vel_dist) >= 2:
+                vel_smooth = 0.5 * (vel_dist[:-1] + vel_dist[1:])
+                vel_cost = np.r_[vel_smooth, vel_dist[-1]]
+            else:
+                vel_cost = vel_dist
+            # Pad to match len(dist) (vel has length n_desc - 1 -> len(dist) - 1)
+            if len(vel_cost) < len(app_cost):
+                vel_cost = np.pad(vel_cost, (0, len(app_cost) - len(vel_cost)), mode="edge")
+            else:
+                vel_cost = vel_cost[: len(app_cost)]
+            seam_cost = 0.62 * app_cost + 0.55 * vel_cost
+        else:
+            seam_cost = app_cost
+
         act = (cum_act[lag : lag + len(seam_cost)] - cum_act[: len(seam_cost)]) / max(lag, 1)
         # Penalize static windows heavily
         adj_cost = seam_cost + np.where(act < 0.35, 90.0, 0.0)

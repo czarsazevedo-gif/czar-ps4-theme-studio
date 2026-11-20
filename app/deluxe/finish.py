@@ -149,6 +149,7 @@ def apply_deluxe_finish(
     enable_flicker_fix: bool = True,
     enable_photometric_fix: bool = True,
     enable_sharpness_guard: bool = True,
+    precomputed_baseline: dict | None = None,
 ) -> dict:
     """Execute the full Ouroboros Deluxe Finish pipeline with mandatory post-DDS validation & regression rejection.
 
@@ -167,8 +168,12 @@ def apply_deluxe_finish(
     prot_eval = _align_protected_dxt1(protected_mask) if protected_mask is not None else None
     ref = np.asarray(reference_frames, dtype=np.uint8)[..., :3] if reference_frames is not None else src
 
-    # 1. Mandatory baseline post-DDS measurement on the actual sequence
-    base_res = evaluate_post_dds(src, wait, protected_mask=prot_eval, reference_frames=ref, backend=backend, return_blobs=True)
+    # 1. Mandatory baseline post-DDS measurement on the actual sequence (reuse if identical sequence already measured)
+    base_res = (
+        precomputed_baseline
+        if precomputed_baseline is not None
+        else evaluate_post_dds(src, wait, protected_mask=prot_eval, reference_frames=ref, backend=backend, return_blobs=True)
+    )
     base_eval = base_res["report"]
     best_frames = src
     best_eval = base_eval

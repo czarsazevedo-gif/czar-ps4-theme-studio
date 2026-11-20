@@ -88,16 +88,19 @@ def estimate_2d_flow_field(
         v_up = cv2.resize(steady[..., 1], (w, h), interpolation=cv2.INTER_LINEAR)
         steady = np.stack([u_up, v_up], axis=-1)
 
-    # Smooth spatial flow field for coherent Eulerian advection
-    ksize = max(5, (min(h, w) // 16) | 1)
-    steady[..., 0] = cv2.GaussianBlur(steady[..., 0], (ksize, ksize), 0)
-    steady[..., 1] = cv2.GaussianBlur(steady[..., 1], (ksize, ksize), 0)
-
-    # Apply mask & smoothly taper near protected boundaries so static elements never tear
+    # Normalized-convolution spatial flow smoothing inside active mask so static borders
+    # (e.g. cliff beside waterfall) never bleed zero velocity into moving water or leak motion out!
     active_mask = np.ones((h, w), dtype=np.float32) if mask is None else mask.astype(np.float32)
     if protected_mask is not None:
         active_mask = np.where(protected_mask.astype(bool), 0.0, active_mask)
-    soft_taper = cv2.GaussianBlur(active_mask, (9, 9), 2.5)
+    ksize = max(5, (min(h, w) // 16) | 1)
+    mask_blur = cv2.GaussianBlur(active_mask, (ksize, ksize), 0)
+    denom = np.maximum(mask_blur, 1e-4)
+    steady[..., 0] = cv2.GaussianBlur(steady[..., 0] * active_mask, (ksize, ksize), 0) / denom
+    steady[..., 1] = cv2.GaussianBlur(steady[..., 1] * active_mask, (ksize, ksize), 0) / denom
+
+    # Smoothly taper only in the narrow feather ring next to protected boundaries so static elements never tear
+    soft_taper = cv2.GaussianBlur(active_mask, (7, 7), 1.8)
     if protected_mask is not None:
         soft_taper = np.where(protected_mask.astype(bool), 0.0, soft_taper)
     steady *= soft_taper[..., None]
@@ -179,19 +182,46 @@ def _semi_lagrangian_advect(
     return cv2.remap(image, px, py, interpolation=cv2.INTER_CUBIC, borderMode=border)
 
 
-def _contrast_preserving_dual_blend(img_a: np.ndarray, img_b: np.ndarray, w_a: float) -> np.ndarray:
-    """Blend two advected texture layers without mid-transition contrast washout (anti-ghosting).
+def _match_lab_tone(src: np.ndarray, ref: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    """Align Lab mean/std of `src` to `ref` so dual-phase synthesis never pulses in brightness/color."""
+    s_lab = cv2.cvtColor(src, cv2.COLOR_RGB2LAB).astype(np.float32)
+    r_lab = cv2.cvtColor(ref, cv2.COLOR_RGB2LAB).astype(np.float32)
+    if mask is not None and np.any(mask):
+        m = mask.astype(bool)
+        s_m = s_lab[m].mean(axis=0)
+        r_m = r_lab[m].mean(axis=0)
+        s_s = np.maximum(s_lab[m].std(axis=0), 2.0)
+        r_s = np.maximum(r_lab[m].std(axis=0), 2.0)
+    else:
+        s_m = s_lab.mean(axis=(0, 1))
+        r_m = r_lab.mean(axis=(0, 1))
+        s_s = np.maximum(s_lab.std(axis=(0, 1)), 2.0)
+        r_s = np.maximum(r_lab.std(axis=(0, 1)), 2.0)
+    ratio = np.clip(r_s / s_s, 0.85, 1.18)
+    aligned = (s_lab - s_m[None, None, :]) * ratio[None, None, :] + r_m[None, None, :]
+    return cv2.cvtColor(np.clip(aligned, 0.0, 255.0).astype(np.uint8), cv2.COLOR_LAB2RGB)
 
-    Uses a 2-band decomposition:
-    - Low-frequency color/lighting blends linearly via (w_a, w_b).
-    - High-frequency detail is variance-normalized by 1/sqrt(w_a^2 + w_b^2) clamped gently
-      to preserve crisp ripples/clouds without amplifying noise!
+
+def _contrast_preserving_dual_blend(
+    img_a: np.ndarray,
+    img_b: np.ndarray,
+    w_a: float | np.ndarray,
+    *,
+    spatial_phase: np.ndarray | None = None,
+    phi_a: float | None = None,
+) -> np.ndarray:
+    """Blend two advected texture layers without mid-transition ghosting or sharpness washout.
+
+    - Low-frequency tone/structure blends smoothly via scalar `w_a` (zero brightness flicker).
+    - High-frequency crisp texture (droplets, ripples, clouds) transitions through a spatially
+      staggered S-curve mask along streamlines + variance-preserving gain so at every instant
+      most pixels carry crisp single-layer detail instead of a uniform 50/50 double exposure!
     """
-    w_b = 1.0 - w_a
-    if w_a <= 1e-4:
-        return img_b.copy()
-    if w_b <= 1e-4:
-        return img_a.copy()
+    if isinstance(w_a, (int, float)):
+        if w_a <= 1e-4:
+            return img_b.copy()
+        if w_a >= 1.0 - 1e-4:
+            return img_a.copy()
 
     fa = img_a.astype(np.float32)
     fb = img_b.astype(np.float32)
@@ -200,10 +230,25 @@ def _contrast_preserving_dual_blend(img_a: np.ndarray, img_b: np.ndarray, w_a: f
     high_a = fa - low_a
     high_b = fb - low_b
 
-    low_blend = w_a * low_a + w_b * low_b
-    # Variance-preserving detail gain (capped at 1.32 to avoid overshoot/ringing before DXT1a)
-    norm_gain = min(1.32, 1.0 / math.sqrt(w_a * w_a + w_b * w_b))
-    high_blend = (w_a * high_a + w_b * high_b) * norm_gain
+    w_low = np.asarray(w_a, dtype=np.float32)
+    if w_low.ndim == 2:
+        w_low = w_low[..., None]
+    low_blend = w_low * low_a + (1.0 - w_low) * low_b
+
+    if spatial_phase is not None and phi_a is not None:
+        # Staggered cyclic phase per spatial band prevents all pixels from hitting 50/50 simultaneously!
+        phi_loc = (float(phi_a) + spatial_phase) % 1.0
+        raw_w = 0.5 * (1.0 - np.cos(2.0 * math.pi * phi_loc)).astype(np.float32)
+        # Sharpened smoothstep S-curve narrows the overlap ribbon while staying C1-continuous
+        u = np.clip((raw_w - 0.22) / 0.56, 0.0, 1.0)
+        w_hi = (u * u * (3.0 - 2.0 * u))[..., None]
+    else:
+        u = np.clip((w_low - 0.18) / 0.64, 0.0, 1.0)
+        w_hi = u * u * (3.0 - 2.0 * u)
+
+    w_hi_b = 1.0 - w_hi
+    norm_gain = np.minimum(1.38, 1.0 / np.sqrt(np.maximum(w_hi * w_hi + w_hi_b * w_hi_b, 1e-4)))
+    high_blend = (w_hi * high_a + w_hi_b * high_b) * norm_gain
     return np.clip(np.rint(low_blend + high_blend), 0, 255).astype(np.uint8)
 
 
@@ -249,8 +294,9 @@ def synthesize_periodic_2d(
 ) -> np.ndarray:
     """Synthesize an N-frame strictly unidirectional infinite loop using dual-phase Eulerian advection.
 
-    Uses two distinct phase textures (`base_frame` and `base_frame_b`) so the full N-frame cycle
-    produces N distinct DDS frames (never collapsing to an N/2 half-cycle duplicate!).
+    Uses two photometrically matched phase textures (`base_frame` and `base_frame_b`) with
+    spatially staggered high-frequency phase transitions so the full N-frame cycle produces
+    N distinct, crisp, ghost-free DDS frames advancing strictly along +flow_field.
     """
     base = np.asarray(base_frame, dtype=np.uint8)
     if base.shape[-1] == 4:
@@ -271,15 +317,22 @@ def synthesize_periodic_2d(
     alpha = _feather_mask(active, feather_px=feather_px, protected_mask=prot)
     alpha_3 = alpha[..., None]
 
-    # Cycle advection span: scales naturally with N and speed_scale, bounded to avoid excessive stretch
-    span = float(cycle_steps) if cycle_steps is not None else max(4.0, min(float(n_frames) * 0.65, 16.0)) * float(speed_scale)
+    # Cycle advection span: span = n_frames preserves exact 1.0x measured physical velocity per frame!
+    # Cap only so extreme half-cycle travel stays safely within frame geometry.
+    if cycle_steps is not None:
+        span = float(cycle_steps)
+    else:
+        max_sp = float(np.percentile(np.hypot(flow_field[..., 0][active], flow_field[..., 1][active]), 90)) if active.any() else 1.0
+        max_safe_span = (0.44 * min(h, w)) / max(max_sp * float(speed_scale), 1.0)
+        span = float(np.clip(float(n_frames), 4.0, min(28.0, max(4.0, max_safe_span)))) * float(speed_scale)
     scaled_flow = flow_field.astype(np.float32) * float(speed_scale)
 
-    # Second phase reference texture: use real distinct source frame if provided, else forward-advected offset
+    # Second phase reference texture: photometrically matched to `base` to prevent tone pulsation
     if base_frame_b is not None:
         base_b = np.asarray(base_frame_b, dtype=np.uint8)
         if base_b.shape[-1] == 4:
             base_b = base_b[..., :3]
+        base_b = _match_lab_tone(base_b, base, active)
     else:
         base_b = _semi_lagrangian_advect(base, scaled_flow, 0.37 * span, wrap=False)
 
@@ -303,8 +356,17 @@ def synthesize_periodic_2d(
             k_cycles = max(1, int(round(nat_travel / py)))
             wrap_step = (v_sign * k_cycles * py) / float(n_frames)
 
-    out_frames = []
+    # Smooth spatial phase offset perpendicular to dominant flow so detail transitions stagger organically
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    u_m = float(scaled_flow[..., 0][active].mean()) if active.any() else 1.0
+    v_m = float(scaled_flow[..., 1][active].mean()) if active.any() else 0.0
+    norm_uv = max(math.hypot(u_m, v_m), 1e-5)
+    # Cross-stream coordinate (perpendicular to flow) + mild stream coordinate for organic stagger
+    perp = (-v_m / norm_uv) * (xx / max(w, 1)) + (u_m / norm_uv) * (yy / max(h, 1))
+    along = (u_m / norm_uv) * (xx / max(w, 1)) + (v_m / norm_uv) * (yy / max(h, 1))
+    spatial_phase = (0.14 * np.sin(2.0 * math.pi * (perp * 1.5 + along * 0.5))).astype(np.float32)
+
+    out_frames = []
     for i in range(n_frames):
         if use_exact_wrap:
             if period_xy[0] > 0:
@@ -315,8 +377,8 @@ def synthesize_periodic_2d(
                 my = np.mod(yy - i * wrap_step, h).astype(np.float32)
             dyn = cv2.remap(base, mx, my, interpolation=cv2.INTER_CUBIC, borderMode=cv2.BORDER_WRAP)
         else:
-            # Dual-phase Eulerian advection with two distinct source layers (base_a, base_b):
-            # Both advance STRICTLY FORWARD along +flow_field and produce N distinct frames!
+            # Dual-phase Eulerian advection with two photometrically-matched source layers:
+            # Both advance STRICTLY FORWARD along +flow_field and produce N distinct crisp frames!
             phi_a = i / float(n_frames)
             phi_b = (phi_a + 0.5) % 1.0
             t_a = (phi_a - 0.5) * span
@@ -324,7 +386,7 @@ def synthesize_periodic_2d(
             w_a = 0.5 * (1.0 - math.cos(2.0 * math.pi * phi_a))
             adv_a = _semi_lagrangian_advect(base, scaled_flow, t_a, wrap=False)
             adv_b = _semi_lagrangian_advect(base_b, scaled_flow, t_b, wrap=False)
-            dyn = _contrast_preserving_dual_blend(adv_a, adv_b, w_a)
+            dyn = _contrast_preserving_dual_blend(adv_a, adv_b, w_a, spatial_phase=spatial_phase, phi_a=phi_a)
 
         comp = np.clip(np.rint(dyn.astype(np.float32) * alpha_3 + base.astype(np.float32) * (1.0 - alpha_3)), 0, 255).astype(np.uint8)
         if prot is not None:
@@ -380,10 +442,10 @@ def synthesize_genesis_supreme(
         if flow_stats["temporalCoherence"] < 0.35:
             raise SynthesisRejected("A fonte apresenta reversão ou movimento incoerente para síntese unidirecional.")
 
-    # Pick a clean cycle_steps that produces smooth, non-duplicate steps without excessive warping
-    mean_sp = max(flow_stats["meanSpeedPx"], 0.35)
-    target_step_px = max(1.0, min(mean_sp * 1.15, 6.0))
-    cycle_steps = float(np.clip((target_step_px * n_frames * 0.55) / max(mean_sp, 0.25), 3.0, 14.0))
+    # Preserve 1.0x measured physical velocity per frame while bounding half-cycle travel to frame geometry
+    h_s, w_s = base.shape[:2]
+    max_safe_span = (0.44 * min(h_s, w_s)) / max(float(flow_stats["p90SpeedPx"]) * float(speed_scale), 1.0)
+    cycle_steps = float(np.clip(float(n_frames), 4.0, min(28.0, max(4.0, max_safe_span)))) * float(speed_scale)
 
     synthesized = synthesize_periodic_2d(
         base,
