@@ -807,11 +807,13 @@ class AuditRemediationTest(unittest.TestCase):
     # honest post-DDS finish message verified in live headless Chromium!
     # =========================================================================
     def test_aud_014_015_016_ui_readiness_touch_targets_and_honest_finish_wording(self):
-        # Verify ouroboros.js never prints misleading 'nenhum ajuste extra necessário'
-        ouro_js = (REPO / "app" / "static" / "ouroboros.js").read_text(encoding="utf-8")
-        self.assertNotIn("nenhum ajuste extra necessário", ouro_js)
-        self.assertIn("REPROVADO/CONDICIONAL pós-DDS", ouro_js)
-        self.assertIn("Esta configuração exige novo render antes de aplicar", ouro_js)
+        # Verify removed duplicate lab ouroboros.js is gone and unified app.js never prints misleading finish wording
+        self.assertFalse((REPO / "app" / "static" / "ouroboros.js").exists())
+        app_js = (REPO / "app" / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn("nenhum ajuste extra necessário", app_js)
+        self.assertIn("expectedRenderKey", app_js)
+        self.assertIn("verdict-reprovado", app_js)
+        self.assertIn("APLICAR ESTE LOOP AO MEU TEMA", app_js)
 
         # Verify style.css enforces 44px touch minimums on frequent controls
         css = (REPO / "app" / "static" / "style.css").read_text(encoding="utf-8")

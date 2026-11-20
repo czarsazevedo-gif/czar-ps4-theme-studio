@@ -82,4 +82,44 @@ Auditoria profunda por subsistema com reprodução de falhas, correção na caus
 - Os ensaios físicos abaixo permanecem explicitamente **`PENDENTES`**:
   1. **Galaxy Tab S10 Ultra (Chrome Android real + dedo + S Pen)** — roteiro detalhado em [`docs/acceptance-ps4.md`](acceptance-ps4.md).
   2. **PS4 Slim (Firmware 12.52)** — instalação via USB, aparição exclusiva em *Configurações → Temas*, reprodução prolongada de animação RAF e música ATRAC9, efeitos VAG e reinício do console (roteiro em [`docs/acceptance-ps4.md`](acceptance-ps4.md)).
-  3. **Vídeos privados do proprietário** — o gancho `CZAR_ACCEPTANCE_VIDEO` em `tests/test_ouroboros_perceptual_v2.py` permanece disponível para validação local reproduzível pelo proprietário.
+  3. **Vídeos privados do proprietário** — o gancho `CZAR_ACCEPTANCE_VIDEO` em `tests/test_ouroboros_perceptual_v2.py` e `tests/test_ouroboros_finishing_c4.py` permanece disponível para validação local reproduzível pelo proprietário.
+
+---
+
+## 5. Consolidação Final — MISSÃO CZAR — OUROBOROS ABSOLUTE (Checkpoints 0–8)
+
+- **Branch única de entrega**: `feature/czar-studio-gold-master-v1` (nenhuma branch nova criada, nenhum merge, branches anteriores `4ea9c75`, `315f0cb`, `02ef155` intactas).
+- **Tag de segurança / rollback**: `backup/pre-ouroboros-absolute-20261120` → `2710937615a0cedd998869b4b8ba0a750a3eea6b`.
+- **Integridade canônica verificada**: `git diff 02ef1552b44074678f8874304c5df9ee077a2162 -- app/dxt1.py app/dds.py app/mdx.py app/raf.py` = **0 linhas** + `tests/test_ouroboros_compat.py` **APROVADO** (6 variações / 30 entradas byte a byte).
+- **Diagnóstico da Toolchain (`./scripts/doctor_czar_full.sh --json`)**: **21/21 obrigatórios PRONTOS** + opcionais `ImageMagick` e `Tabler Icons` PRONTOS (`libvmaf` opcional ausente no FFmpeg padrão Debian 12, coberto por SSIM/MS-SSIM/fluxo).
+
+### Legado Removido (Checkpoint 6)
+- Motores concorrentes removidos: `app/sentinela.py`, `app/circulo.py`, `app/genesis.py`, `app/ouroboros_media.py`, `app/deluxe/` (13 módulos).
+- Laboratório duplicado removido: `app/static/ouroboros.html`, `app/static/ouroboros.js`, `app/static/ouroboros.css` e link `#ouroboros-link`.
+- Suítes puramente legadas v1 removidas após migração para o motor único `app/ouroboros_engine/`: `tests/bench_deluxe.py`, `tests/test_sentinela.py`, `tests/test_circulo.py`, `tests/test_genesis.py`, `tests/test_genesis_browser.py`, `tests/test_ouroboros_api.py`, `tests/test_ouroboros_browser.py`, `tests/test_deluxe_browser.py`, `tests/test_deluxe_checkpoint1..5.py`.
+
+### Defeitos Históricos Removidos na Causa Raiz (Checkpoint 7)
+1. **Áudio ATRAC9 loop interno (`app/forge/audio_loop.py` + `app/forge/audio_validation.py`)**: `evaluate_post_at9_loop()` agora usa `vgmstream-cli` (`tools/bin/vgmstream-cli`, decodificação exata compensada por `encoder_delay`, erro de 0 amostras) para avaliar o intervalo realmente repetido `[loop_start, loop_end]` (e não as pontas `[0..N]` do arquivo), validando também 3 repetições contínuas (`-l 3 -f 0`). Comprovado em ambas as direções em `tests/test_audio_sfo_icons_bench_c7.py`.
+2. **Validação estrita de `Sc0/param.sfo` (`app/forge/pkg_inspector.py`)**: `compare_param_sfo_fields()` agora compara todas as chaves do `param.sfo` e subchaves de `PUBTOOLINFO` contra `expected_content_dir/sce_sys/param.sfo`, permitindo apenas transformações documentadas do empacotador (`PUBTOOLVER`, `PUBTOOLMINVER`, `c_date`, `img0_l0_size`, `img0_l1_size`, `img0_sc_ksize`, `img0_pc_ksize`, `img0_stat_size`, `pkg_ver`, `sdk_ver`, `st_type`). Qualquer divergência em `TITLE`, `CONTENT_ID`, `IRO_TAG`, `CATEGORY`, `bgmhome_loud` ou chave extra rejeita `full_bundle_verified`.
+3. **Benchmark com 0 vídeos (`scripts/benchmark_ouroboros_corpus.py`)**: agora retorna código de saída não-zero (`2` quando 0 vídeos encontrados, `1` quando 0 vídeos concluem com sucesso).
+4. **Ícones vetoriais SVG sem halo (`app/config.py`, `app/media.py`, `app/library.py`, `app/compositor.py`)**: suporte seguro a `.svg` (Tabler Icons) com guarda anti-XXE/XSS e rasterização transparente sem halo escuro (`min RGB >= 250` sobre branco em `128×128`, `152×152` e `512×512`).
+
+### Benchmarks Reais Medidos com Hyperfine 2.0.0 (`./scripts/benchmark_hyperfine.sh`)
+
+Ambiente: Linux Debian 12 x86_64 · 2 vCPU · 7947 MiB RAM · Python 3.11.2.
+
+| Etapa | Tempo Wall Médio (s) | Tempo CPU Médio (s) | Pico RSS (MiB) | Observação |
+|---|---:|---:|---:|---|
+| `01_startup` (`app.main` + `/healthz`) | **1.127 s** | 1.327 s | 109.0 MiB | Arranque frio + resposta HTTP 200 |
+| `02_media_probe` (PyAV PTS + FFprobe) | **1.243 s** | 1.509 s | 125.0 MiB | Sondagem exata de timestamps |
+| `03_dds_raf` (12× 960×540 DXT1a + RAF ZIP) | **2.763 s** | 3.012 s | 167.7 MiB | Gerador canônico intacto |
+| `04_atrac9_vgmstream` (144 kbps + 3 ciclos) | **0.814 s** | 0.986 s | 52.0 MiB | `psgfx-at9` + `vgmstream-cli` + loop interno |
+| `05_pkg_build_verify` (`LibOrbisPkg` + SFO estrito) | **1.254 s** | 1.251 s | 46.7 MiB | Build + extração `Image0`/`Sc0` + hashes + SFO |
+| `06_ouroboros_3proposals` (antes da otimização) | 183.152 s | 209.547 s | 881.3 MiB | Baseline antes do merge de máscaras auto-regionais |
+| `06_ouroboros_3proposals` (pós-otimização) | **111.108 s** | **129.240 s** | **855.7 MiB** | **−39,3% wall / −38,3% CPU** ao coalescer regiões auto-detectadas por estratégia em `level6_multi_region_reconstruct()` |
+
+### Suíte Final Consolidada (Checkpoints 0–8)
+- **25 módulos pytest executados**: **91 passed**, **9 subtests passed**, **0 failed**, **3 skipped** (somente ganchos opcionais de corpus externo `/tmp` e vídeo privado `CZAR_ACCEPTANCE_VIDEO`).
+- **Playwright Chromium Touch E2E (`tests/test_ouroboros_proposals_c5.py`)**: **APROVADO** em `1480×924` e `924×1480` (upload real → 3 propostas automáticas → 10 Ciclos, Inspecionar junção, Tela cheia → `APLICAR ESTE LOOP AO MEU TEMA` → persistência pós-reload → `0` overflow, `0` alvos `< 44 px`, `0` erros JS).
+- **E2E Real de 20 Etapas com 2 Reinícios de Uvicorn (`tests/test_gold_master_e2e_20steps.py`)**: **APROVADO** (motor unificado Ouroboros → vínculo criptográfico 409/200 → ícones sem halo → Compositor animado → ATRAC9 + `vgmstream-cli` + VAG → reinício #1 → RAF composto → bundle → PKG nativo `LibOrbisPkg` → extração `Image0`/`Sc0` + SFO estrito + SHA-256 → reinício #2 → integridade pós-reinício).
+

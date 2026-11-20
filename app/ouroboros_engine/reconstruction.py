@@ -488,6 +488,7 @@ def level6_multi_region_reconstruct(
 
     specs = list(region_specs or [])
     if not specs and sentinela_report is not None:
+        merged_masks: dict[str, np.ndarray] = {}
         for reg in sentinela_report.get("levelB", {}).get("regions", []):
             beh = reg["behavior"]
             strat = {
@@ -497,15 +498,23 @@ def level6_multi_region_reconstruct(
                 "oscillatory": "fix_seam",
                 "photometric": "fix_seam",
             }.get(beh, "fix_seam")
-            specs.append(
-                {
-                    "id": reg["id"],
-                    "mask": _region_mask_from_sentinela(sentinela_report, reg, (h, w)),
-                    "strategy": strat,
-                    "speedScale": 1.0,
-                    "featherPx": 6,
-                }
-            )
+            rmask = _region_mask_from_sentinela(sentinela_report, reg, (h, w))
+            if strat not in merged_masks:
+                merged_masks[strat] = rmask.copy()
+            else:
+                merged_masks[strat] |= rmask
+        # Process in deterministic order: protect -> remove_transient -> animate -> fix_seam
+        for strat in ("protect", "remove_transient", "animate", "fix_seam"):
+            if strat in merged_masks and merged_masks[strat].any():
+                specs.append(
+                    {
+                        "id": f"auto_{strat}",
+                        "mask": merged_masks[strat],
+                        "strategy": strat,
+                        "speedScale": 1.0,
+                        "featherPx": 6,
+                    }
+                )
 
     if not specs:
         return rgb.copy(), {"applied": False, "regionsProcessed": 0}
