@@ -169,6 +169,24 @@ def composed_slots(composition, original: dict[str, Path], direct: set[str], sta
     return sources
 
 
+def composed_glow_slots(composition, original: dict[str, Path], staging: Path) -> dict[str, Path]:
+    """Render composed function-icon glow variants natively at 152x152 without 128->152 upscaling."""
+    glows: dict[str, Path] = {}
+    if not composition:
+        return glows
+    for target in IMAGE_TARGETS:
+        spec = IMAGE_SLOTS.get(target)
+        if not spec or "glow_size" not in spec:
+            continue
+        surface = composition.surface(target)
+        if surface:
+            staging.mkdir(parents=True, exist_ok=True)
+            path = staging / f"{target.replace(':', '-')}_glow.png"
+            render(workspace(), target, surface, tuple(spec["glow_size"]), original.get(target)).save(path)
+            glows[target] = path
+    return glows
+
+
 class ImagePreview(Model):
     target: str
     surface: Surface
@@ -209,6 +227,31 @@ def image_preview(payload: ImagePreview):
         raise HTTPException(422, "Não foi possível renderizar a composição da imagem.") from exc
 
 
+def _iter_animation_base_frames(job: jobs.Job, frame_count: int, size: tuple[int, int]):
+    """Yield the exact base RGBA frames used on RAF/PKG export (honoring applied Deluxe loops)."""
+    from . import dxt1, theme
+
+    deluxe = job.meta.get("deluxe")
+    deluxe_match = (
+        isinstance(deluxe, dict)
+        and deluxe.get("frames") == frame_count
+        and list(deluxe.get("size") or []) == list(size)
+    )
+    png_dir = job.root / "deluxe_frames"
+    dds_dir = job.root / "deluxe_dds"
+    if deluxe_match and png_dir.is_dir() and all((png_dir / f"{i:02d}.png").is_file() for i in range(frame_count)):
+        for index in range(frame_count):
+            with Image.open(png_dir / f"{index:02d}.png") as im:
+                yield np.asarray(im.convert("RGBA"))
+        return
+    if deluxe_match and dds_dir.is_dir() and all((dds_dir / theme.frame_name(i)).is_file() for i in range(frame_count)):
+        for index in range(frame_count):
+            yield dxt1.decode_dds((dds_dir / theme.frame_name(index)).read_bytes())
+        return
+    info = media.probe(job.source)
+    yield from media.iter_raw_frames(job.source, frame_count, size, info.duration)
+
+
 @router.post("/animation")
 def animation_preview(payload: AnimatedPreview):
     root = workspace()
@@ -218,7 +261,15 @@ def animation_preview(payload: AnimatedPreview):
     if job is None:
         raise HTTPException(422, "Selecione uma fonte animada deste projeto.")
     validate_references(root, Composition(surfaces={"animated": payload.surface}))
-    key = hashlib.sha256((VERSION + payload.model_dump_json()).encode()).hexdigest()
+    deluxe = job.meta.get("deluxe")
+    deluxe_sig = ""
+    if (
+        isinstance(deluxe, dict)
+        and deluxe.get("frames") == payload.frames
+        and list(deluxe.get("size") or []) == list(payload.size)
+    ):
+        deluxe_sig = str(deluxe.get("key") or deluxe.get("appliedAt") or "deluxe")
+    key = hashlib.sha256((VERSION + "|" + deluxe_sig + "|" + payload.model_dump_json()).encode()).hexdigest()
     cache = root / "composition-cache" / "frames"
     target = cache / key
     names = [f"{index:02d}.webp" for index in range(payload.frames)]
@@ -229,8 +280,7 @@ def animation_preview(payload: AnimatedPreview):
                 stage = Path(temporary) / key
                 stage.mkdir()
                 overlay = render(root, "animated", payload.surface, payload.size)
-                info = media.probe(job.source)
-                raw = media.iter_raw_frames(job.source, payload.frames, payload.size, info.duration)
+                raw = _iter_animation_base_frames(job, payload.frames, payload.size)
                 for name, frame in zip(names, compose_frames(raw, overlay), strict=True):
                     Image.fromarray(frame).save(stage / name, "WEBP", lossless=True, method=1)
                 stage.rename(target)

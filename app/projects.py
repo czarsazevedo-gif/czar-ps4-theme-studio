@@ -315,6 +315,14 @@ def new_project(parent: Path, name: str, previous: Path | None = None) -> Manife
         root.mkdir(mode=0o700)
         if previous and state:
             copy_jobs(previous, root, state)
+        if previous:
+            recipes_src = previous / "ouroboros-deluxe" / "recipes"
+            if recipes_src.is_dir():
+                recipes_dst = root / "ouroboros-deluxe" / "recipes"
+                recipes_dst.mkdir(parents=True, mode=0o700, exist_ok=True)
+                for rec_file in recipes_src.glob("*.json"):
+                    if rec_file.is_file():
+                        shutil.copyfile(rec_file, recipes_dst / rec_file.name)
         atomic_write(root, manifest)
         root.rename(parent / manifest.id)
     return manifest

@@ -358,7 +358,11 @@ async def animated_upload(
     job = jobs.create("animated", file.filename or "source", data)
     loop = asyncio.get_running_loop()
     ctx = contextvars.copy_context()
-    return await loop.run_in_executor(_RAF_EXPORT_POOL, ctx.run, _prepare_animated_upload, job, frames, size)
+    try:
+        return await loop.run_in_executor(_RAF_EXPORT_POOL, ctx.run, _prepare_animated_upload, job, frames, size)
+    except BaseException:
+        shutil.rmtree(job.root, ignore_errors=True)
+        raise
 
 
 def _prepare_animated_upload(job: jobs.Job, frames: int, size: str) -> dict:
@@ -597,7 +601,11 @@ async def slot_upload(slot_id: str, file: UploadFile = File(...)) -> dict:
 
     data = await _read_upload(file, IMAGE_EXTS)
     job = jobs.create("slot", file.filename or "source", data)
-    return _prepare_slot_upload(job, slot_id, spec)
+    try:
+        return _prepare_slot_upload(job, slot_id, spec)
+    except BaseException:
+        shutil.rmtree(job.root, ignore_errors=True)
+        raise
 
 
 def _prepare_slot_upload(job: jobs.Job, slot_id: str, spec: dict) -> dict:
@@ -1086,24 +1094,30 @@ async def convert_audio(target: str, file: UploadFile = File(...)) -> dict:
 
     data = await _read_upload(file, SOUND_EXTS)
     job = jobs.create("convert", file.filename or "source", data)
-    info = media.probe_audio(job.source)
+    try:
+        info = media.probe_audio(job.source)
 
-    stem = Path(job.original_name).stem or "audio"
-    dest = job.out_dir / f"{stem}{spec['ext']}"
+        stem = Path(job.original_name).stem or "audio"
+        dest = job.out_dir / f"{stem}{spec['ext']}"
 
-    if target == "wav":
-        media.to_wav(job.source, dest, at9.SAMPLE_RATE)
-    elif target == "at9":
-        wav = job.out_dir / "_tmp.wav"
-        media.to_wav(job.source, wav, at9.SAMPLE_RATE, at9.MAX_SECONDS)
-        at9.encode(wav, dest)
-        wav.unlink(missing_ok=True)
-    else:
-        pcm = media.pcm_mono(job.source, at9.SAMPLE_RATE, MAX_SFX_SECONDS)
-        dest.write_bytes(vag.encode(pcm, at9.SAMPLE_RATE, stem[:15]))
+        if target == "wav":
+            media.to_wav(job.source, dest, at9.SAMPLE_RATE)
+        elif target == "at9":
+            wav = job.out_dir / "_tmp.wav"
+            try:
+                media.to_wav(job.source, wav, at9.SAMPLE_RATE, at9.MAX_SECONDS)
+                at9.encode(wav, dest)
+            finally:
+                wav.unlink(missing_ok=True)
+        else:
+            pcm = media.pcm_mono(job.source, at9.SAMPLE_RATE, MAX_SFX_SECONDS)
+            dest.write_bytes(vag.encode(pcm, at9.SAMPLE_RATE, stem[:15]))
 
-    job.meta["out"] = dest.name
-    job.save()
+        job.meta["out"] = dest.name
+        job.save()
+    except BaseException:
+        shutil.rmtree(job.root, ignore_errors=True)
+        raise
 
     out_info = media.probe_audio(dest) if target != "vag" else None
     return {
@@ -1232,7 +1246,10 @@ def _add_animated_scene(
 
 
 def _collect_slot_assets(
-    slot_sources: dict[str, Path], content_dir: Path, animated: bool = False
+    slot_sources: dict[str, Path],
+    content_dir: Path,
+    animated: bool = False,
+    glow_sources: dict[str, Path] | None = None,
 ) -> list[dict]:
     """Renderiza cada hueco a su destino dentro del tema.
 
@@ -1245,6 +1262,7 @@ def _collect_slot_assets(
     """
     included: list[dict] = []
     by_group: dict[str, list[str]] = {}
+    glow_map = glow_sources or {}
 
     for slot_id, source in slot_sources.items():
         spec = IMAGE_SLOTS[slot_id]
@@ -1256,7 +1274,12 @@ def _collect_slot_assets(
 
         if "glow_path" in spec:
             glow = content_dir / spec["glow_path"]
-            media.render_image(source, glow, spec["glow_size"])
+            glow_src = glow_map.get(slot_id, source)
+            if glow_src is not source and glow_src.is_file():
+                glow.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(glow_src, glow)
+            else:
+                media.render_image(glow_src, glow, spec["glow_size"])
             total += glow.stat().st_size
 
         by_group.setdefault(spec["group"], []).append(slot_id)
@@ -1326,11 +1349,15 @@ def _collect_theme_assets(
         _add(included, f"SFX: {spec['label']['en']}", dest, spec["path"])
 
     with tempfile.TemporaryDirectory(dir=content_dir.parent) as staging:
+        orig_sources = {slot: job.source for slot, job in slot_jobs.items()}
         sources = compositor.composed_slots(
-            composition, {slot: job.source for slot, job in slot_jobs.items()},
+            composition, orig_sources,
             direct_slots or set(), Path(staging),
         )
-        included += _collect_slot_assets(sources, content_dir, animated=bool(animated_job))
+        glow_sources = compositor.composed_glow_slots(composition, orig_sources, Path(staging))
+        included += _collect_slot_assets(
+            sources, content_dir, animated=bool(animated_job), glow_sources=glow_sources,
+        )
 
         # pic1 uses the same home artwork as the canonical theme.
         home = sources.get("home")

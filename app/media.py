@@ -263,10 +263,64 @@ def iter_raw_frames(
         yield last
 
 
+def _render_transparent_rgba(src: Path, size: tuple[int, int]) -> "Image.Image | None":
+    """Return a premultiplied-alpha Lanczos cover-cropped RGBA image when `src` has real transparency.
+
+    FFmpeg's swscale resamples straight RGBA channels independently, creating dark fringe halos
+    around transparent antialiased icon edges. Pillow's Lanczos filter properly premultiplies alpha.
+    Returns None for opaque sources or formats Pillow does not decode (e.g. DDS), preserving the
+    canonical FFmpeg path.
+    """
+    from PIL import Image, ImageOps
+
+    if src.suffix.lower() in {".dds", ".gif", ".apng"}:
+        return None
+    try:
+        with Image.open(src) as im:
+            has_alpha = "A" in im.getbands() or "transparency" in im.info
+            if not has_alpha:
+                return None
+            im = ImageOps.exif_transpose(im)
+            rgba = im.convert("RGBA")
+            alpha_min, _ = rgba.getchannel("A").getextrema()
+            if alpha_min >= 255:
+                return None
+            width, height = size
+            sw, sh = rgba.size
+            if sw <= 0 or sh <= 0:
+                return None
+            # Match scale_crop_filter: force_original_aspect_ratio=increase + centered crop
+            scale = max(width / sw, height / sh)
+            nw = max(width, int(round(sw * scale)))
+            nh = max(height, int(round(sh * scale)))
+            if (nw, nh) != (sw, sh):
+                rgba = rgba.resize((nw, nh), Image.Resampling.LANCZOS)
+            left = (nw - width) // 2
+            top = (nh - height) // 2
+            return rgba.crop((left, top, left + width, top + height))
+    except Exception:
+        return None
+
+
 def render_image(src: Path, dest: Path, size: tuple[int, int]) -> Path:
     """Escala + recorta una imagen a WxH exactos y la guarda (formato por extension)."""
-    require_tools()
     dest.parent.mkdir(parents=True, exist_ok=True)
+    suffix = dest.suffix.lower()
+    if suffix in {".png", ".webp"}:
+        rgba = _render_transparent_rgba(src, size)
+        if rgba is not None:
+            tmp = dest.with_name(f".{dest.name}.tmp")
+            try:
+                if suffix == ".png":
+                    rgba.save(tmp, "PNG")
+                else:
+                    rgba.save(tmp, "WEBP", lossless=True, method=1)
+                tmp.replace(dest)
+                return dest
+            finally:
+                tmp.unlink(missing_ok=True)
+
+    require_tools()
     width, height = size
     args = [
         FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
@@ -274,9 +328,9 @@ def render_image(src: Path, dest: Path, size: tuple[int, int]) -> Path:
         "-vf", scale_crop_filter(width, height),
         "-frames:v", "1",
     ]
-    if dest.suffix.lower() == ".webp":
+    if suffix == ".webp":
         args += ["-c:v", "libwebp", "-quality", str(PREVIEW_WEBP_QUALITY), "-compression_level", "4"]
-    elif dest.suffix.lower() == ".png":
+    elif suffix == ".png":
         # The icon carries alpha; without this ffmpeg would flatten it to rgb24.
         args += ["-c:v", "png", "-pix_fmt", "rgba"]
     args.append(str(dest))
@@ -288,6 +342,9 @@ def render_image(src: Path, dest: Path, size: tuple[int, int]) -> Path:
 
 def image_to_rgba(src: Path, size: tuple[int, int]) -> np.ndarray:
     """Imagen -> array RGBA (H, W, 4) ya escalado y recortado."""
+    rgba = _render_transparent_rgba(src, size)
+    if rgba is not None:
+        return np.asarray(rgba, dtype=np.uint8)
     require_tools()
     width, height = size
     raw = _run(
