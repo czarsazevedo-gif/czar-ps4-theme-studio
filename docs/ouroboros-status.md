@@ -32,3 +32,9 @@ Os testes HTTP da bancada usaram a porta isolada 18088 e os testes de reinício 
 A revisão encontrou três situações que poderiam distorcer o diagnóstico. A classificação descartou evidência de movimento causada pelo par de um corte abrupto. A busca passou a penalizar janelas imóveis, incluir o limite final da gravação e informar falhas de leitura separadamente da inadequação do material. Uma prévia truncada passou a ser verificada e refeita sob a mesma chave.
 
 A próxima evidência necessária é a observação da junção pelo proprietário no Chrome físico. Lua e Coroa foram representadas por sinais sintéticos. O teste físico 3.3, a integração em branches anteriores e a aceitação da fase 3.4 seguem pendentes.
+
+## Gênesis V1
+
+Branch independente `feature/ouroboros-genesis-v1`, baseada em `e578614`. O checkpoint inicial do sintetizador é `ae7be83`. A demonstração produziu RAF nas três resoluções e preservou a lua sintética durante todo o ciclo. Os ensaios de regressão e o navegador com toque emulado acompanham o código. A aprovação perceptiva no tablet e a aplicação no PS4 seguem pendentes. [Resultados e arquivos de demonstração](genesis-v1.md)
+
+Na bancada Linux, passaram 22 testes de regressão da Fundação e das fases anteriores. O Chromium com toque emulado reproduziu dez voltas, abriu a inspeção da junção em retrato, recuperou o vídeo original e baixou o RAF. A regressão registrou um ResourceWarning de fechamento de upload na rota legada e um aviso de depreciação do cliente HTTP de testes.

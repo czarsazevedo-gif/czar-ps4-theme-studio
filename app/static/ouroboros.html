@@ -24,6 +24,33 @@
         ><button hidden id="cancel">Cancelar</button><progress hidden id="progress" max="100"></progress>
         <p role="status" id="status"></p>
       </section>
+      <section>
+        <h2>Gênesis · síntese circular</h2>
+        <label
+          >Eixo da translação
+          <select id="axis">
+            <option value="horizontal">Horizontal</option>
+            <option value="vertical">Vertical</option>
+          </select></label
+        >
+        <label
+          >Resolução
+          <select id="output">
+            <option>1280×720</option>
+            <option>960×540</option>
+            <option selected>640×360</option>
+          </select></label
+        >
+        <label
+          >Velocidade relativa à fonte
+          <select id="rate">
+            <option>0.5</option>
+            <option selected>1</option>
+            <option>2</option>
+          </select></label
+        >
+        <button id="synthesize">Sintetizar faixas periódicas</button>
+      </section>
       <section hidden id="diag">
         <h2>Sentinela</h2>
         <p id="summary"></p>
@@ -46,6 +73,14 @@
         <div>
           <button id="play">Reproduzir</button><button id="seam">Inspecionar último → primeiro</button
           ><button id="step">Próximo quadro</button>
+        </div>
+        <div hidden id="artifacts">
+          <details>
+            <summary>Comparar com a fonte</summary>
+            <video id="original" controls playsinline preload="none" width="320" aria-label="Vídeo original"></video>
+            <img id="reference" width="320" alt="Primeiro quadro da fonte" />
+          </details>
+          <a id="download">Baixar background.raf.zip</a>
         </div>
         <output id="counter"></output>
       </section>

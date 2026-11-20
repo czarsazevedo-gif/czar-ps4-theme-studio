@@ -37,6 +37,10 @@ function release() {
   frames = [];
   index = 0;
   by("player").hidden = true;
+  by("original").pause();
+  by("original").removeAttribute("src");
+  by("original").load();
+  by("artifacts").hidden = true;
 }
 function draw() {
   const cv = document.querySelector("canvas"),
@@ -190,9 +194,18 @@ async function operate(kind, payload) {
       frames = loaded;
       wait = r.wait;
       draw();
-      const clip = analysis.groups[payload.resolution].candidates[payload.candidate];
-      by("measurement").textContent =
-        `${r.size.join(" × ")} · ${fmt(clip.start)} → ${fmt(clip.end)} s. Fonte · ${r.sourceVerdict}. DDS · ${r.quality.verdict}. ${r.quality.reason} ${fmt(r.bytes)} bytes reais · espera ${fmt(wait)} s. A prévia mede os DDS. A aplicação no PS4 exige teste físico.`;
+      if (kind === "genesis") {
+        by("measurement").textContent =
+          `DDS decodificados · ${r.frames} quadros · ${fmt(r.bytes)} bytes · ${fmt(r.wait)} s por quadro · deslocamento na junção por faixa: ${r.measured.at(-1).join(", ")} px.`;
+        by("artifacts").hidden = false;
+        by("original").src = url("/api/ouroboros/genesis-source/"+payload.kind+"/"+payload.id);
+        by("reference").src = url("/api/ouroboros/genesis/" + t.key + "/source.png");
+        by("download").href = url("/api/ouroboros/genesis/" + t.key + "/background.raf.zip");
+      } else {
+        const clip = analysis.groups[payload.resolution].candidates[payload.candidate];
+        by("measurement").textContent =
+          `${r.size.join(" × ")} · ${fmt(clip.start)} → ${fmt(clip.end)} s. Fonte · ${r.sourceVerdict}. DDS · ${r.quality.verdict}. ${r.quality.reason} ${fmt(r.bytes)} bytes reais · espera ${fmt(wait)} s. A prévia mede os DDS. A aplicação no PS4 exige teste físico.`;
+      }
       by("player").hidden = false;
       by("player").scrollIntoView();
       play();
@@ -232,3 +245,18 @@ document.addEventListener("visibilitychange", () => {
   if (list.some((p) => p.id === params.get("project"))) by("project").value = params.get("project");
   await sources();
 })().catch((e) => (by("status").textContent = e.message));
+
+by("synthesize").onclick = () => {
+  if (!by("video").value) {
+    by("status").textContent = "Selecione um vídeo importado.";
+    return;
+  }
+  const [kind, id] = by("video").value.split("/");
+  operate("genesis", {
+    kind,
+    id,
+    resolution: by("output").selectedIndex,
+    axis: by("axis").value,
+    rate: Number(by("rate").value),
+  });
+};

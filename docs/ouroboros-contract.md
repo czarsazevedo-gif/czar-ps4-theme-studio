@@ -14,3 +14,5 @@ Fontes disponíveis para consolidação foram a missão Infinite Motion e a pres
 
 
 O resultado de cada busca pode ser **loop natural aprovado**, **loop natural condicional**, **reconstrução necessária** ou **material inadequado**. Registrar separadamente falhas de decodificação. A busca deve cobrir toda a duração em amostras, recalcular a seleção por orçamento e explicitar a confiança. Os diagnósticos e as prévias ficam em derivados versionados do projeto. O teste de compatibilidade compara os conteúdos descompactados da exportação com os de `8a9ef7f`. [Estado de execução](ouroboros-status.md) · [Ordem de retomada](ouroboros-roadmap.md)
+
+A missão Gênesis autorizou na branch isolada a síntese de translação periódica em faixas paralelas de uma única fonte. A validação compara também os quadros DDS decodificados e verifica os pixels protegidos. O contrato canônico de exportação da Fundação continua vigente. [Escopo e limites](genesis-v1.md)

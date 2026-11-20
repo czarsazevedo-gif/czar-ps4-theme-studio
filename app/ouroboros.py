@@ -60,7 +60,13 @@ class Task:
             self.stage, self.percent = stage, percent
 
     def public(self):
-        return dict(id=self.id, state=self.state, stage=self.stage, percent=self.percent, key=self.key)
+        return dict(
+            id=self.id,
+            state=self.state,
+            stage=self.stage,
+            percent=self.percent,
+            key=self.key,
+        )
 
 
 tasks: dict[str, Task] = {}
@@ -124,9 +130,11 @@ def healthy(folder, key, check):
         count = header["frames"]
         if not 1 <= count <= 48:
             return False
-        for i in range(count):
+        names = [f"{i:02d}.webp" for i in range(count)]
+        if header["type"] == "genesis":
+            names.extend(["source.png", "background.raf.zip"])
+        for name in names:
             check()
-            name = f"{i:02d}.webp"
             if media.digest(folder / name, check) != header["files"][name]:
                 return False
         return True
@@ -148,6 +156,9 @@ def execute(task, calculate):
                 data.update(key=key, version=VERSION)
                 if "frames" in data:
                     data["files"] = {p.name: media.digest(p, task.check) for p in stage.glob("*.webp")}
+                if data["type"] == "genesis":
+                    for name in ("source.png", "background.raf.zip"):
+                        data["files"][name] = media.digest(stage / name, task.check)
                 (stage / "report.json").write_text(json.dumps(data, allow_nan=False), encoding="utf-8")
                 with lock:
                     task.check()
@@ -155,17 +166,27 @@ def execute(task, calculate):
                         stage.rename(dest)
                     else:
                         # Readers see complete files from the same immutable recipe.
-                        for path in stage.glob("*.webp"):
-                            path.replace(dest / path.name)
+                        for name in data.get("files", {}):
+                            (stage / name).replace(dest / name)
                         (stage / "report.json").replace(dest / "report.json")
         with lock:
             task.check()
-            task.state, task.stage, task.percent, task.key = "ready", "Concluído", 100, key
+            task.state, task.stage, task.percent, task.key = (
+                "ready",
+                "Concluído",
+                100,
+                key,
+            )
     except media.Cancelled:
         with lock:
             task.state, task.stage = "cancelled", "Cancelado."
     except Exception as exc:
-        log.warning("ouroboros job=%s project=%s error=%s", task.id, task.root.name, type(exc).__name__)
+        log.warning(
+            "ouroboros job=%s project=%s error=%s",
+            task.id,
+            task.root.name,
+            type(exc).__name__,
+        )
         with lock:
             task.state = "error"
             task.stage = (
@@ -259,26 +280,46 @@ def frame(key: AssetId, name: str):
 
 
 class Synthesis(Source):
-    axis: Literal["horizontal","vertical"] = "horizontal"
-    resolution: int = Field(ge=0,le=2)
-    rate: float = Field(ge=.5,le=2)
+    axis: Literal["horizontal", "vertical"] = "horizontal"
+    resolution: int = Field(ge=0, le=2)
+    rate: float = Field(ge=0.5, le=2)
 
 
-@router.post("/genesis",status_code=202)
-def synthesize(request: Request,item: Synthesis):
+@router.post("/genesis", status_code=202)
+def synthesize(request: Request, item: Synthesis):
     from . import genesis
-    root=workspace()
-    path,duration,_=source(request,item)
+
+    root = workspace()
+    path, duration, _ = source(request, item)
+
     def prepare(task):
-        key=media.fingerprint(["genesis-1",media.digest(path,task.check),item.model_dump()])
-        return key,lambda folder:genesis.render(path,duration,folder,genesis.ANIMATED_SIZES[item.resolution],
-            item.axis,item.rate,task.progress,task.check)
-    return submit(root,item.model_dump_json(),prepare)
+        key = media.fingerprint(["genesis-1", media.digest(path, task.check), item.model_dump()])
+        return key, lambda folder: genesis.render(
+            path,
+            duration,
+            folder,
+            genesis.ANIMATED_SIZES[item.resolution],
+            item.axis,
+            item.rate,
+            task.progress,
+            task.check,
+        )
+
+    return submit(root, item.model_dump_json(), prepare)
 
 
 @router.get("/genesis/{key}/{artifact}")
-def synthesis_artifact(key: AssetId,artifact: Literal["source.png","background.raf.zip"]):
-    folder,data=record(workspace(),key)
-    if data.get("type")!="genesis" or not (folder/artifact).is_file():
-        raise HTTPException(404,"Derivado indisponível.")
-    return FileResponse(folder/artifact,filename=artifact if artifact.endswith(".zip") else None)
+def synthesis_artifact(key: AssetId, artifact: Literal["source.png", "background.raf.zip"]):
+    folder, data = record(workspace(), key)
+    if data.get("type") != "genesis" or not (folder / artifact).is_file():
+        raise HTTPException(404, "Derivado indisponível.")
+    return FileResponse(folder / artifact, filename=artifact if artifact.endswith(".zip") else None)
+
+
+@router.get("/genesis-source/{kind}/{ident}")
+def genesis_source(request: Request, kind: Literal["animated", "library"], ident: AssetId | JobId):
+    path, _, _ = source(request, Source(kind=kind, id=ident))
+    mime = {".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime"}.get(path.suffix.lower())
+    if not mime:
+        raise HTTPException(415, "Use o quadro de referência para comparar este formato.")
+    return FileResponse(path, media_type=mime, headers={"X-Content-Type-Options": "nosniff"})

@@ -15,3 +15,5 @@ Os projetos da versão 0.1.0 continuam na instalação em que foram salvos. Para
 O código original é de Imxnxl, sob a licença do repositório. ATRAC9 requer áudio pronto ou codificador compatível fornecido pelo proprietário. A exportação RAF funciona sem o empacotador externo. [Referência original](https://github.com/Imxnxl/PS4-Ultimate-Theme-Creator/tree/aa595aa6cda8e906c7f21086b829a6b23223784e)
 
 Consulte o [registro de recuperação](docs/recuperacao.md), o [guia de projetos](docs/projetos-v1.md), o [guia da biblioteca](docs/biblioteca-v1.md) e o [histórico de mudanças](CHANGELOG.md).
+
+Na branch `feature/ouroboros-genesis-v1`, abra **Diagnóstico de loops → Gênesis** para sintetizar, visualizar e exportar faixas com translação periódica. [Demonstração da lua, RAFs e roteiro no tablet](docs/genesis-v1.md)

@@ -12,3 +12,5 @@
 2. Concluir a aceitação física da 3.3 e observar as junções da fundação no Chrome do Galaxy Tab, nas duas orientações, inclusive nas fontes Lua e Coroa quando disponíveis. Registrar cada veredito e qualquer divergência com a percepção humana. [Roteiro e métricas de referência](ouroboros-circulo.md)
 3. Se houver falso positivo, registrar os timestamps, o veredito e os indicadores de movimento do projeto privado. Reproduzir o defeito em fixture antes de recalibrar o classificador.
 4. A próxima missão técnica depende de autorização após a aceitação. Casos com **reconstrução necessária** são entradas para pesquisa futura. A integração exige decisão expressa do proprietário.
+
+A missão Gênesis foi executada em branch independente após a autorização do proprietário. O próximo passo para essa branch é a aceitação perceptiva da demonstração no Chrome do Galaxy Tab. [Roteiro do Gênesis](genesis-v1.md)
