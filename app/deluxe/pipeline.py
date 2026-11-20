@@ -222,12 +222,16 @@ def render_deluxe_loop(
         candidate_frames = r_res["frames"]
         strategy_meta = r_res["meta"]
     else:  # reconstruct_auto
+        from .sentinela_supreme import analyze_levels
+
+        auto_sent = analyze_levels(raw_frames, dt=step_sec, check=check)
         rec_res = reconstruct_best(
             raw_frames,
             wait,
             lead_in=lead_in,
             lead_out=lead_out,
             protected_mask=protected_mask,
+            sentinela_report=auto_sent,
             stabilize_camera=stabilize_camera,
             verify_dds=False,
         )
