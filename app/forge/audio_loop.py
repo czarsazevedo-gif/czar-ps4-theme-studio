@@ -324,6 +324,23 @@ def finish_audio_loop(
     if n < 256:
         raise ValueError("Áudio curto demais para preparar um loop válido.")
 
+    for label, val in (
+        ("início", start_sec),
+        ("fim", end_sec),
+        ("crossfade", crossfade_ms),
+        ("fade-in", fade_in_ms),
+        ("fade-out", fade_out_ms),
+    ):
+        if val is not None and (not math.isfinite(float(val)) or float(val) < 0.0):
+            raise ValueError(f"Parâmetro de áudio inválido ({label}): informe um número finito não negativo.")
+
+    if start_sec is not None and end_sec is not None and end_sec <= start_sec:
+        raise ValueError("Intervalo de loop inválido: o tempo final deve ser maior que o tempo inicial.")
+    if start_sample is not None and end_sample is not None and end_sample <= start_sample:
+        raise ValueError("Intervalo de amostras inválido: a amostra final deve ser maior que a inicial.")
+    if start_sec is not None and int(round(start_sec * sr)) >= n - 256:
+        raise ValueError("O início do trecho de loop ultrapassa a duração útil do áudio.")
+
     if start_sample is not None:
         s0 = max(0, min(n - 256, int(start_sample)))
     elif start_sec is not None and start_sec > 0:
