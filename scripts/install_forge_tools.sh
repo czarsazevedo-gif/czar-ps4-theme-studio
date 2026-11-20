@@ -4,9 +4,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC_DIR="${ROOT_DIR}/tools/src"
-BIN_DIR="${ROOT_DIR}/tools/bin"
-DOTNET_DIR="${ROOT_DIR}/tools/dotnet"
+TOOLS_DIR="${ROOT_DIR}/tools"
+SRC_DIR="${TOOLS_DIR}/src"
+BIN_DIR="${TOOLS_DIR}/bin"
+DOTNET_DIR="${TOOLS_DIR}/dotnet"
 
 PSGFX_REPO="https://github.com/elripalda/psgfx.git"
 PSGFX_COMMIT="5ee7aa9e7d91c9f518322847d13a6bda5ba97837"
@@ -16,10 +17,96 @@ LIBORBISPKG_COMMIT="92a4e7f8e5914cb06b52ba3ae6b0675da438a051"
 
 mkdir -p "${SRC_DIR}" "${BIN_DIR}"
 
+has_passwordless_sudo() {
+    command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1
+}
+
+apt_install_if_sudo() {
+    if ! command -v apt-get >/dev/null 2>&1 || ! has_passwordless_sudo; then
+        return 1
+    fi
+    # GitHub Codespaces Debian Bookworm images ship an expired Yarn GPG repo
+    # that breaks apt-get update; remove it safely before installing packages.
+    if [[ -f /etc/apt/sources.list.d/yarn.list ]]; then
+        echo "[CZAR Forge] Removendo /etc/apt/sources.list.d/yarn.list (chave GPG expirada no Codespaces)..."
+        sudo -n rm -f /etc/apt/sources.list.d/yarn.list || true
+    fi
+    sudo -n apt-get update -qq
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+}
+
+is_real_imagemagick() {
+    local bin="$1"
+    [[ -n "${bin}" && -x "${bin}" ]] && "${bin}" -version 2>/dev/null | grep -qi "ImageMagick"
+}
+
+probe_magick_dxt1a() {
+    local bin="$1"
+    python3 - "${bin}" <<'PY'
+import subprocess, sys
+bin_path = sys.argv[1]
+rgba = bytes([255, 128, 64, 255] * 16)
+p = subprocess.run(
+    [bin_path, "-size", "4x4", "-depth", "8", "rgba:-", "-alpha", "off",
+     "-define", "dds:compression=dxt1a", "-define", "dds:mipmaps=0", "dds:-"],
+    input=rgba, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15
+)
+ok = p.returncode == 0 and len(p.stdout) >= 136 and p.stdout[:4] == b"DDS " and p.stdout[84:88] == b"DXT1"
+sys.exit(0 if ok else 1)
+PY
+}
+
+install_magick() {
+    local target="${BIN_DIR}/magick"
+    local found=""
+
+    if command -v magick >/dev/null 2>&1 && is_real_imagemagick "$(command -v magick)"; then
+        found="$(command -v magick)"
+    elif [[ -x "${target}" ]] && is_real_imagemagick "${target}"; then
+        found="${target}"
+    elif command -v convert >/dev/null 2>&1 && is_real_imagemagick "$(command -v convert)"; then
+        found="$(command -v convert)"
+    else
+        echo "[CZAR Forge] ImageMagick não encontrado; tentando instalar via apt-get..."
+        if apt_install_if_sudo imagemagick; then
+            if command -v magick >/dev/null 2>&1 && is_real_imagemagick "$(command -v magick)"; then
+                found="$(command -v magick)"
+            elif command -v convert >/dev/null 2>&1 && is_real_imagemagick "$(command -v convert)"; then
+                found="$(command -v convert)"
+            fi
+        fi
+    fi
+
+    if [[ -z "${found}" ]]; then
+        echo "[AVISO] ImageMagick não pôde ser instalado automaticamente (sem apt-get/sudo sem senha)." >&2
+        echo "        O encoder nativo DXT1a continua 100% funcional sem ImageMagick." >&2
+        return 1
+    fi
+
+    if [[ "${found}" != "${target}" ]]; then
+        ln -sf "${found}" "${target}"
+    fi
+    if has_passwordless_sudo && [[ ! -e /usr/local/bin/magick ]]; then
+        sudo -n ln -sf "${found}" /usr/local/bin/magick || true
+    fi
+
+    if probe_magick_dxt1a "${target}"; then
+        echo "[CZAR Forge] ImageMagick validado (DXT1a OK): ${target} -> ${found}"
+        return 0
+    else
+        echo "[ERRO] ImageMagick encontrado em ${found}, mas falhou no teste real DXT1a." >&2
+        return 1
+    fi
+}
+
 install_psgfx_at9() {
     local target="${BIN_DIR}/psgfx-at9"
     local repo_dir="${SRC_DIR}/psgfx"
 
+    if ! command -v g++ >/dev/null 2>&1 && ! command -v clang++ >/dev/null 2>&1; then
+        echo "[CZAR Forge] Compilador C++17 ausente; tentando instalar g++..."
+        apt_install_if_sudo g++ || true
+    fi
     if ! command -v g++ >/dev/null 2>&1 && ! command -v clang++ >/dev/null 2>&1; then
         echo "[ERRO] Compilador C++17 (g++ ou clang++) não encontrado." >&2
         exit 1
@@ -123,12 +210,16 @@ case "${1:-all}" in
     pkg)
         install_liborbispkg
         ;;
+    magick)
+        install_magick
+        ;;
     all)
         install_psgfx_at9
         install_liborbispkg
+        install_magick || true
         ;;
     *)
-        echo "Uso: $0 [at9|pkg|all]" >&2
+        echo "Uso: $0 [at9|pkg|magick|all]" >&2
         exit 2
         ;;
 esac

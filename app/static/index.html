@@ -747,6 +747,25 @@
   <div id="forge-report-body" class="forge-report-body"></div>
 </dialog>
 
+<dialog id="tools-dialog" class="forge-dialog" aria-labelledby="tools-dialog-title">
+  <div class="library-asset-head">
+    <h2 id="tools-dialog-title">Status das Ferramentas do Studio</h2>
+    <form method="dialog"><button type="submit" class="btn btn-ghost">Fechar</button></form>
+  </div>
+  <div class="tools-legend" aria-label="Legenda das luzes de status">
+    <span class="tools-legend-item"><i class="status-led ok"></i><b>Verde</b>: Funcionando</span>
+    <span class="tools-legend-item"><i class="status-led off"></i><b>Cinza</b>: Ausente</span>
+    <span class="tools-legend-item"><i class="status-led err"></i><b>Vermelho</b>: Defeituosa</span>
+  </div>
+  <div id="tools-list" class="tools-list"></div>
+  <div class="tools-actions">
+    <button id="tools-activate-all" type="button" class="btn btn-primary forge-touch-btn">Ativar / Reparar tudo</button>
+    <button id="tools-recheck-btn" type="button" class="btn btn-ghost forge-touch-btn">Reverificar agora</button>
+  </div>
+  <p id="tools-setup-status" class="tools-setup-status" role="status" aria-live="polite"></p>
+  <pre id="tools-setup-log" class="tools-setup-log" hidden></pre>
+</dialog>
+
 <dialog id="library-asset" aria-labelledby="library-title">
   <div class="library-asset-head">
     <h2 id="library-title"></h2>

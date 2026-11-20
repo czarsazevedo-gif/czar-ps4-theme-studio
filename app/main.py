@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 
 from pydantic import BaseModel, ConfigDict
 
-from . import at9, compositor, dxt1, jobs, library, mdx, media, ouroboros, pkg, projects, raf, theme, theme_xml, vag
+from . import at9, compositor, dxt1, jobs, library, mdx, media, ouroboros, pkg, projects, raf, system_health, theme, theme_xml, vag
 from .forge import audio_router as forge_audio
 from .forge import bundle_service as forge_bundle
 from .forge import pkg_forge, pkg_router as forge_pkg, sfo as forge_sfo
@@ -193,15 +193,19 @@ def healthz() -> dict:
 
 
 @app.get("/api/system")
-def system_info() -> dict:
+def system_info(refresh: bool = False) -> dict:
+    health = system_health.get_system_health(force=refresh)
+    tools = health["tools"]
     return {
-        "ffmpeg": bool(media.FFMPEG),
+        "ffmpeg": tools["ffmpeg"]["state"] == "ok",
         "ffprobe": bool(media.FFPROBE),
-        "magick": bool(media.MAGICK),
-        "pkg_tools": pkg.tools_available() or pkg_forge.pkg_forge_info()["available"],
+        "magick": tools["magick"]["state"] == "ok",
+        "pkg_tools": tools["pkg"]["state"] == "ok",
         "pkg_forge": pkg_forge.pkg_forge_info(),
-        "at9tool": at9.available(),
+        "at9tool": tools["at9"]["state"] == "ok",
         "at9_encoder": at9.encoder_info(),
+        "health": health,
+        "tools_setup": system_health.get_tool_setup_status(),
         "min_gain_db": MIN_GAIN_DB,
         "max_gain_db": MAX_GAIN_DB,
         "backends": available_backends(),
@@ -226,6 +230,54 @@ def system_info() -> dict:
             "video": sorted(VIDEO_EXTS),
             "image": sorted(IMAGE_EXTS),
         },
+    }
+
+
+@app.get("/api/system/health")
+def api_system_health(refresh: bool = False) -> dict:
+    """Real-time 3-state (ok/off/err) tool health snapshot for live UI traffic lights."""
+    health = system_health.get_system_health(force=refresh)
+    return {
+        **health,
+        "setup": system_health.get_tool_setup_status(),
+    }
+
+
+@app.post("/api/system/tools/setup")
+async def api_system_tools_setup(request: Request) -> dict:
+    """Trigger one-tap background activation/repair of allowlisted tools (all|pkg|at9|magick)."""
+    target = "all"
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "application/json" in ctype:
+        try:
+            body = await request.json()
+            if isinstance(body, dict) and body.get("target"):
+                target = str(body["target"])
+        except Exception:
+            pass
+    else:
+        q_target = request.query_params.get("target")
+        if q_target:
+            target = q_target
+    try:
+        res = system_health.start_tool_setup(target)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return {
+        **res,
+        "health": system_health.get_system_health(force=False),
+    }
+
+
+@app.get("/api/system/tools/setup/status")
+def api_system_tools_setup_status(refresh: bool = False) -> dict:
+    setup = system_health.get_tool_setup_status()
+    health = system_health.get_system_health(force=refresh)
+    return {
+        "setup": setup,
+        "health": health,
     }
 
 

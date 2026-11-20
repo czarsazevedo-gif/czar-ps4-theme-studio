@@ -10,8 +10,8 @@
       "requireLocalPort": true
     }
   },
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg && python -m pip install -r requirements.txt",
-  "postStartCommand": "test -x ./start.sh && command -v ffprobe",
+  "postCreateCommand": "bash ./scripts/setup_codespace.sh",
+  "postStartCommand": "bash ./scripts/setup_codespace.sh --quick",
   "containerEnv": {
     "PYTHONUNBUFFERED": "1"
   }

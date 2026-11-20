@@ -2324,6 +2324,272 @@ function relocalizarTodo() {
 
 document.addEventListener("langchange", relocalizarTodo);
 
+/* ================================================== status ao vivo e ativação de ferramentas */
+
+const TOOL_ORDER = ["ffmpeg", "magick", "encoder", "at9", "pkg"];
+const toolsUiState = {
+  health: null,
+  setup: null,
+  offline: false,
+  pollTimer: null,
+  setupTimer: null,
+};
+
+function _toolStateMeta(state) {
+  if (state === "ok") return { cls: "ok", text: "Funcionando", suffix: "" };
+  if (state === "err") return { cls: "err", text: "Defeituosa", suffix: " (defeituosa)" };
+  return { cls: "off", text: "Ausente", suffix: " (ausente)" };
+}
+
+function _fallbackHealthFromSys() {
+  return {
+    ok: Boolean(sys?.ffmpeg),
+    any_defective: false,
+    needs_activation: !sys?.pkg_tools || !sys?.at9tool || !sys?.magick,
+    backends: sys?.backends || ["native"],
+    tools: {
+      ffmpeg: { id: "ffmpeg", label: "ffmpeg", state: sys?.ffmpeg ? "ok" : "off", status_label: sys?.ffmpeg ? "Funcionando" : "Ausente", detail: "", installable: false },
+      magick: { id: "magick", label: "ImageMagick", state: sys?.magick ? "ok" : "off", status_label: sys?.magick ? "Funcionando" : "Ausente", detail: "", installable: true, setup_target: "magick" },
+      encoder: { id: "encoder", label: `encoder ${sys?.default_backend || "native"}`, state: "ok", status_label: "Funcionando", detail: "", installable: false },
+      at9: { id: "at9", label: "ATRAC9", state: sys?.at9tool ? "ok" : "off", status_label: sys?.at9tool ? "Funcionando" : "Ausente", detail: "", installable: true, setup_target: "at9" },
+      pkg: { id: "pkg", label: "PKG Tools", state: sys?.pkg_tools ? "ok" : "off", status_label: sys?.pkg_tools ? "Funcionando" : "Ausente", detail: "", installable: true, setup_target: "pkg" },
+    },
+  };
+}
+
+function renderSystemPills() {
+  const box = $("sysinfo");
+  if (!box) return;
+  const health = toolsUiState.health || _fallbackHealthFromSys();
+  const offline = toolsUiState.offline;
+  const setupRunning = toolsUiState.setup?.status === "running";
+  const pills = TOOL_ORDER.map((key) => {
+    const item = health.tools?.[key];
+    if (!item) return "";
+    const st = offline ? "err" : (item.state || "off");
+    const meta = offline
+      ? { cls: "err", text: "Sem resposta", suffix: " (offline)" }
+      : _toolStateMeta(st);
+    const title = offline
+      ? "Servidor sem resposta. Toque para reverificar."
+      : `${item.label}: ${meta.text}${item.detail ? " — " + item.detail : ""}`;
+    return `<button type="button" class="pill ${meta.cls}" data-tool-pill="${forgeEsc(key)}" data-state="${forgeEsc(st)}" title="${forgeEsc(title)}" aria-label="${forgeEsc(title)}">${forgeEsc(item.label)}${forgeEsc(meta.suffix)}</button>`;
+  });
+
+  if (offline) {
+    pills.push(`<button type="button" class="pill err" data-open-tools="1" title="Servidor sem resposta">Reconectar</button>`);
+  } else if (setupRunning) {
+    pills.push(`<button type="button" class="pill pill-activate" data-open-tools="1">Ativando…</button>`);
+  } else if (health.needs_activation || health.any_defective) {
+    pills.push(`<button type="button" class="pill pill-activate" data-open-tools="1">Ativar ferramentas</button>`);
+  }
+
+  box.innerHTML = pills.join("");
+  box.querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", () => openToolsDialog());
+  });
+}
+
+function renderToolsDialog() {
+  const list = $("tools-list");
+  if (!list) return;
+  const health = toolsUiState.health || _fallbackHealthFromSys();
+  const setup = toolsUiState.setup;
+  const running = setup?.status === "running";
+
+  list.innerHTML = TOOL_ORDER.map((key) => {
+    const item = health.tools?.[key];
+    if (!item) return "";
+    const st = toolsUiState.offline ? "err" : (item.state || "off");
+    const meta = toolsUiState.offline ? { cls: "err", text: "Sem resposta" } : _toolStateMeta(st);
+    const detail = toolsUiState.offline
+      ? "Não foi possível contactar o servidor neste momento."
+      : (item.detail || meta.text);
+    const showBtn = !toolsUiState.offline && item.installable && st !== "ok";
+    const btnLabel = st === "err" ? "Reparar" : "Ativar";
+    return `
+      <div class="tool-row is-${meta.cls}" data-tool-row="${forgeEsc(key)}">
+        <div class="tool-row-main">
+          <i class="status-led ${meta.cls}" aria-hidden="true"></i>
+          <div>
+            <div class="tool-row-title">
+              <span>${forgeEsc(item.label)}</span>
+              <span class="tool-state-tag ${meta.cls}">${forgeEsc(meta.text)}</span>
+            </div>
+            <p class="tool-row-detail">${forgeEsc(detail)}</p>
+          </div>
+        </div>
+        ${showBtn ? `<button type="button" class="btn btn-primary forge-touch-btn" data-setup-target="${forgeEsc(item.setup_target)}" ${running ? "disabled" : ""}>${forgeEsc(btnLabel)}</button>` : ""}
+      </div>
+    `;
+  }).join("");
+
+  list.querySelectorAll("[data-setup-target]").forEach((btn) => {
+    btn.addEventListener("click", () => runToolsSetup(btn.dataset.setupTarget));
+  });
+
+  const actAll = $("tools-activate-all");
+  const recheck = $("tools-recheck-btn");
+  if (actAll) {
+    actAll.disabled = running || toolsUiState.offline;
+    actAll.textContent = running ? "Ativando ferramentas…" : "Ativar / Reparar tudo";
+  }
+  if (recheck) recheck.disabled = running;
+
+  const statusEl = $("tools-setup-status");
+  const logEl = $("tools-setup-log");
+  if (statusEl) {
+    statusEl.textContent = setup?.message || (
+      toolsUiState.offline
+        ? "Servidor sem resposta. Verifique se o Studio está ativo e toque em Reverificar agora."
+        : (health.any_defective
+          ? "Há ferramenta com luz vermelha (defeituosa). Toque em Reparar para corrigir automaticamente."
+          : (health.needs_activation
+            ? "Toque em Ativar / Reparar tudo para deixar PKG Tools, ATRAC9 e ImageMagick prontos sem usar terminal."
+            : "Todas as ferramentas estão verdes e funcionando."))
+    );
+  }
+  if (logEl) {
+    const logs = setup?.logs || [];
+    if (logs.length) {
+      logEl.hidden = false;
+      logEl.textContent = logs.join("\n");
+      logEl.scrollTop = logEl.scrollHeight;
+    } else {
+      logEl.hidden = true;
+      logEl.textContent = "";
+    }
+  }
+}
+
+function applySystemHealthSnapshot(health, setup = null) {
+  if (!health || !health.tools) return;
+  toolsUiState.offline = false;
+  toolsUiState.health = health;
+  if (setup) toolsUiState.setup = setup;
+
+  if (sys) {
+    sys.ffmpeg = health.tools.ffmpeg?.state === "ok";
+    sys.magick = health.tools.magick?.state === "ok";
+    sys.pkg_tools = health.tools.pkg?.state === "ok";
+    sys.at9tool = health.tools.at9?.state === "ok";
+    if (Array.isArray(health.backends) && health.backends.length) {
+      sys.backends = health.backends;
+      const sel = $("anim-backend");
+      if (sel) {
+        const current = sel.value || sys.default_backend;
+        sel.innerHTML = sys.backends
+          .map((b) => `<option value="${b}"${b === current ? " selected" : ""}>${b}</option>`)
+          .join("");
+        if ($("backend-row")) $("backend-row").hidden = sys.backends.length < 2;
+      }
+    }
+  }
+
+  if ($("pkg-missing")) $("pkg-missing").hidden = Boolean(sys?.pkg_tools);
+  renderSystemPills();
+  renderToolsDialog();
+  if (typeof describeBgmSupport === "function") describeBgmSupport();
+  if (typeof refreshChecklist === "function" && sys) refreshChecklist();
+}
+
+async function refreshSystemHealth(force = false) {
+  try {
+    const r = await fetch(`/api/system/health${force ? "?refresh=1" : ""}`, { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    applySystemHealthSnapshot(data, data.setup || toolsUiState.setup);
+    if (data.setup?.status === "running" && !toolsUiState.setupTimer) {
+      pollToolsSetup();
+    }
+    return data;
+  } catch {
+    toolsUiState.offline = true;
+    renderSystemPills();
+    renderToolsDialog();
+    return null;
+  }
+}
+
+function openToolsDialog() {
+  const dlg = $("tools-dialog");
+  if (!dlg) return;
+  renderToolsDialog();
+  if (!dlg.open) dlg.showModal();
+  refreshSystemHealth(true);
+}
+
+async function runToolsSetup(target = "all") {
+  const dlg = $("tools-dialog");
+  if (dlg && !dlg.open) dlg.showModal();
+  try {
+    const r = await fetch("/api/system/tools/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      toast(data.detail || "Não foi possível iniciar a ativação das ferramentas.");
+      return;
+    }
+    toolsUiState.setup = data.setup;
+    if (data.health) applySystemHealthSnapshot(data.health, data.setup);
+    else {
+      renderSystemPills();
+      renderToolsDialog();
+    }
+    pollToolsSetup();
+  } catch {
+    toast("Falha ao contactar o servidor para ativar ferramentas.");
+  }
+}
+
+function pollToolsSetup() {
+  if (toolsUiState.setupTimer) clearTimeout(toolsUiState.setupTimer);
+  const tick = async () => {
+    try {
+      const r = await fetch("/api/system/tools/setup/status", { cache: "no-store" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      toolsUiState.setup = data.setup;
+      if (data.health) applySystemHealthSnapshot(data.health, data.setup);
+      if (data.setup?.status === "running") {
+        toolsUiState.setupTimer = setTimeout(tick, 1500);
+      } else {
+        toolsUiState.setupTimer = null;
+        await refreshSystemHealth(true);
+        if (data.setup?.status === "done") toast(data.setup.message || "Ferramentas ativadas!");
+        else if (data.setup?.status === "error") toast(data.setup.message || "Falha ao ativar ferramentas.");
+      }
+    } catch {
+      toolsUiState.setupTimer = null;
+      toolsUiState.offline = true;
+      renderSystemPills();
+      renderToolsDialog();
+    }
+  };
+  toolsUiState.setupTimer = setTimeout(tick, 1000);
+}
+
+function startSystemHealthMonitor() {
+  if (toolsUiState.pollTimer) clearInterval(toolsUiState.pollTimer);
+  toolsUiState.pollTimer = setInterval(() => {
+    if (document.visibilityState === "visible" && toolsUiState.setup?.status !== "running") {
+      refreshSystemHealth(true);
+    }
+  }, 20000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshSystemHealth(true);
+  });
+  $("tools-activate-all")?.addEventListener("click", () => runToolsSetup("all"));
+  $("tools-recheck-btn")?.addEventListener("click", async () => {
+    toast("Verificando ferramentas…");
+    await refreshSystemHealth(true);
+  });
+  $("pkg-activate-now")?.addEventListener("click", () => runToolsSetup("pkg"));
+}
+
 /* ================================================== arranque */
 
 async function boot() {
@@ -2332,18 +2598,18 @@ async function boot() {
   try {
     sys = await api("/api/system");
   } catch {
+    toolsUiState.offline = true;
+    renderSystemPills();
     toast("Não foi possível conectar ao servidor.");
     return;
   }
 
   anim.wait = sys.default_wait_seconds;
-
-  $("sysinfo").innerHTML = [
-    `<span class="pill ${sys.ffmpeg ? "ok" : "off"}">ffmpeg</span>`,
-    `<span class="pill ${sys.magick ? "ok" : "off"}">ImageMagick${sys.magick ? "" : " (não instalado)"}</span>`,
-    `<span class="pill ok">encoder ${sys.default_backend}</span>`,
-    `<span class="pill ${sys.pkg_tools ? "ok" : "off"}">pkg tools</span>`,
-  ].join("");
+  toolsUiState.health = sys.health || _fallbackHealthFromSys();
+  toolsUiState.setup = sys.tools_setup || null;
+  renderSystemPills();
+  startSystemHealthMonitor();
+  if (toolsUiState.setup?.status === "running") pollToolsSetup();
 
   // Encoder selector only when there is more than one option.
   const sel = $("anim-backend");

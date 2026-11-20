@@ -14,6 +14,7 @@ en cada llamada:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -21,17 +22,64 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import PREVIEW_WEBP_QUALITY
-
-FFMPEG = shutil.which("ffmpeg")
-FFPROBE = shutil.which("ffprobe")
-
-# On Windows `convert` is the system's FAT->NTFS converter, not ImageMagick.
-# Only the `magick` binary is accepted, which has no such name clash.
-MAGICK = shutil.which("magick")
+from .config import PREVIEW_WEBP_QUALITY, PROJECT_ROOT
 
 #: Keeps Windows from opening a console window on every ffmpeg call.
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
+
+def _is_imagemagick_binary(binary: str | Path) -> bool:
+    """Confirm that an executable is genuine ImageMagick (never Windows FAT->NTFS convert.exe)."""
+    path = Path(binary)
+    if not path.is_file() or not os.access(path, os.X_OK):
+        return False
+    try:
+        proc = subprocess.run(
+            [str(path), "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=4,
+            creationflags=NO_WINDOW,
+        )
+        out = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+        return proc.returncode == 0 and "imagemagick" in out.lower()
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def find_magick() -> str | None:
+    """Locate ImageMagick safely across Linux and Windows.
+
+    Priority:
+    1. `magick` on PATH (ImageMagick 7 or symlink)
+    2. `tools/bin/magick` (user-space link created by CZAR setup)
+    3. On POSIX (non-Windows), `convert` on PATH ONLY when `-version` confirms ImageMagick.
+       On Windows `convert` is the system FAT->NTFS converter and is never probed.
+    """
+    on_path = shutil.which("magick")
+    if on_path:
+        return on_path
+    local_bin = PROJECT_ROOT / "tools" / "bin" / "magick"
+    if local_bin.is_file() and os.access(local_bin, os.X_OK):
+        return str(local_bin)
+    if os.name != "nt":
+        conv = shutil.which("convert")
+        if conv and _is_imagemagick_binary(conv):
+            return conv
+    return None
+
+
+FFMPEG = shutil.which("ffmpeg")
+FFPROBE = shutil.which("ffprobe")
+MAGICK = find_magick()
+
+
+def refresh_tools() -> None:
+    """Re-probe ffmpeg, ffprobe and ImageMagick paths live without restarting the server."""
+    global FFMPEG, FFPROBE, MAGICK
+    FFMPEG = shutil.which("ffmpeg")
+    FFPROBE = shutil.which("ffprobe")
+    MAGICK = find_magick()
 
 
 class MediaError(RuntimeError):

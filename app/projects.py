@@ -128,6 +128,10 @@ STATELESS_CATALOG_PATHS = {
     "/api/package/content-id",
     "/api/forge/audio/status",
     "/api/forge/status",
+    "/api/system",
+    "/api/system/health",
+    "/api/system/tools/setup",
+    "/api/system/tools/setup/status",
 }
 
 
@@ -137,7 +141,11 @@ async def scope_jobs(request: Request, call_next):
     path = request.url.path
     library_apply = path.startswith("/api/library/") and path.endswith("/apply")
     project_tool = path.startswith(("/api/composition/", "/api/ouroboros/"))
-    protected = project is not None or project_tool or path.startswith(("/api/projects", "/api/library", "/api/forge"))
+    protected = (
+        project is not None
+        or project_tool
+        or path.startswith(("/api/projects", "/api/library", "/api/forge", "/api/system/tools/"))
+    )
     if protected and request.method in {"POST", "PUT"}:
         if not valid_origin(request):
             return JSONResponse({"detail": "Origem da solicitação não autorizada."}, status_code=403)
