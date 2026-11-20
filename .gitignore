@@ -29,6 +29,9 @@
 /tools/bin/
 /tools/src/
 /tools/dotnet/
+/tools/dotnet-home/
+/tools/cache/
+/tools/icons/
 
 
 # --- Python ---------------------------------------------------------------
