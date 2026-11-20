@@ -129,7 +129,12 @@ def healthy(folder, key, check):
         if kind == "analysis":
             return len(header["groups"]) == 3 and "sentinela" in header
         if kind == "deluxe_analysis":
-            return len(header["groups"]) == 3 and "sentinela" in header and "categories" in header
+            return (
+                len(header["groups"]) == 3
+                and "sentinela" in header
+                and "categories" in header
+                and "mediaDiagnostic" in header
+            )
         if kind == "deluxe_calibrate":
             return "recommendations" in header and "configurations" in header
         count = header["frames"]

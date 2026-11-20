@@ -368,6 +368,8 @@ def analyze_levels(
                 cell_class[r, c] = "static"
 
     static_frac = float((cell_class == "static").mean())
+    cell_std = grays[0, : gh * bh, : gw * bw].reshape(gh, bh, gw, bw).std(axis=(1, 3))
+    textured_static_frac = float(((cell_class == "static") & (cell_std >= 5.0)).mean())
     transient_frac = float((cell_class == "transient").mean())
     progressive_frac = float((cell_class == "progressive_flow").mean())
     oscillatory_frac = float((cell_class == "oscillatory").mean())
@@ -389,6 +391,7 @@ def analyze_levels(
 
     camera_moving = bool(
         static_frac < 0.18
+        and textured_static_frac < 0.08
         and cam_moving_frac >= 0.50
         and (
             (cam_inliers >= 0.65 and cam_med_disp > 0.45)

@@ -294,6 +294,10 @@ async function sources() {
   }
   if (revision !== generation) return;
   by("video").replaceChildren(...options);
+  const wantedVideo = params.get("video");
+  if (wantedVideo && options.some((opt) => opt.value === wantedVideo)) {
+    by("video").value = wantedVideo;
+  }
   setButtonsDisabled(false);
   if (!options.length)
     by("status").textContent = "Importe um vídeo na Biblioteca ou selecione um fundo animado no editor.";
@@ -368,7 +372,10 @@ function applyCandidateToControls(c) {
 
 function displayDeluxeAnalysis() {
   const s = deluxeAnalysis.sentinela;
+  const md = deluxeAnalysis.mediaDiagnostic;
+  const aptPrefix = md ? `[${md.aptidao}] ${md.resumo} · ` : "";
   by("deluxe-summary").textContent =
+    aptPrefix +
     `Classificação Supreme: ${s.classification} (confiança ${s.confidenceLabel} · ${fmt(s.confidence * 100)}%). ` +
     `${s.reasons.join(" ")} ` +
     `Câmera: ${s.levelA.cameraMoving ? "móvel" : "fixa"} · Regiões detectadas: ${s.levelB.regions.length} · ` +

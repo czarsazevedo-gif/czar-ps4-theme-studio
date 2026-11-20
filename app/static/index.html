@@ -208,6 +208,79 @@
     <!-- ---- modo animado ---- -->
     <div id="bg-animated" hidden>
 
+      <details id="loop-guide" class="loop-guide">
+        <summary class="loop-guide-summary">COMO ESCOLHER UM VÍDEO PARA UM LOOP PERFEITO</summary>
+        <div class="loop-guide-body">
+          <p class="loop-guide-intro">
+            Um bom loop no PS4 precisa continuar indefinidamente sem inversões, congelamentos ou cortes bruscos dentro do limite de <b>6 MiB</b> e <b>48 quadros</b> do <code>background.raf</code>. Os valores abaixo são <b>orientações práticas</b>, não garantias absolutas — o diagnóstico automático avalia cada vídeo individualmente após a importação.
+          </p>
+
+          <div class="loop-guide-grid">
+            <article class="loop-guide-card">
+              <h4>Duração</h4>
+              <p>Avalia a duração total, a variedade de trechos pesquisáveis e a existência de ciclos naturais com diferentes períodos. Como orientação inicial, vídeos de <b>15–30 segundos</b> costumam oferecer boa margem para comparar candidatos, mas vídeos mais curtos ou longos não são rejeitados.</p>
+            </article>
+
+            <article class="loop-guide-card">
+              <h4>Resolução e proporção</h4>
+              <p>Preferencialmente utilize fontes de boa nitidez (<b>1080p ou superior</b> quando processáveis), o que favorece a redução limpa para <code>1280×720</code>, <code>960×540</code> ou <code>640×360</code> em <b>16:9</b>. Fontes inferiores não são rejeitadas automaticamente; vídeos verticais exigirão recorte central.</p>
+            </article>
+
+            <article class="loop-guide-card">
+              <h4>FPS e timestamps</h4>
+              <p><b>24, 30 ou 60 FPS</b> podem funcionar muito bem conforme a velocidade do movimento — <b>60 FPS não é exigência universal</b>. O mais importante é a regularidade temporal (CFR), evitando VFR extremo, quadros duplicados, quedas de quadro e motion blur excessivo.</p>
+            </article>
+
+            <article class="loop-guide-card">
+              <h4>Codec e compressão</h4>
+              <p>Prefira arquivos com decodificação estável e compressão limpa. Macroblocos intensos, ruído forte e banding na fonte tendem a se acentuar após a codificação canônica em <b>DDS DXT1a</b>.</p>
+            </article>
+
+            <article class="loop-guide-card">
+              <h4>Câmera</h4>
+              <p><b>Câmera fixa ou estabilizada</b> geralmente favorece um loop natural. Tremores, zoom, panorâmicas longas, travelling, rolling shutter, mudança de foco e alterações de perspectiva dificultam o fechamento entre o último e o primeiro quadro.</p>
+            </article>
+
+            <article class="loop-guide-card">
+              <h4>Iluminação</h4>
+              <p>Exposição, balanço de branco, brilho, contraste e saturação consistentes evitam degraus visíveis na emenda. Flicker rápido, luzes intermitentes e mudanças bruscas de exposição exigem correção fotométrica.</p>
+            </article>
+
+            <article class="loop-guide-card">
+              <h4>Movimento</h4>
+              <p>Movimento com direção coerente, velocidade regular e continuidade (ou periodicidade natural) facilita o fechamento. Variações bruscas de trajetória, acelerações súbitas e objetos entrando ou saindo da tela prejudicam a costura.</p>
+            </article>
+
+            <article class="loop-guide-card">
+              <h4>Composição e qualidade visual</h4>
+              <p>Cenas com áreas estáticas bem separadas de áreas dinâmicas permitem proteger o cenário fixo e animar ou sintetizar apenas a região viva. Menos oclusões e menos elementos únicos aumentam a fidelidade visual.</p>
+            </article>
+
+            <article class="loop-guide-card loop-guide-good">
+              <h4>Conteúdos favoráveis</h4>
+              <ul>
+                <li>Água corrente, rios e riachos (fluxo estacionário).</li>
+                <li>Cachoeiras, fontes e quedas d'água.</li>
+                <li>Nuvens, névoa, neblina e fumaça contínua.</li>
+                <li>Chuva constante e partículas atmosféricas (neve, brasa, poeira).</li>
+                <li>Ondas aproximadamente periódicas e paisagens com movimento localizado.</li>
+              </ul>
+            </article>
+
+            <article class="loop-guide-card loop-guide-warn">
+              <h4>Conteúdos desafiadores</h4>
+              <ul>
+                <li>Personagens caminhando, veículos ou objetos únicos atravessando a tela.</li>
+                <li>Câmera em movimento contínuo (drone, panorâmica, zoom) ou cortes de edição.</li>
+                <li>Mudanças bruscas de iluminação, explosões e movimentos únicos sem retorno natural.</li>
+                <li>Grandes oclusões ou elementos que surgem e desaparecem.</li>
+              </ul>
+              <p class="loop-guide-note"><b>Importante:</b> esses conteúdos não são impossíveis de transformar em loop, mas frequentemente exigem reconstrução local, máscaras regionais, escolha criteriosa de trecho ou decisão artística.</p>
+            </article>
+          </div>
+        </div>
+      </details>
+
       <div id="anim-drop" class="dropzone">
         <input type="file" id="anim-file" accept="video/*,.gif,.mp4,.mov,.mkv,.webm,.avi,.m4v">
         <div class="dz-inner">
@@ -301,6 +374,22 @@
           <div id="anim-result" class="result" hidden></div>
         </aside>
       </div>
+
+      <section id="anim-diagnostic" class="anim-diagnostic" aria-live="polite" hidden>
+        <div class="anim-diag-head">
+          <div>
+            <h3 class="anim-diag-title">Diagnóstico inteligente do vídeo importado</h3>
+            <p id="anim-diag-status" class="anim-diag-status">Aguardando análise…</p>
+          </div>
+          <div class="anim-diag-actions">
+            <button id="anim-diag-run" type="button" class="btn btn-ghost">Reanalisar vídeo</button>
+            <button id="anim-diag-cancel" type="button" class="btn btn-ghost" hidden>Cancelar análise</button>
+            <a id="anim-diag-ouroboros" class="btn btn-primary" href="/static/ouroboros.html">Abrir no Ouroboros Deluxe</a>
+          </div>
+        </div>
+        <progress id="anim-diag-progress" max="100" value="0" hidden></progress>
+        <div id="anim-diag-body" class="anim-diag-body" hidden></div>
+      </section>
     </div>
 
     <!-- ---- huecos de imagen ---- -->

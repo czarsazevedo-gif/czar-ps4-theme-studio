@@ -306,6 +306,262 @@ function setAnimBusy(busy) {
   $("anim-export").disabled = busy || anim.frameCount * sys.animated_frame_bytes > sys.limit_bytes;
 }
 
+/* ---- Diagnóstico inteligente pós-importação (Pilar II, não-bloqueante e cancelável) ---- */
+
+const animDiag = {
+  taskId: null,
+  jobId: null,
+  pollTimer: 0,
+  running: false,
+  runSeq: 0,
+};
+
+function syncAnimDiagLink(jobId = anim.jobId) {
+  const link = $("anim-diag-ouroboros");
+  if (!link) return;
+  const u = new URL("/static/ouroboros.html", location.origin);
+  if (Projects.id) u.searchParams.set("project", Projects.id);
+  if (jobId) u.searchParams.set("video", `animated/${jobId}`);
+  link.href = u.pathname + u.search;
+}
+
+function animDiagBadgeClass(aptidao) {
+  if (aptidao === "FAVORÁVEL A LOOP NATURAL") return "is-good";
+  if (aptidao === "ADEQUADO À SÍNTESE" || aptidao === "CORRIGÍVEL") return "is-synth";
+  if (aptidao === "DIFÍCIL / RESULTADO CONDICIONAL") return "is-warn";
+  return "is-bad";
+}
+
+function renderAnimDiagnostic(diag) {
+  const body = $("anim-diag-body");
+  if (!body || !diag || !diag.fields) return;
+  const f = diag.fields;
+  body.replaceChildren();
+
+  const banner = document.createElement("div");
+  banner.className = "anim-diag-banner";
+  const badge = document.createElement("span");
+  badge.className = `anim-diag-badge ${animDiagBadgeClass(diag.aptidao)}`;
+  badge.textContent = diag.aptidao;
+  const summary = document.createElement("p");
+  summary.className = "anim-diag-summary";
+  summary.textContent = diag.resumo || "";
+  banner.append(badge, summary);
+  body.append(banner);
+
+  const kvPairs = [
+    ["MATERIAL", f.material],
+    ["DURAÇÃO", f.duracao],
+    ["RESOLUÇÃO", f.resolucao],
+    ["FPS", f.fps],
+    ["QUALIDADE", f.qualidade],
+    ["MOVIMENTO", f.movimento],
+    ["ESTABILIDADE", f.estabilidade],
+    ["PERIODICIDADE", f.periodicidade],
+    ["APTIDÃO", f.aptidao],
+    ["MELHOR TRECHO", f.melhor_trecho],
+    ["MELHOR RESOLUÇÃO", f.melhor_resolucao],
+    ["MELHOR CADÊNCIA", f.melhor_cadencia],
+    ["MELHOR ESTRATÉGIA", f.melhor_estrategia],
+    ["QUALIDADE ESPERADA", f.qualidade_esperada],
+    ["CONFIANÇA", f.confianca],
+    ["PRÓXIMO PASSO", f.proximo_passo],
+  ];
+
+  const dl = document.createElement("dl");
+  dl.className = "anim-diag-kv";
+  for (const [label, val] of kvPairs) {
+    const item = document.createElement("div");
+    item.className = "anim-diag-item";
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = val || "—";
+    item.append(dt, dd);
+    dl.append(item);
+  }
+  body.append(dl);
+
+  const listSpecs = [
+    ["PONTOS FORTES", f.pontos_fortes],
+    ["PONTOS FRACOS", f.pontos_fracos],
+    ["O QUE FALTA", f.o_que_falta],
+    ["O QUE PODE SER CORRIGIDO", f.o_que_pode_ser_corrigido],
+    ["O QUE NÃO PODE SER GARANTIDO", f.o_que_nao_pode_ser_garantido],
+  ];
+  const lists = document.createElement("div");
+  lists.className = "anim-diag-lists";
+  for (const [title, items] of listSpecs) {
+    const card = document.createElement("article");
+    card.className = "anim-diag-list-card";
+    const h4 = document.createElement("h4");
+    h4.textContent = title;
+    const ul = document.createElement("ul");
+    const arr = Array.isArray(items) && items.length ? items : ["Nenhum ponto registrado."];
+    for (const entry of arr) {
+      const li = document.createElement("li");
+      li.textContent = entry;
+      ul.append(li);
+    }
+    card.append(h4, ul);
+    lists.append(card);
+  }
+  body.append(lists);
+  body.hidden = false;
+}
+
+function setAnimDiagRunning(running) {
+  animDiag.running = running;
+  const runBtn = $("anim-diag-run");
+  const cancelBtn = $("anim-diag-cancel");
+  const prog = $("anim-diag-progress");
+  if (runBtn) runBtn.disabled = running || !anim.jobId || !Projects.id;
+  if (cancelBtn) cancelBtn.hidden = !running;
+  if (prog) prog.hidden = !running;
+}
+
+async function cancelAnimDiagnostic({ quiet = false } = {}) {
+  clearTimeout(animDiag.pollTimer);
+  animDiag.pollTimer = 0;
+  animDiag.runSeq++;
+  const activeTask = animDiag.taskId;
+  animDiag.taskId = null;
+  setAnimDiagRunning(false);
+  if (activeTask && Projects.id) {
+    api(`/api/ouroboros/jobs/${encodeURIComponent(activeTask)}/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }).catch(() => { /* best effort cancel */ });
+  }
+  if (!quiet && $("anim-diag-status")) {
+    $("anim-diag-status").textContent =
+      "Diagnóstico cancelado. O vídeo importado permanece disponível para edição e exportação.";
+  }
+}
+
+function resetAnimDiagnostic() {
+  cancelAnimDiagnostic({ quiet: true });
+  animDiag.jobId = null;
+  const sec = $("anim-diagnostic");
+  const body = $("anim-diag-body");
+  if (sec) sec.hidden = true;
+  if (body) { body.replaceChildren(); body.hidden = true; }
+  if ($("anim-diag-status")) $("anim-diag-status").textContent = "Aguardando análise…";
+  if ($("anim-diag-progress")) $("anim-diag-progress").value = 0;
+  syncAnimDiagLink(null);
+}
+
+function prepareAnimDiagnosticPanel(jobId, { autoRun = false } = {}) {
+  const sec = $("anim-diagnostic");
+  if (!sec || !jobId) return;
+  animDiag.jobId = jobId;
+  sec.hidden = false;
+  syncAnimDiagLink(jobId);
+  if (!Projects.id) {
+    setAnimDiagRunning(false);
+    if ($("anim-diag-body")) { $("anim-diag-body").replaceChildren(); $("anim-diag-body").hidden = true; }
+    if ($("anim-diag-status")) {
+      $("anim-diag-status").textContent =
+        "Sessão avulsa: abra ou crie um projeto para executar o diagnóstico automático inteligente.";
+    }
+    return;
+  }
+  if (autoRun) {
+    startAnimDiagnostic(jobId);
+  } else {
+    setAnimDiagRunning(false);
+    if ($("anim-diag-status")) {
+      $("anim-diag-status").textContent =
+        "Vídeo carregado no projeto. Toque em 'Reanalisar vídeo' para consultar ou gerar o diagnóstico completo.";
+    }
+  }
+}
+
+async function startAnimDiagnostic(jobId = anim.jobId) {
+  if (!jobId || !Projects.id) {
+    prepareAnimDiagnosticPanel(jobId, { autoRun: false });
+    return;
+  }
+  await cancelAnimDiagnostic({ quiet: true });
+  const seq = ++animDiag.runSeq;
+  animDiag.jobId = jobId;
+  const sec = $("anim-diagnostic");
+  const statusEl = $("anim-diag-status");
+  const progEl = $("anim-diag-progress");
+  const bodyEl = $("anim-diag-body");
+  if (sec) sec.hidden = false;
+  syncAnimDiagLink(jobId);
+  if (bodyEl) bodyEl.hidden = true;
+  if (progEl) progEl.value = 5;
+  if (statusEl) statusEl.textContent = "Iniciando diagnóstico automático em segundo plano…";
+  setAnimDiagRunning(true);
+
+  try {
+    const ticket = await api("/api/ouroboros/deluxe/diagnose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "animated", id: jobId }),
+    });
+    if (seq !== animDiag.runSeq) return;
+    animDiag.taskId = ticket.id;
+
+    const poll = async () => {
+      if (seq !== animDiag.runSeq || !animDiag.taskId) return;
+      try {
+        const st = await api(`/api/ouroboros/jobs/${encodeURIComponent(animDiag.taskId)}`);
+        if (seq !== animDiag.runSeq) return;
+        if (st.state === "working") {
+          if (statusEl) statusEl.textContent = st.stage || "Analisando movimento, estabilidade e periodicidade…";
+          if (progEl) progEl.value = Number(st.percent || 10);
+          animDiag.pollTimer = setTimeout(poll, 450);
+          return;
+        }
+        animDiag.taskId = null;
+        setAnimDiagRunning(false);
+        if (st.state === "cancelled") {
+          if (statusEl) {
+            statusEl.textContent =
+              "Diagnóstico cancelado. O vídeo importado permanece disponível para edição e exportação.";
+          }
+          return;
+        }
+        if (st.state !== "ready" || !st.key) {
+          if (statusEl) statusEl.textContent = `Diagnóstico indisponível: ${st.stage || "falha na análise"}.`;
+          return;
+        }
+        const report = await api(`/api/ouroboros/result/${encodeURIComponent(st.key)}`);
+        if (seq !== animDiag.runSeq) return;
+        if (report?.mediaDiagnostic) {
+          renderAnimDiagnostic(report.mediaDiagnostic);
+          if (statusEl) {
+            statusEl.textContent =
+              `Diagnóstico concluído (${report.mediaDiagnostic.aptidao}) · cache compartilhado com o Ouroboros Deluxe.`;
+          }
+        } else if (statusEl) {
+          statusEl.textContent = "Diagnóstico concluído sem relatório detalhado.";
+        }
+      } catch (err) {
+        if (seq !== animDiag.runSeq) return;
+        animDiag.taskId = null;
+        setAnimDiagRunning(false);
+        if (statusEl) {
+          statusEl.textContent = `Não foi possível concluir o diagnóstico (${err.message}). O vídeo continua pronto para uso.`;
+        }
+      }
+    };
+
+    poll();
+  } catch (err) {
+    if (seq !== animDiag.runSeq) return;
+    animDiag.taskId = null;
+    setAnimDiagRunning(false);
+    if (statusEl) {
+      statusEl.textContent = `Diagnóstico em espera (${err.message}). O vídeo continua pronto para edição e exportação.`;
+    }
+  }
+}
+
 async function animatedUpload(file) {
   const fd = new FormData();
   fd.append("file", file);
@@ -323,6 +579,7 @@ async function animatedUpload(file) {
     await loadBitmaps(data.frames);
     applyAnimatedPayload(data);
     player.start();
+    prepareAnimDiagnosticPanel(data.job_id, { autoRun: true });
   } catch (err) {
     toast(err.message);
     resetAnimated();
@@ -397,6 +654,7 @@ function resetAnimated() {
   anim.bitmaps.forEach((b) => b.close?.());
   anim.bitmaps = [];
   anim.jobId = null;
+  resetAnimDiagnostic();
   syncRafOverlap();
   guardarSesion();
   $("anim-drop").hidden = false;
@@ -854,6 +1112,7 @@ async function useLibraryAsset(id, slot) {
       $("anim-result").hidden = true;
       applyAnimatedPayload(data);
       if ($("panel-backgrounds").classList.contains("is-active")) player.start();
+      prepareAnimDiagnosticPanel(data.job_id, { autoRun: true });
     } else if (slot === "bgm") {
       paintBgm(data);
     } else if (sfx.catalog.some((spec) => spec.id === slot)) {
@@ -1139,6 +1398,7 @@ async function restoreEditorState(d, project = false) {
         $("anim-workspace").hidden = false;
         applyAnimatedPayload(data);
         player.draw();
+        prepareAnimDiagnosticPanel(data.job_id, { autoRun: false });
         vivos++;
       } catch { perdidos++; }
     }
@@ -2203,6 +2463,21 @@ $("anim-scrub").addEventListener("input", (e) => {
 });
 $("anim-export").addEventListener("click", animatedExport);
 $("anim-reset").addEventListener("click", resetAnimated);
+if ($("anim-diag-run")) {
+  $("anim-diag-run").addEventListener("click", () => startAnimDiagnostic(anim.jobId));
+}
+if ($("anim-diag-cancel")) {
+  $("anim-diag-cancel").addEventListener("click", () => cancelAnimDiagnostic());
+}
+if ($("anim-diag-ouroboros")) {
+  $("anim-diag-ouroboros").addEventListener("click", async (event) => {
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    const href = $("anim-diag-ouroboros").href;
+    if (Projects.id) await Projects.flush();
+    location.assign(href);
+  });
+}
 
 
 // Space = play/pause, arrows = frame by frame. Only with the player visible:

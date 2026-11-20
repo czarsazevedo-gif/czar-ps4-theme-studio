@@ -17,6 +17,7 @@ from ..projects import JobId
 from . import DELUXE_VERSION
 from .calibrator import calibrate_interval
 from .circulo_supreme import search_supreme
+from .media_diagnostic import build_media_diagnostic
 from .pipeline import RenderMode, apply_deluxe_to_project, render_deluxe_loop
 from .regions import RegionalRecipe, list_recipes, load_recipe, save_recipe
 
@@ -60,8 +61,8 @@ def _render_fingerprint(sha: str, item: RenderRequest, resolved_recipe: Regional
     return io_media.fingerprint([DELUXE_VERSION, "render", sha, sig_payload])
 
 
-@router.post("/analyze", status_code=202)
-def deluxe_analyze(request: Request, item: DeluxeSource):
+def _submit_deluxe_analysis(request: Request, item: DeluxeSource):
+    """Run Sentinela + Círculo Supreme + 21-field Media Diagnostic under one shared cache key."""
     from .. import ouroboros as core
 
     root = core.workspace()
@@ -69,7 +70,7 @@ def deluxe_analyze(request: Request, item: DeluxeSource):
 
     def prepare(task):
         sha = io_media.digest(path, task.check)
-        key = io_media.fingerprint([DELUXE_VERSION, "analyze", sha, item.model_dump()])
+        key = io_media.fingerprint([DELUXE_VERSION, "analyze_v2", sha, item.model_dump()])
 
         def calculate(folder: Path):
             result = search_supreme(
@@ -86,11 +87,23 @@ def deluxe_analyze(request: Request, item: DeluxeSource):
                 name=name,
                 sha256=sha,
             )
+            result["mediaDiagnostic"] = build_media_diagnostic(result, filename=name)
             return result
 
         return key, calculate
 
     return core.submit(root, "deluxe-analyze:" + item.model_dump_json(), prepare)
+
+
+@router.post("/analyze", status_code=202)
+def deluxe_analyze(request: Request, item: DeluxeSource):
+    return _submit_deluxe_analysis(request, item)
+
+
+@router.post("/diagnose", status_code=202)
+def deluxe_diagnose(request: Request, item: DeluxeSource):
+    """Non-blocking, cancellable automatic post-import media diagnostic sharing the analysis cache."""
+    return _submit_deluxe_analysis(request, item)
 
 
 @router.post("/calibrate", status_code=202)
