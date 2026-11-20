@@ -256,3 +256,29 @@ def frame(key: AssetId, name: str):
     if not re.fullmatch(r"[0-9]{2}\.webp", name) or not (folder / name).is_file():
         raise HTTPException(404, "Quadro indisponível.")
     return FileResponse(folder / name, media_type="image/webp")
+
+
+class Synthesis(Source):
+    axis: Literal["horizontal","vertical"] = "horizontal"
+    resolution: int = Field(ge=0,le=2)
+    rate: float = Field(ge=.5,le=2)
+
+
+@router.post("/genesis",status_code=202)
+def synthesize(request: Request,item: Synthesis):
+    from . import genesis
+    root=workspace()
+    path,duration,_=source(request,item)
+    def prepare(task):
+        key=media.fingerprint(["genesis-1",media.digest(path,task.check),item.model_dump()])
+        return key,lambda folder:genesis.render(path,duration,folder,genesis.ANIMATED_SIZES[item.resolution],
+            item.axis,item.rate,task.progress,task.check)
+    return submit(root,item.model_dump_json(),prepare)
+
+
+@router.get("/genesis/{key}/{artifact}")
+def synthesis_artifact(key: AssetId,artifact: Literal["source.png","background.raf.zip"]):
+    folder,data=record(workspace(),key)
+    if data.get("type")!="genesis" or not (folder/artifact).is_file():
+        raise HTTPException(404,"Derivado indisponível.")
+    return FileResponse(folder/artifact,filename=artifact if artifact.endswith(".zip") else None)
