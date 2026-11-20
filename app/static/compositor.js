@@ -131,7 +131,7 @@ const Compositor = (() => {
       ctx.fillStyle = "#000"; ctx.fillRect(0, 0, w, h);
     }
     if (target === "animated" && anim.bitmaps.length) {
-      ctx.drawImage(Motion.base(draw) || anim.bitmaps[0], 0, 0, w, h);
+      ctx.drawImage(anim.bitmaps[0], 0, 0, w, h);
     }
     const base = current.base && target !== "animated" && sourceFor(target);
     if (base) {
@@ -428,9 +428,9 @@ const Compositor = (() => {
     gesture = null;
   }
 
-  const previewNeeded = () => (bgMode() === "animated" && !!Motion.activeKey()) || Object.keys(state.surfaces).some((target) =>
+  const previewNeeded = () => Object.keys(state.surfaces).some((target) =>
     has(target) && (target !== "animated" || bgMode() === "animated"));
-  const key = () => JSON.stringify([state, slots.chosen, bgMode(), anim.jobId, anim.size, anim.frameCount, Motion.activeKey()]);
+  const key = () => JSON.stringify([state, slots.chosen, bgMode(), anim.jobId, anim.size, anim.frameCount]);
   const previewReady = () => readyKey === key();
   const previewImage = (target) => previews[target] ||
     (fallsBackToHome(target) && !slots.chosen[target] && previews.home) || null;
@@ -507,11 +507,10 @@ const Compositor = (() => {
       return response;
     }
     try {
-      if (bgMode() === "animated" && Motion.activeKey()) frames.push(...await Motion.previewFrames(controller.signal));
       for (const [target, part] of Object.entries(state.surfaces)) {
         if (!part.layers.length) continue;
         if (target === "animated") {
-          if (bgMode() !== "animated" || Motion.activeKey()) continue;
+          if (bgMode() !== "animated") continue;
           if (!anim.jobId) throw new Error("Importe a fonte animada para conferir a composição.");
           const response = await check(await post("/api/composition/animation", {
             job: anim.jobId, size: anim.size, frames: anim.frameCount, surface: part,

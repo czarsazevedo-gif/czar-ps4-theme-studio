@@ -31,7 +31,6 @@
 __pycache__/
 *.py[cod]
 .venv/
-.venv-motion/
 venv/
 *.egg-info/
 

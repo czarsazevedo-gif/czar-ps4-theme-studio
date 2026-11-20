@@ -8,7 +8,6 @@
   <link rel="stylesheet" href="/static/projects.css">
   <link rel="stylesheet" href="/static/library.css">
   <link rel="stylesheet" href="/static/compositor.css">
-  <link rel="stylesheet" href="/static/motion.css">
   <script src="/static/i18n.js"></script>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎮</text></svg>">
 </head>
@@ -102,7 +101,6 @@
 <nav class="tabs" role="tablist">
   <button class="tab is-active" data-tab="backgrounds" role="tab" data-i18n="tab.backgrounds"></button>
   <button class="tab" data-tab="icons" role="tab" data-i18n="tab.icons"></button>
-  <button class="tab" data-tab="motion" role="tab">Loops</button>
   <button class="tab" data-tab="compositor" role="tab">Compor</button>
   <button class="tab" data-tab="sounds" role="tab" data-i18n="tab.sounds"></button>
   <button class="tab" data-tab="preview" role="tab" data-i18n="tab.preview"></button>
@@ -110,49 +108,6 @@
 </nav>
 
 <main>
-
-  <section class="panel" id="panel-motion" aria-labelledby="motion-title">
-    <header class="motion-heading"><div><h2 id="motion-title">Laboratório de loops</h2><p id="motion-source">Abra um projeto e escolha um fundo animado.</p></div>
-      <button class="btn btn-ghost" id="motion-choose">Escolher fonte animada</button></header>
-    <div id="motion-editor" hidden>
-      <div class="motion-grid">
-        <div class="motion-monitor">
-          <div class="motion-screen"><canvas id="motion-canvas" width="640" height="360" aria-label="Monitor dos quadros renderizados"></canvas>
-            <video id="motion-original" playsinline controls preload="none" hidden></video><img id="motion-gif" alt="Animação original" hidden>
-            <p id="motion-placeholder">Renderize um trecho para inspecionar a junção.</p></div>
-          <div class="motion-row"><label>Comparar <select id="motion-view"><option value="raf">RAF final · DDS</option><option value="cut">Corte sem refinamento</option><option value="opt">Loop otimizado</option><option value="original">Fonte original</option></select></label>
-            <label>Reprodução <select id="motion-speed"><option value="1">Normal · 1×</option><option value="0.5">Diagnóstico · 0,5×</option><option value="0.25">Diagnóstico · 0,25×</option></select></label></div>
-          <div class="motion-row" id="motion-transport"><button id="motion-play">Reproduzir</button><button id="motion-prev" aria-label="Quadro anterior">Anterior</button><button id="motion-next" aria-label="Próximo quadro">Próximo</button><button id="motion-seam">Ver a junção</button>
-            <label><input id="motion-repeat" type="checkbox" checked> Repetir</label><label><input id="motion-count" type="checkbox"> Mostrar voltas</label></div>
-          <output id="motion-position"></output><output id="motion-turns" hidden></output>
-          <div class="motion-row"><label>Zoom da timeline <select id="motion-zoom"><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
-            <button id="motion-mark-in">Marcar entrada</button><button id="motion-mark-out">Marcar saída</button></div>
-          <div id="motion-axis" aria-hidden="true"><span id="motion-selection"></span><span id="motion-points"></span><i id="motion-playhead"></i></div>
-          <div class="motion-scroll" tabindex="0" aria-label="Miniaturas e indicadores de movimento. Deslize na horizontal."><div id="motion-strip"></div></div>
-          <label>Instante na fonte <output id="motion-time">0 s</output><input type="range" id="motion-cursor" min="0" max="1" step="0.001" value="0"></label>
-          <div id="motion-candidates" aria-label="Candidatos à junção"></div>
-        </div>
-        <aside class="motion-inspector">
-          <label>Perfil <select id="motion-profile"><option value="smooth">Movimento suave</option><option value="cinema">Qualidade cinematográfica</option><option value="long">Loop prolongado</option><option value="custom">Personalizado</option></select></label>
-          <button class="btn btn-primary" id="motion-analyze">Procurar junções</button>
-          <div class="motion-fields"><label>Entrada (s)<input type="number" id="motion-start" min="0" step="0.001"></label><label>Saída exclusiva (s)<input type="number" id="motion-end" min="0" step="0.001"></label>
-            <label>Duração (s)<input type="number" id="motion-length" min="0.06" step="0.001"></label><label>Quadros<input type="number" id="motion-frames" min="3" max="48" step="1"></label>
-            <label>FPS desejado<input type="number" id="motion-fps" min="0.2" max="50" step="0.01"></label><label>Resolução<select id="motion-size"></select></label></div>
-          <label>Estratégia <select id="motion-strategy"><option value="cut">Corte otimizado</option><option value="align">Testar alinhamento local</option><option value="texture">Recorrência de textura</option></select></label>
-          <details id="motion-mask" hidden><summary>Proteger uma região do alinhamento</summary><label><input type="checkbox" id="motion-protect"> Usar retângulo protegido</label>
-            <div class="motion-fields"><label>Esquerda (%)<input id="motion-left" type="number" min="0" max="99" value="0"></label><label>Topo (%)<input id="motion-top" type="number" min="0" max="99" value="0"></label><label>Direita (%)<input id="motion-right" type="number" min="1" max="100" value="50"></label><label>Base (%)<input id="motion-bottom" type="number" min="1" max="100" value="100"></label></div></details>
-          <div class="motion-budget"><b>Orçamento RAF</b><progress id="motion-budget-bar" max="100" value="0"></progress><output id="motion-budget"></output></div>
-          <div class="motion-row"><button id="motion-undo">Desfazer</button><button id="motion-redo">Refazer</button></div>
-          <button id="motion-render" class="btn btn-primary">Renderizar e verificar</button>
-          <progress id="motion-progress" max="100" value="0" aria-label="Progresso da operação" hidden></progress>
-          <p role="status" id="motion-status"></p><button id="motion-cancel" hidden>Cancelar processamento</button>
-        </aside>
-      </div>
-      <section class="motion-finish" id="motion-report" hidden><h3>Verificação do acabamento</h3><p id="motion-verdict"></p><div id="motion-measures"></div>
-        <div class="motion-row"><button id="motion-apply" class="btn btn-primary">Aplicar ao tema</button><a id="motion-download" class="btn btn-ghost" download>Baixar background.raf.zip</a></div></section>
-      <button id="motion-off" hidden>Desativar loop aplicado</button>
-    </div>
-  </section>
 
   <section class="panel" id="panel-compositor" aria-label="Editar composição">
     <p id="comp-no-project">Abra ou crie um projeto para editar camadas.</p>
@@ -336,7 +291,6 @@
             <select id="anim-backend" class="select"></select>
           </div>
 
-          <p id="motion-active-note" hidden>O laboratório controla o RAF e a prévia PS4. Os controles desta aba mostram a fonte inteira.</p>
           <button id="anim-export" class="btn btn-primary btn-block">
             <span data-i18n="bg.export"></span> <span class="dim">background.raf.zip</span>
           </button>
@@ -578,7 +532,6 @@
 <script src="/static/projects.js"></script>
 <script src="/static/library.js"></script>
 <script src="/static/compositor.js"></script>
-<script src="/static/motion.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

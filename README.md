@@ -1,8 +1,6 @@
 # Czar PS4 Theme Studio
 
-No Chrome do tablet, abra a branch `feature/studio-infinite-motion-v1` e crie um Codespace nela em **Code → Codespaces**. Na primeira abertura, o devcontainer instala FFmpeg e compila os módulos livres do OpenCV usados pelo laboratório em CPU. Aguarde o fim da preparação, execute `./start.sh` no terminal e abra a porta **8000**, com visibilidade **Privada**, no painel **Portas**. O endereço encaminhado segue a forma `https://<nome-do-codespace>-8000.app.github.dev`. Para atualizar as dependências de um Codespace já preparado para esta branch, execute `./.devcontainer/install-motion.sh`.
-
-Em um projeto, selecione **Fundo → Animado** e importe um vídeo, ou aplique um da Biblioteca. Em **Loops**, procure junções, selecione um candidato e toque em **Renderizar e verificar**. O monitor toca os próprios quadros DDS e permite comparar a fonte, o corte e o refinamento. **Aplicar ao tema** usa a mesma cena na prévia PS4 e no ZIP de recursos. [Laboratório, medições e aceitação no tablet](docs/infinite-motion-v1.md)
+Para testar a fase 3.3 no Chrome do tablet, abra a branch `feature/studio-visual-compositor-v1`. Em **Code → Codespaces**, crie um Codespace nessa branch. Aguarde a instalação de Python, FFmpeg e dependências pelo devcontainer, execute `./start.sh` no terminal e abra a porta **8000** no painel **Portas**. Confira se a visibilidade está **Privada**. Em um Codespace existente, execute antes `python -m pip install -r requirements.txt`.
 
 Abra um projeto e use **Compor** para montar os fundos, sobrepor imagens a uma fonte animada e enquadrar ícones. **Prévia PS4** renderiza as camadas antes de mostrá-las nas três telas. Em **Pacote**, **Exportar recursos do tema (ZIP)** baixa os recursos processados, independentemente da disponibilidade de um empacotador PKG. [Compositor e roteiro de aceitação](docs/compositor-v1.md)
 

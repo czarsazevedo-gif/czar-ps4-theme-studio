@@ -10,7 +10,7 @@
       "requireLocalPort": true
     }
   },
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg build-essential cmake ninja-build curl && ./.devcontainer/install-motion.sh",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg && python -m pip install -r requirements.txt",
   "postStartCommand": "test -x ./start.sh && command -v ffprobe",
   "containerEnv": {
     "PYTHONUNBUFFERED": "1"

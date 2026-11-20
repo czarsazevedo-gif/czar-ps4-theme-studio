@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import math
-import shutil
 import tempfile
 import time
 import zipfile
@@ -21,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from pydantic import BaseModel, ConfigDict
 
-from . import at9, compositor, jobs, library, mdx, media, motion, pkg, projects, raf, theme, theme_xml, vag
+from . import at9, compositor, jobs, library, mdx, media, pkg, projects, raf, theme, theme_xml, vag
 from .config import (
     ANIMATED_FRAME_BYTES,
     ANIMATED_SIZE,
@@ -62,7 +61,6 @@ app.middleware("http")(projects.scope_jobs)
 app.include_router(projects.router)
 app.include_router(library.router)
 app.include_router(compositor.router)
-app.include_router(motion.router)
 
 #: The UI used to allow going over the cap "so the red bar could be seen".
 #: That let you assemble a theme the console rejects with CE-38196-7, so it no
@@ -272,21 +270,10 @@ async def animated_export(
     backend: str = Form(DEFAULT_BACKEND),
     composition: str | None = Form(None),
     animation_size: str = Form(""),
-    motion_key: str | None = Form(None),
 ) -> dict:
     """Converts to .dds, writes the full RAF scene and assembles the .zip."""
     job = _get_job("animated", job_id)
     state = compositor.load_composition(composition)
-    ready = motion.applied(job, motion_key, state)
-    if ready:
-        folder, report = ready
-        return {
-            "job_id": job.id, "download": f"/api/motion/results/{report['key']}/background.raf.zip",
-            "frames": report["frames"], "wait": report["wait"], "backend": "native",
-            "dds_bytes": report["ddsBytes"], "zip_bytes": report["zipBytes"], "elapsed": report["seconds"],
-            "index_xml": (folder / "background.raf" / "index.xml").read_text(encoding="utf-8"),
-            "budget": _budget(report["frames"], tuple(report["clip"]["size"])),
-        }
     has_overlay = bool(state and state.surface("animated"))
     size = _composed_animation_size(job, animation_size if has_overlay else "")
     frame_count = _clamp_frames(frames, size)
@@ -332,22 +319,20 @@ async def animated_export(
     }
 
 
-def _write_raf_export(job, destination, frame_count, size, wait, backend, overlay=None, *, encoded=None):
+def _write_raf_export(job, destination, frame_count, size, wait, backend, overlay=None):
     raf_dir = destination / "background.raf"
     if raf_dir.exists():
         for stale in raf_dir.iterdir():
             stale.unlink()
     raf_dir.mkdir(parents=True, exist_ok=True)
 
+    info = media.probe(job.source)
     total_bytes = 0
     written = 0
 
-    if encoded is None:
-        info = media.probe(job.source)
-        frames_in = media.iter_raw_frames(job.source, frame_count, size, info.duration)
-        encoded = encode_sequence(compositor.compose_frames(frames_in, overlay), backend)
+    frames_in = media.iter_raw_frames(job.source, frame_count, size, info.duration)
     names: list[str] = []
-    for index, blob in encoded:
+    for index, blob in encode_sequence(compositor.compose_frames(frames_in, overlay), backend):
         name = theme.frame_name(index)
         (raf_dir / name).write_bytes(blob)
         names.append(name)
@@ -936,7 +921,6 @@ def _collect_theme_assets(
     animated_job: str = "", frames: int = 24, wait_seconds: float = 0.1,
     backend: str = DEFAULT_BACKEND,
     composition=None, direct_slots: set[str] | None = None, animation_size: str = "",
-    motion_scene=None,
 ) -> list[dict]:
     """Assembles the theme tree inside the content folder.
 
@@ -991,13 +975,7 @@ def _collect_theme_assets(
             media.render_image(home, pic1, PIC1_SIZE)
             _add(included, "pic1 (ficha)", pic1, PKG_FIXED_PATHS["pic1"])
 
-    if motion_scene:
-        folder, report = motion_scene
-        dest = content_dir / THEME_PATHS["raf_dir"]
-        shutil.copytree(folder / "background.raf", dest)
-        included.append({"asset": "Loop do laboratório", "path": THEME_PATHS["raf_dir"],
-                         "bytes": sum(p.stat().st_size for p in dest.iterdir())})
-    elif animated_job:
+    if animated_job:
         anim_job = _get_job("animated", animated_job)
         included.append(
             _add_animated_scene(anim_job, frames, wait_seconds, backend, content_dir, composition, animation_size)
@@ -1073,7 +1051,6 @@ async def package_build(
     composition_mode: str = Form(""),
     animation_size: str = Form(""),
     artifacts_only: bool = Form(False),
-    motion_key: str | None = Form(None),
 ) -> dict:
     """Assembles the theme tree and builds the .pkg.
 
@@ -1108,8 +1085,7 @@ async def package_build(
 
     frame_count = frames
     animation_size = animation_size if has_overlay else ""
-    motion_scene = motion.applied(_get_job("animated", animated_job), motion_key, state) if animated_job else None
-    if animated_job and not motion_scene:
+    if animated_job:
         anim_size = _composed_animation_size(_get_job("animated", animated_job), animation_size)
         frame_count = _clamp_frames(frames, anim_size)
         if has_overlay and frame_count != frames:
@@ -1168,7 +1144,6 @@ async def package_build(
             backend=backend, composition=state,
             direct_slots={key for key, value in raw_slots.items() if value},
             animation_size=animation_size,
-            motion_scene=motion_scene,
         )
         if artifacts_only:
             archive = work_dir / "recursos-tema.zip"
