@@ -934,3 +934,139 @@ def compare_before_after(before: dict, after: dict) -> dict:
         "regressions": regressions,
         "matrix": matrix,
     }
+
+
+def check_prohibited_artifacts(eval_report: dict) -> dict:
+    """Explicitly check every prohibited loop artifact from Section 20.
+
+    Prohibited approvals:
+      - ping-pong / artificial reversal
+      - disguised freeze / duplicate stall
+      - gross ghosting / destructive crossfade
+      - excessive blur / texture loss
+      - protected-region deformation
+      - abrupt position or velocity jump
+    """
+    m = eval_report.get("metrics") or {}
+    vs = m.get("visualSimilarity") or {}
+    fc = m.get("flowContinuity") or {}
+    vc = m.get("velocityContinuity") or {}
+    gh = m.get("ghosting") or {}
+    tp = m.get("texturePreservation") or {}
+    st = m.get("staticIntegrity") or {}
+    rv = m.get("reversals") or {}
+    fz = m.get("freezes") or {}
+
+    violations: list[str] = []
+    if rv.get("detected"):
+        violations.append("Inversão artificial / efeito ping-pong detectado.")
+    if fz.get("detected"):
+        violations.append("Congelamento ou repetição disfarçada detectada.")
+    if gh.get("detected") or float(gh.get("score", 0.0)) > 0.35:
+        violations.append("Ghosting grosseiro ou crossfade destrutivo na junção.")
+    if float(tp.get("sharpnessRetention", 1.0)) < 0.70:
+        violations.append("Perda excessiva de nitidez/textura.")
+    if st.get("checked") and float(st.get("maxAbsDiff", 0.0)) > 6.0:
+        violations.append("Deformação indevida em região estática protegida.")
+    if fc.get("directionMeasured") and (
+        float(fc.get("seamDirectionCosine", 1.0)) < 0.30 or float(fc.get("seamOppositeFraction", 0.0)) > 0.35
+    ):
+        violations.append("Inversão ou quebra severa da direção do movimento na junção.")
+    if float(vs.get("seamRatio", 1.0)) > 2.2 or float(vc.get("relativeJump", 0.0)) > 0.85:
+        violations.append("Salto abrupto de posição ou velocidade no fechamento do ciclo.")
+
+    return {
+        "clean": len(violations) == 0,
+        "violations": violations,
+    }
+
+
+def classify_loop_verdict(eval_report: dict, ten_cycle: dict | None = None) -> dict:
+    """Honest verdict classification: APROVADO, CONDICIONAL, or REPROVADO (never falsifies quality)."""
+    prohibited = check_prohibited_artifacts(eval_report)
+    issues = list(eval_report.get("issues") or [])
+    m = eval_report.get("metrics") or {}
+    dds_d = m.get("ddsDelta") or {}
+    within_budget = bool(dds_d.get("withinBudget", True))
+    distinct = int(dds_d.get("distinctFrames", eval_report.get("frames", 0)))
+    ten_ok = bool(ten_cycle.get("continuousTenCyclePass", False)) if ten_cycle else bool(eval_report.get("passed"))
+
+    if not within_budget or distinct < 2:
+        return {
+            "verdict": "REPROVADO",
+            "approved": False,
+            "summary": "Sequência inválida para PS4 (estática, congelada ou fora do orçamento de 6 MiB).",
+            "prohibited": prohibited,
+        }
+    if not prohibited["clean"]:
+        return {
+            "verdict": "REPROVADO",
+            "approved": False,
+            "summary": prohibited["violations"][0],
+            "prohibited": prohibited,
+        }
+    if eval_report.get("passed") and ten_ok and len(issues) == 0:
+        return {
+            "verdict": "APROVADO",
+            "approved": True,
+            "summary": "Loop contínuo aprovado após codificação DXT1a real e auditoria de 10 ciclos.",
+            "prohibited": prohibited,
+        }
+    return {
+        "verdict": "CONDICIONAL",
+        "approved": False,
+        "summary": (
+            f"Resultado condicional pós-DDS ({len(issues)} alerta(s)): "
+            + (issues[0] if issues else "inspecione a junção antes de aplicar.")
+        ),
+        "prohibited": prohibited,
+    }
+
+
+def evaluate_raf_zip(raf_zip_path, *, protected_mask: np.ndarray | None = None) -> dict:
+    """Independently decode an exported `background.raf.zip` (DXT1a DDS + plane.mdx + index.xml) and validate."""
+    import re
+    import zipfile
+    from pathlib import Path
+
+    p = Path(raf_zip_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Arquivo RAF ausente: {p}")
+
+    with zipfile.ZipFile(p, "r") as zf:
+        names = zf.namelist()
+        xml_entries = [n for n in names if n.endswith("/index.xml") or n == "index.xml"]
+        mdx_entries = [n for n in names if n.endswith("/plane.mdx") or n == "plane.mdx"]
+        dds_entries = sorted(n for n in names if n.endswith(".dds"))
+        if not xml_entries or not mdx_entries or not dds_entries:
+            raise ValueError("RAF ZIP incompleto: exige index.xml, plane.mdx e arquivos .dds.")
+
+        xml_text = zf.read(xml_entries[0]).decode("utf-8")
+        m_wait = re.search(r'<case\s+wait="([0-9.]+)"', xml_text)
+        wait_sec = float(m_wait.group(1)) if m_wait else 0.1
+        dds_blobs = [zf.read(n) for n in dds_entries]
+
+    total_bytes = sum(len(b) for b in dds_blobs)
+    decoded_frames = []
+    for blob in dds_blobs:
+        if blob[:4] != b"DDS " or blob[84:88] != b"DXT1":
+            raise ValueError("Bloco DDS dentro do RAF ZIP não possui cabeçalho DXT1 válido.")
+        rgba = dxt1.decode_dds(blob)
+        decoded_frames.append(rgba[..., :3])
+
+    arr = np.stack(decoded_frames, axis=0)
+    ev = evaluate_loop(arr, wait_sec, protected_mask=protected_mask)
+    ten = evaluate_ten_cycles(ev)
+    verdict = classify_loop_verdict(ev, ten)
+    return {
+        "evaluatedFromRafZip": True,
+        "frames": len(dds_blobs),
+        "size": [int(arr.shape[2]), int(arr.shape[1])],
+        "wait": wait_sec,
+        "ddsBytes": total_bytes,
+        "withinBudget": total_bytes <= RAF_SIZE_LIMIT and len(dds_blobs) <= MAX_FRAME_COUNT,
+        "evaluation": ev,
+        "tenCycleAudit": ten,
+        "verdict": verdict,
+    }
+

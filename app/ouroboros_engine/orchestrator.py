@@ -322,6 +322,9 @@ class OuroborosEngine:
 
         overall_cmp = compare_before_after(raw_post_dds, final_post_dds)
         ten_cycle = evaluate_ten_cycles(final_post_dds)
+        from .metrics import classify_loop_verdict
+
+        verdict_info = classify_loop_verdict(final_post_dds, ten_cycle)
 
         # Attribute issues honestly: present in source baseline vs newly introduced by processing
         raw_issues = set(raw_post_dds.get("issues") or [])
@@ -372,6 +375,9 @@ class OuroborosEngine:
             "diffStats": {k: v for k, v in diff_info.items() if k != "heatmap"},
             "baselinePostDds": raw_post_dds,
             "finalPostDds": final_post_dds,
+            "verdict": verdict_info["verdict"],
+            "verdictSummary": verdict_info["summary"],
+            "prohibitedArtifacts": verdict_info["prohibited"],
             "issueAttribution": {
                 "sourceIssues": source_issues,
                 "introducedIssues": introduced_issues,
