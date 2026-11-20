@@ -394,7 +394,7 @@ def animated_preview_frame(job_id: str, name: str) -> FileResponse:
         raise HTTPException(404, "Frame not found.")
     path = job.preview_dir / name
     if not path.is_file():
-        raise HTTPException(404, "Frame no encontrado.")
+        raise HTTPException(404, "Quadro não encontrado.")
     return FileResponse(path, media_type="image/webp")
 
 
@@ -1088,7 +1088,7 @@ def _resolve_slot_jobs(raw: dict[str, str]) -> dict[str, jobs.Job]:
         if not job_id:
             continue
         if slot_id not in IMAGE_SLOTS:
-            raise HTTPException(422, f"Hueco desconocido: {slot_id}")
+            raise HTTPException(422, f"Slot desconhecido: {slot_id}")
         direct[slot_id] = _get_job("slot", job_id)
 
     resolved = dict(direct)
@@ -1112,7 +1112,7 @@ def audio_info(job_id: str) -> dict:
     slot_id = str(job.meta.get("slot") or "bgm")
     spec = AUDIO_SLOTS.get(slot_id)
     if spec is None:
-        raise HTTPException(404, f"Hueco de audio desconocido: {slot_id}")
+        raise HTTPException(404, f"Slot de áudio desconhecido: {slot_id}")
 
     converted = job.meta.get("converted")
     blob = job.out_dir / str(converted) if converted else job.source
@@ -1350,8 +1350,8 @@ def _add_animated_scene(
     theme.write_index_xml(raf_dir / "index.xml", raf.build_scene(names, wait_seconds))
 
     return {
-        "asset": "Fondo animado",
-        "path": f"{THEME_PATHS['raf_dir']}/ ({len(names)} .dds + plano + escena)",
+        "asset": "Fundo animado",
+        "path": f"{THEME_PATHS['raf_dir']}/ ({len(names)} .dds + plano + cena)",
         "bytes": total + len(plane),
     }
 

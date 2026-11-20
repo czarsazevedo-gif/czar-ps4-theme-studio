@@ -618,7 +618,7 @@ async function animatedExport() {
   const btn = $("anim-export");
   const original = btn.innerHTML;
   btn.disabled = true;
-  btn.textContent = "Convirtiendo a .dds…";
+  btn.textContent = "Convertendo para .dds…";
 
   const fd = new FormData();
   fd.append("frames", String(anim.frameCount));
@@ -632,14 +632,14 @@ async function animatedExport() {
     $("anim-result").innerHTML = `
       <p class="result-ok">${t("bg.result.ok", { n: r.frames, s: r.elapsed })}</p>
       <div class="result-rows">
-        <div class="result-row"><span>.dds totales</span><b>${fmtBytes(r.dds_bytes)}</b></div>
+        <div class="result-row"><span>.dds totais</span><b>${fmtBytes(r.dds_bytes)}</b></div>
         <div class="result-row"><span>zip</span><b>${fmtBytes(r.zip_bytes)}</b></div>
         <div class="result-row"><span>wait</span><b>${r.wait}</b></div>
         <div class="result-row"><span>encoder</span><b>${r.backend}</b></div>
       </div>
       <pre>${r.index_xml.replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]))}</pre>
       <a class="dl-btn" href="${Projects.mediaUrl(r.download)}" download>${t("bg.export")} background.raf.zip</a>`;
-    toast("Exportado correctamente.", "ok");
+    toast("Exportado com sucesso.", "ok");
   } catch (err) {
     toast(err.message);
   } finally {
@@ -700,7 +700,7 @@ function syncRafOverlap() {
     // and the subtitle stops advertising a file size that is no longer made.
     el.querySelector(".slot-name").textContent = lbl(hay ? spec.raf_label : spec.label);
     el.querySelector(".slot-sub").textContent =
-      hay ? "miniatura · icono · ficha" : el.dataset.sub;
+      hay ? t("slot.themePurpose") : el.dataset.sub;
     el.classList.toggle("is-repurposed", hay);
   });
 
@@ -2332,7 +2332,7 @@ async function boot() {
   try {
     sys = await api("/api/system");
   } catch {
-    toast("No se pudo contactar al backend.");
+    toast("Não foi possível conectar ao servidor.");
     return;
   }
 
@@ -2340,7 +2340,7 @@ async function boot() {
 
   $("sysinfo").innerHTML = [
     `<span class="pill ${sys.ffmpeg ? "ok" : "off"}">ffmpeg</span>`,
-    `<span class="pill ${sys.magick ? "ok" : "off"}">ImageMagick${sys.magick ? "" : " (no instalado)"}</span>`,
+    `<span class="pill ${sys.magick ? "ok" : "off"}">ImageMagick${sys.magick ? "" : " (não instalado)"}</span>`,
     `<span class="pill ok">encoder ${sys.default_backend}</span>`,
     `<span class="pill ${sys.pkg_tools ? "ok" : "off"}">pkg tools</span>`,
   ].join("");
