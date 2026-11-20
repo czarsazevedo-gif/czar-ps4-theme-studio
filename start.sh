@@ -2,8 +2,13 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
-if [[ -x ./.venv/bin/python ]]; then
+export PATH="$PWD/tools/bin:$PWD/tools/dotnet:$PATH"
+if [[ -n "${CZAR_VENV:-}" && -x "${CZAR_VENV}/bin/python" ]]; then
+  export PATH="${CZAR_VENV}/bin:$PATH"
+elif [[ -x ./.venv/bin/python ]]; then
   export PATH="$PWD/.venv/bin:$PATH"
+elif [[ -x "$HOME/.venv/bin/python" ]]; then
+  export PATH="$HOME/.venv/bin:$PATH"
 fi
 
 PY_BIN="$(command -v python || command -v python3 || true)"

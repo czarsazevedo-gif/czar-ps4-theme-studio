@@ -10,7 +10,7 @@
       "requireLocalPort": true
     }
   },
-  "postCreateCommand": "bash ./scripts/setup_codespace.sh",
+  "postCreateCommand": "bash ./scripts/bootstrap_czar_full.sh --install",
   "postStartCommand": "bash ./scripts/setup_codespace.sh --quick",
   "containerEnv": {
     "PYTHONUNBUFFERED": "1"

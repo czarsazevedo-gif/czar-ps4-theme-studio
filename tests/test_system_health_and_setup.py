@@ -125,7 +125,7 @@ def test_scripts_and_devcontainer_provisioning_integrity():
     assert "/etc/apt/sources.list.d/yarn.list" in install_txt
 
     dev = json.loads((REPO / ".devcontainer" / "devcontainer.json").read_text(encoding="utf-8"))
-    assert "setup_codespace.sh" in dev["postCreateCommand"]
+    assert "bootstrap_czar_full.sh" in dev["postCreateCommand"]
     assert "setup_codespace.sh" in dev["postStartCommand"]
 
 
