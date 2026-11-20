@@ -128,7 +128,7 @@ def test_section14_projects_lifecycle_isolation_conflict_atomic_failure_and_reci
             }
         ],
     }
-    rec_put = c1.put("/api/ouroboros/deluxe/recipes/principal", params={"project": pid1}, json=rec_payload)
+    rec_put = c1.put("/api/ouroboros/recipes/principal", params={"project": pid1}, json=rec_payload)
     assert rec_put.status_code == 200, rec_put.text
 
     # Save revision 1 -> 2 with rename
@@ -157,7 +157,7 @@ def test_section14_projects_lifecycle_isolation_conflict_atomic_failure_and_reci
     pid2 = dup.json()["id"]
     assert pid2 != pid1
     assert dup.json()["state"]["slots"]["home"] == home_job
-    dup_rec = c1.get("/api/ouroboros/deluxe/recipes/principal", params={"project": pid2})
+    dup_rec = c1.get("/api/ouroboros/recipes/principal", params={"project": pid2})
     assert dup_rec.status_code == 200, dup_rec.text
     assert dup_rec.json()["regions"][0]["name"] == "Céu"
 
@@ -358,33 +358,28 @@ def test_section17_compositor_deluxe_preview_export_parity_and_zero_temporal_lay
     Image.fromarray(badge, "RGBA").save(badge_p)
     badge_id = c1.post("/api/library", files={"file": ("badge.png", badge_p.open("rb"), "image/png")}).json()["id"]
 
-    # Render a Deluxe take on a sub-interval (different from raw full-video uniform extraction!)
-    spec = {
-        "kind": "library",
-        "id": vid_id,
-        "start": 0.4,
-        "end": 1.4,
-        "frames": 6,
-        "resolution": 2,  # 640x360
-        "wait": 0.10,
-        "mode": "natural",
-        "deluxeFinish": False,
-        "stabilizeCamera": False,
-        "speedScale": 1.0,
-    }
-    tk = c1.post("/api/ouroboros/deluxe/render", params=params, json=spec)
+    # Run unified OUROBOROS and apply Proposal 3 (flexibility 640x360)
+    tk = c1.post("/api/ouroboros/run", params=params, json={"kind": "library", "id": vid_id})
     assert tk.status_code == 202, tk.text
     tid = tk.json()["id"]
     import time
-    for _ in range(300):
+    for _ in range(1200):
         st = c1.get(f"/api/ouroboros/jobs/{tid}", params=params).json()
         if st["state"] != "working":
             break
         time.sleep(0.15)
     assert st["state"] == "ready", st
     key = st["key"]
+    rep = c1.get(f"/api/ouroboros/result/{key}", params=params).json()
+    flex = next(p for p in rep["proposals"] if p["profileId"] == "flexibility")
+    n_f = int(flex["frames"])
+    w_f = float(flex["wait"])
 
-    applied = c1.post("/api/ouroboros/deluxe/apply", params=params, json={"key": key, "expected": spec})
+    applied = c1.post(
+        "/api/ouroboros/apply",
+        params=params,
+        json={"key": key, "profileId": "flexibility", "expectedRenderKey": flex["renderKey"]},
+    )
     assert applied.status_code == 200, applied.text
     anim_job_id = applied.json()["jobId"]
 
@@ -414,11 +409,11 @@ def test_section17_compositor_deluxe_preview_export_parity_and_zero_temporal_lay
     prev_res = c1.post(
         "/api/composition/animation",
         params=params,
-        json={"job": anim_job_id, "size": [640, 360], "frames": 6, "surface": surface},
+        json={"job": anim_job_id, "size": [640, 360], "frames": n_f, "surface": surface},
     )
     assert prev_res.status_code == 200, prev_res.text
     prev_urls = prev_res.json()["frames"]
-    assert len(prev_urls) == 6
+    assert len(prev_urls) == n_f
     prev_frames = [np.asarray(Image.open(io.BytesIO(c1.get(u, params=params).content)).convert("RGB")) for u in prev_urls]
 
     # 2. Export composed RAF ZIP with the exact same surface
@@ -426,7 +421,7 @@ def test_section17_compositor_deluxe_preview_export_parity_and_zero_temporal_lay
     exp_res = c1.post(
         f"/api/animated/{anim_job_id}/export",
         params=params,
-        data={"frames": "6", "wait_seconds": "0.10", "composition": comp_json, "animation_size": "640x360"},
+        data={"frames": str(n_f), "wait_seconds": str(w_f), "composition": comp_json, "animation_size": "640x360"},
     )
     assert exp_res.status_code == 200, exp_res.text
     raf_zip = c1.get(exp_res.json()["download"], params=params).content
@@ -435,19 +430,19 @@ def test_section17_compositor_deluxe_preview_export_parity_and_zero_temporal_lay
     with zipfile.ZipFile(io.BytesIO(raf_zip)) as zf:
         names = set(zf.namelist())
         prefix = "scene/background.raf/" if "scene/background.raf/00.dds" in names else "background.raf/"
-        for i in range(6):
+        for i in range(n_f):
             rgba = dxt1.decode_dds(zf.read(f"{prefix}{i:02d}.dds"))
             dds_frames.append(rgba[..., :3])
 
     # GM-C-001 Proof: Every Compositor preview frame MUST match its exported composed DDS frame (modulo DXT1 quantization)!
-    for i in range(6):
+    for i in range(n_f):
         mae = float(np.abs(prev_frames[i].astype(np.float32) - dds_frames[i].astype(np.float32)).mean())
-        assert mae < 4.5, f"Frame {i} compositor preview diverged from exported Deluxe DDS (MAE={mae:.2f})"
+        assert mae < 4.5, f"Frame {i} compositor preview diverged from exported Ouroboros DDS (MAE={mae:.2f})"
 
-    # Section 17 Proof: Zero temporal drift on the cyan overlay patch across all 6 frames!
-    # At 640x360, center=(60,60), size=60x60 -> interior [42:78, 42:78] must be locked solid cyan [0, 255, 255]
+    # Section 17 Proof: Zero temporal drift on the cyan overlay patch across all frames!
+    # At 640x360, center=(60,60), size=60x60 -> interior [45:75, 45:75] must be locked solid cyan [0, 255, 255]
     patch_0 = prev_frames[0][45:75, 45:75]
     assert float(patch_0[..., 0].mean()) < 2.0 and float(patch_0[..., 1].mean()) > 253.0 and float(patch_0[..., 2].mean()) > 253.0
-    for i in range(1, 6):
+    for i in range(1, n_f):
         drift = float(np.abs(prev_frames[i][45:75, 45:75].astype(np.float32) - patch_0.astype(np.float32)).max())
         assert drift == 0.0, f"Layer drifted temporally on frame {i} (max diff={drift})"

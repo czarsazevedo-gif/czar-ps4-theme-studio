@@ -472,18 +472,24 @@ def _check_hyperfine() -> dict[str, Any]:
 
 def _check_ouroboros() -> dict[str, Any]:
     try:
-        # Supports both pre-unification (Checkpoint 1) and unified app/ouroboros_engine (Checkpoints 2+)
-        try:
-            from app import ouroboros_engine  # type: ignore
+        from app import ouroboros_engine  # type: ignore
 
-            mod_name = "app/ouroboros_engine (unificado)"
-            _ = ouroboros_engine
-        except ImportError:
-            from app.deluxe import metrics as d_metrics  # type: ignore
-
-            mod_name = "app/deluxe (pré-unificação)"
-            _ = d_metrics
-        return _ok("OUROBOROS", f"Motor carregado e operacional ({mod_name})")
+        legacy_paths = [
+            REPO / "app" / "sentinela.py",
+            REPO / "app" / "circulo.py",
+            REPO / "app" / "genesis.py",
+            REPO / "app" / "ouroboros_media.py",
+            REPO / "app" / "deluxe",
+            REPO / "app" / "static" / "ouroboros.html",
+        ]
+        leftovers = [str(p.relative_to(REPO)) for p in legacy_paths if p.exists()]
+        if leftovers:
+            return _fail("OUROBOROS", f"Arquivos legados ainda presentes: {', '.join(leftovers)}")
+        engine = ouroboros_engine.OuroborosEngine()
+        return _ok(
+            "OUROBOROS",
+            f"Motor único unificado ({ouroboros_engine.OUROBOROS_VERSION}, {len(ouroboros_engine.PROPOSAL_PROFILES)} propostas, {type(engine).__name__})",
+        )
     except Exception as exc:
         return _fail("OUROBOROS", str(exc))
 

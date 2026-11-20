@@ -11,11 +11,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app.deluxe.circulo_supreme import compute_multicriteria_cost, _generate_seeds
-from app.deluxe.genesis_supreme import synthesize_genesis_supreme
-from app.deluxe.metrics import compare_before_after, evaluate_loop, evaluate_post_dds, evaluate_ten_cycles
-from app.deluxe.reconstructor import level3_motion_compensated_seam, level4_content_bridge_reconstruct, reconstruct_best
-from app.deluxe.sentinela_supreme import CLASS_CORRECTABLE, CLASS_NATURAL, CLASS_UNSUITABLE, analyze_levels
+from app.ouroboros_engine.search import compute_multicriteria_cost, _generate_seeds
+from app.ouroboros_engine.synthesis import synthesize_genesis_supreme
+from app.ouroboros_engine.metrics import compare_before_after, evaluate_loop, evaluate_post_dds, evaluate_ten_cycles
+from app.ouroboros_engine.reconstruction import level3_motion_compensated_seam, level4_content_bridge_reconstruct, reconstruct_best
+from app.ouroboros_engine.analyzer import CLASS_CORRECTABLE, CLASS_NATURAL, CLASS_UNSUITABLE, analyze_levels
 
 HERE = Path(__file__).resolve().parent
 

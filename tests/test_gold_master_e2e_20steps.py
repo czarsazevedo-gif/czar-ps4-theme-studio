@@ -150,58 +150,44 @@ def test_gold_master_20_steps_real_e2e_with_server_restarts(tmp_path):
             vid_id = lib_v.json()["id"]
             assert vid_id == video_sha
 
-            # STEP 4: Diagnóstico automático de mídia (21 campos + 5 categorias oficiais)
-            td = hc.post("/api/ouroboros/deluxe/diagnose", params=params, json={"kind": "library", "id": vid_id})
+            # STEP 4 & 5: OUROBOROS unificado (diagnóstico 21 campos + 3 propostas independentes + cache compartilhado)
+            td = hc.post("/api/ouroboros/run", params=params, json={"kind": "library", "id": vid_id})
             assert td.status_code == 202, td.text
-            st_diag = _poll_ouroboros(hc, pid, td.json()["id"])
+            st_diag = _poll_ouroboros(hc, pid, td.json()["id"], timeout=240.0)
             assert st_diag["state"] == "ready", st_diag
-            diag_rep = hc.get(f"/api/ouroboros/result/{st_diag['key']}", params=params).json()
+            ren_key = st_diag["key"]
+            diag_rep = hc.get(f"/api/ouroboros/result/{ren_key}", params=params).json()
             md = diag_rep["mediaDiagnostic"]
             assert len(md["fields"]) == 21
+            assert len(diag_rep["proposals"]) == 3
 
-            # STEP 5: Comparar candidatos (cache compartilhado + calibrador)
-            ta = hc.post("/api/ouroboros/deluxe/analyze", params=params, json={"kind": "library", "id": vid_id})
+            # Cache compartilhado em reexecução imediata
+            ta = hc.post("/api/ouroboros/run", params=params, json={"kind": "library", "id": vid_id})
             assert ta.status_code == 202
             st_ana = _poll_ouroboros(hc, pid, ta.json()["id"], timeout=30.0)
-            assert st_ana["key"] == st_diag["key"], "Analyze must reuse Diagnose cache key"
-            best_take = md["bestTake"]
-            assert best_take is not None
-            cal = hc.post(
-                "/api/ouroboros/deluxe/calibrate",
+            assert st_ana["key"] == ren_key, "Re-running Ouroboros must reuse exact cache key"
+
+            # STEP 6 & 7: Escolher proposta (flexibility 640x360), rejeitar renderKey trocado (409) e aplicar exata (200)
+            props_by_id = {p["profileId"]: p for p in diag_rep["proposals"]}
+            chosen = props_by_id["flexibility"]
+            other = props_by_id["balance"]
+            assert "tenCycleAudit" in chosen
+            assert hc.post(
+                "/api/ouroboros/apply",
                 params=params,
-                json={"kind": "library", "id": vid_id, "start": best_take["start"], "end": best_take["end"]},
+                json={"key": ren_key, "profileId": "flexibility", "expectedRenderKey": other["renderKey"]},
+            ).status_code == 409
+            ap = hc.post(
+                "/api/ouroboros/apply",
+                params=params,
+                json={"key": ren_key, "profileId": "flexibility", "expectedRenderKey": chosen["renderKey"]},
             )
-            assert cal.status_code == 202
-            assert _poll_ouroboros(hc, pid, cal.json()["id"])["state"] == "ready"
-
-            # STEP 6: Renderizar take escolhido
-            render_spec = {
-                "kind": "library",
-                "id": vid_id,
-                "start": float(best_take["start"]),
-                "end": float(best_take["end"]),
-                "frames": 8,
-                "resolution": 2,  # 640x360
-                "wait": 0.10,
-                "mode": "reconstruct_auto",
-                "deluxeFinish": True,
-                "stabilizeCamera": False,
-                "speedScale": 1.0,
-            }
-            tr = hc.post("/api/ouroboros/deluxe/render", params=params, json=render_spec)
-            assert tr.status_code == 202, tr.text
-            st_ren = _poll_ouroboros(hc, pid, tr.json()["id"], timeout=180.0)
-            assert st_ren["state"] == "ready", st_ren
-            ren_key = st_ren["key"]
-            ren_rep = hc.get(f"/api/ouroboros/result/{ren_key}", params=params).json()
-            assert "tenCycleAudit" in ren_rep
-
-            # STEP 7: Aplicar take correto (rejeita seleção trocada 409, aceita exata 200)
-            wrong_spec = dict(render_spec, frames=6)
-            assert hc.post("/api/ouroboros/deluxe/apply", params=params, json={"key": ren_key, "expected": wrong_spec}).status_code == 409
-            ap = hc.post("/api/ouroboros/deluxe/apply", params=params, json={"key": ren_key, "expected": render_spec})
             assert ap.status_code == 200, ap.text
             anim_job_id = ap.json()["jobId"]
+            anim_frames = int(chosen["frames"])
+            anim_wait = float(chosen["wait"])
+            anim_size = list(chosen["size"])
+            anim_size_str = f"{anim_size[0]}x{anim_size[1]}"
 
             # STEP 8: Configurar ícones (home, icon0, fn:trophy, ct:browser)
             slots_map = {}
@@ -243,10 +229,10 @@ def test_gold_master_20_steps_real_e2e_with_server_restarts(tmp_path):
             comp_prev = hc.post(
                 "/api/composition/animation",
                 params=params,
-                json={"job": anim_job_id, "size": [640, 360], "frames": 8, "surface": anim_surface},
+                json={"job": anim_job_id, "size": anim_size, "frames": anim_frames, "surface": anim_surface},
             )
             assert comp_prev.status_code == 200, comp_prev.text
-            assert len(comp_prev.json()["frames"]) == 8
+            assert len(comp_prev.json()["frames"]) == anim_frames
 
             # STEP 10: Importar música
             insp = hc.post("/api/forge/audio/inspect", params=params, files={"file": ("music.mp3", SAMPLE_MP3.open("rb"), "audio/mpeg")})
@@ -287,7 +273,7 @@ def test_gold_master_20_steps_real_e2e_with_server_restarts(tmp_path):
             pstate["bgm"] = bgm_job_id
             pstate["bgmGain"] = -3.0
             pstate["sfx"] = {"se_decide": sfx_job_id}
-            pstate["anim"] = {"jobId": anim_job_id, "frames": 8, "wait": 0.10, "size": [640, 360], "backend": "native"}
+            pstate["anim"] = {"jobId": anim_job_id, "frames": anim_frames, "wait": anim_wait, "size": anim_size, "backend": "native"}
             pstate["composition"] = {"version": 1, "surfaces": {"animated": anim_surface, "fn:setting": icon_surface}}
             saved = hc.put(f"/api/projects/{pid}", json={"name": "Gold Master 20 Etapas", "revision": cur["revision"], "state": pstate})
             assert saved.status_code == 200, saved.text
@@ -316,10 +302,10 @@ def test_gold_master_20_steps_real_e2e_with_server_restarts(tmp_path):
                 f"/api/animated/{anim_job_id}/export",
                 params=params,
                 data={
-                    "frames": "8",
-                    "wait_seconds": "0.10",
+                    "frames": str(anim_frames),
+                    "wait_seconds": str(anim_wait),
                     "composition": json.dumps(rj["state"]["composition"]),
-                    "animation_size": "640x360",
+                    "animation_size": anim_size_str,
                 },
             )
             assert raf_res.status_code == 200, raf_res.text
@@ -328,7 +314,7 @@ def test_gold_master_20_steps_real_e2e_with_server_restarts(tmp_path):
             with zipfile.ZipFile(io.BytesIO(raf_zip_bytes)) as zf:
                 names = set(zf.namelist())
                 pref = "scene/background.raf/" if "scene/background.raf/00.dds" in names else "background.raf/"
-                for i in range(8):
+                for i in range(anim_frames):
                     dec = dxt1.decode_dds(zf.read(f"{pref}{i:02d}.dds"))
                     # Cyan overlay at interior [45:75, 45:75] must be preserved in decoded DDS!
                     patch = dec[45:75, 45:75, :3]
@@ -392,7 +378,7 @@ def test_gold_master_20_steps_real_e2e_with_server_restarts(tmp_path):
 
             assert (root_img0 / "scene" / "background.raf" / "plane.mdx").is_file()
             assert (root_img0 / "scene" / "background.raf" / "index.xml").is_file()
-            for i in range(8):
+            for i in range(anim_frames):
                 assert (root_img0 / "scene" / "background.raf" / f"{i:02d}.dds").is_file()
 
             at9_rep = validate_at9(root_img0 / "sound" / "bgm_home.at9", require_ps4_profile=True, require_loop=True)

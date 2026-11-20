@@ -31,7 +31,7 @@ import numpy as np
 import pytest
 
 from app import jobs, projects
-from app.deluxe.media_diagnostic import (
+from app.ouroboros_engine.diagnostic import (
     APT_CONDITIONAL,
     APT_CORRECTABLE,
     APT_NATURAL,
@@ -232,12 +232,12 @@ def test_diagnose_21_fields_and_cache_sharing_on_real_video(isolated_client):
     job_id = up.json()["job_id"]
 
     t_diag = client.post(
-        "/api/ouroboros/deluxe/diagnose",
+        "/api/ouroboros/run",
         params={"project": pid},
         json={"kind": "animated", "id": job_id},
     )
     assert t_diag.status_code == 202, t_diag.text
-    st_diag = _poll_task(client, pid, t_diag.json()["id"], timeout=120.0)
+    st_diag = _poll_task(client, pid, t_diag.json()["id"], timeout=180.0)
     assert st_diag["state"] == "ready", st_diag
     key_diag = st_diag["key"]
 
@@ -246,10 +246,10 @@ def test_diagnose_21_fields_and_cache_sharing_on_real_video(isolated_client):
     _assert_valid_21_fields(rep["mediaDiagnostic"])
     assert rep["mediaDiagnostic"]["aptidao"] != APT_UNSUITABLE or video_path == SAMPLE_MP4
 
-    # Calling /analyze right afterwards MUST hit the exact same content-addressed cache key!
+    # Calling /api/ouroboros/run right afterwards MUST hit the exact same content-addressed cache key!
     t0 = time.monotonic()
     t_ana = client.post(
-        "/api/ouroboros/deluxe/analyze",
+        "/api/ouroboros/run",
         params={"project": pid},
         json={"kind": "animated", "id": job_id},
     )
@@ -257,7 +257,7 @@ def test_diagnose_21_fields_and_cache_sharing_on_real_video(isolated_client):
     st_ana = _poll_task(client, pid, t_ana.json()["id"], timeout=30.0)
     elapsed_cached = time.monotonic() - t0
     assert st_ana["state"] == "ready"
-    assert st_ana["key"] == key_diag, "Diagnose and Deluxe Analyze must share the exact same cache key"
+    assert st_ana["key"] == key_diag, "Repeated unified Ouroboros runs must share the exact same cache key"
     assert elapsed_cached < 3.0, f"Expected cached reuse under 3s, took {elapsed_cached:.2f}s"
 
 
@@ -277,12 +277,12 @@ def test_diagnose_static_rejected_and_periodic_vs_pan_classification(isolated_cl
         assert up.status_code == 200, up.text
         jid = up.json()["job_id"]
         tk = client.post(
-            "/api/ouroboros/deluxe/diagnose",
+            "/api/ouroboros/run",
             params={"project": pid},
             json={"kind": "animated", "id": jid},
         )
         assert tk.status_code == 202, tk.text
-        st = _poll_task(client, pid, tk.json()["id"], timeout=90.0)
+        st = _poll_task(client, pid, tk.json()["id"], timeout=180.0)
         assert st["state"] == "ready", st
         rep = client.get(f"/api/ouroboros/result/{st['key']}", params={"project": pid}).json()
         _assert_valid_21_fields(rep["mediaDiagnostic"])
@@ -319,7 +319,7 @@ def test_diagnose_cancellation_is_non_blocking_and_clean(isolated_client):
     jid = up.json()["job_id"]
 
     tk = client.post(
-        "/api/ouroboros/deluxe/diagnose",
+        "/api/ouroboros/run",
         params={"project": pid},
         json={"kind": "animated", "id": jid},
     )
@@ -585,7 +585,7 @@ def test_chromium_guide_and_live_auto_diagnostic_touch_viewports(tmp_path):
                             {"nodeId": inp["nodeId"], "files": [str(clip)]},
                         )
                         diag_ui = None
-                        for poll_i in range(180):
+                        for poll_i in range(360):
                             diag_ui = _cdp_eval(
                                 sock,
                                 300 + poll_i,
@@ -597,7 +597,7 @@ def test_chromium_guide_and_live_auto_diagnostic_touch_viewports(tmp_path):
                                   const dts = [...document.querySelectorAll('#anim-diag-body dt')].map(el => el.textContent.trim());
                                   const h4s = [...document.querySelectorAll('#anim-diag-body h4')].map(el => el.textContent.trim());
                                   const badge = document.querySelector('#anim-diag-body .anim-diag-badge')?.textContent?.trim() || '';
-                                  const link = document.getElementById('anim-diag-ouroboros')?.getAttribute('href') || '';
+                                  const obCards = document.querySelectorAll('#ouroboros-proposals .ob-card').length;
                                   const playDisabled = document.getElementById('anim-play')?.disabled;
                                   const overflow = document.documentElement.scrollWidth - window.innerWidth;
                                   return {
@@ -606,21 +606,21 @@ def test_chromium_guide_and_live_auto_diagnostic_touch_viewports(tmp_path):
                                     status,
                                     labels: [...dts, ...h4s],
                                     badge,
-                                    link,
+                                    obCards,
                                     playDisabled,
                                     overflow,
                                   };
                                 })()
                                 """,
                             )
-                            if not diag_ui["bodyHidden"] and diag_ui["badge"]:
+                            if not diag_ui["bodyHidden"] and diag_ui["badge"] and diag_ui["obCards"] == 3:
                                 break
                             time.sleep(0.35)
                         assert diag_ui and not diag_ui["bodyHidden"], diag_ui
                         assert diag_ui["badge"] in OFFICIAL_APTITUDES, diag_ui
+                        assert diag_ui["obCards"] == 3, diag_ui
                         assert diag_ui["playDisabled"] is False
                         assert diag_ui["overflow"] <= 0, diag_ui
-                        assert f"project={pid}" in diag_ui["link"]
                         for lbl in REQUIRED_UI_LABELS:
                             assert lbl in diag_ui["labels"], f"Missing UI label {lbl}: {diag_ui['labels']}"
                 finally:

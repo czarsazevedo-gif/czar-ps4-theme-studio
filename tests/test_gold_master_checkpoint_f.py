@@ -168,7 +168,7 @@ def test_section21_chromium_touch_ergonomics_all_tabs_and_ouroboros_both_orienta
         else:
             raise AssertionError("Server did not start")
 
-        for page_path in ("/", "/static/ouroboros.html"):
+        for page_path in ("/",):
             for w, h in ((1480, 924), (924, 1480)):
                 dp = _free_port()
                 chrome = subprocess.Popen(
@@ -199,89 +199,67 @@ def test_section21_chromium_touch_ergonomics_all_tabs_and_ouroboros_both_orienta
                         _cdp(sock, 2, "Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 5}, events=exceptions)
                         time.sleep(1.2)
 
-                        if page_path == "/":
-                            _eval(
-                                sock,
-                                3,
-                                """
-                                (async () => {
-                                  const r = await fetch('/api/projects', {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ name: 'Touch Audit F' }),
-                                  });
-                                  const d = await r.json();
-                                  location.href = '/?project=' + encodeURIComponent(d.id);
-                                  return d.id;
-                                })()
-                                """,
-                                events=exceptions,
-                            )
-                            for i in range(60):
-                                try:
-                                    if _eval(
-                                        sock,
-                                        10 + i,
-                                        "location.search.includes('project=') && document.getElementById('project-name') && !document.getElementById('project-name').disabled",
-                                        events=exceptions,
-                                    ):
-                                        break
-                                except RuntimeError:
-                                    pass
-                                time.sleep(0.15)
+                        _eval(
+                            sock,
+                            3,
+                            """
+                            (async () => {
+                              const r = await fetch('/api/projects', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ name: 'Touch Audit F' }),
+                              });
+                              const d = await r.json();
+                              location.href = '/?project=' + encodeURIComponent(d.id);
+                              return d.id;
+                            })()
+                            """,
+                            events=exceptions,
+                        )
+                        for i in range(60):
+                            try:
+                                if _eval(
+                                    sock,
+                                    10 + i,
+                                    "location.search.includes('project=') && document.getElementById('project-name') && !document.getElementById('project-name').disabled",
+                                    events=exceptions,
+                                ):
+                                    break
+                            except RuntimeError:
+                                pass
+                            time.sleep(0.15)
 
-                            rep = _eval(
-                                sock,
-                                100,
-                                """
-                                (() => {
-                                  const out = {};
-                                  for (const tab of ['backgrounds', 'icons', 'compositor', 'sounds', 'preview', 'package']) {
-                                    document.querySelector('[data-tab="' + tab + '"]').click();
-                                    if (tab === 'backgrounds') {
-                                      const r = document.getElementById('bgmode-animated');
-                                      r.checked = true;
-                                      r.dispatchEvent(new Event('change', { bubbles: true }));
-                                    }
-                                    const ov = document.documentElement.scrollWidth - window.innerWidth;
-                                    const small = [];
-                                    for (const el of document.querySelectorAll('button, a.btn, select, input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=file]), summary')) {
-                                      const rc = el.getBoundingClientRect();
-                                      if (rc.width > 0 && rc.height > 0 && rc.height < 43.5) {
-                                        small.push({ id: el.id || el.textContent.trim().slice(0, 24), h: Math.round(rc.height * 10) / 10 });
-                                      }
-                                    }
-                                    out[tab] = { ov, small };
+                        rep = _eval(
+                            sock,
+                            100,
+                            """
+                            (() => {
+                              const out = {};
+                              for (const tab of ['backgrounds', 'icons', 'compositor', 'sounds', 'preview', 'package']) {
+                                document.querySelector('[data-tab="' + tab + '"]').click();
+                                if (tab === 'backgrounds') {
+                                  const r = document.getElementById('bgmode-animated');
+                                  r.checked = true;
+                                  r.dispatchEvent(new Event('change', { bubbles: true }));
+                                }
+                                const ov = document.documentElement.scrollWidth - window.innerWidth;
+                                const small = [];
+                                for (const el of document.querySelectorAll('button, a.btn, select, input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=file]), summary')) {
+                                  const rc = el.getBoundingClientRect();
+                                  if (rc.width > 0 && rc.height > 0 && rc.height < 43.5) {
+                                    small.push({ id: el.id || el.textContent.trim().slice(0, 24), h: Math.round(rc.height * 10) / 10 });
                                   }
-                                  return out;
-                                })()
-                                """,
-                                events=exceptions,
-                            )
-                            for tab_name, info in rep.items():
-                                assert info["ov"] <= 0, f"Overflow on Studio/{tab_name} at {w}x{h}: {info}"
-                                assert not info["small"], f"Controls < 44px on Studio/{tab_name} at {w}x{h}: {info['small']}"
-                        else:
-                            rep = _eval(
-                                sock,
-                                200,
-                                """
-                                (() => {
-                                  const ov = document.documentElement.scrollWidth - window.innerWidth;
-                                  const small = [];
-                                  for (const el of document.querySelectorAll('button, a.btn, select, input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=range]):not([type=file]), summary')) {
-                                    const rc = el.getBoundingClientRect();
-                                    if (rc.width > 0 && rc.height > 0 && rc.height < 43.5) {
-                                      small.push({ id: el.id || el.textContent.trim().slice(0, 24), h: Math.round(rc.height * 10) / 10 });
-                                    }
-                                  }
-                                  return { ov, small };
-                                })()
-                                """,
-                                events=exceptions,
-                            )
-                            assert rep["ov"] <= 0, f"Overflow on ouroboros.html at {w}x{h}: {rep}"
-                            assert not rep["small"], f"Controls < 44px on ouroboros.html at {w}x{h}: {rep['small']}"
+                                }
+                                out[tab] = { ov, small };
+                              }
+                              return out;
+                            })()
+                            """,
+                            events=exceptions,
+                        )
+                        for tab_name, info in rep.items():
+                            assert info["ov"] <= 0, f"Overflow on Studio/{tab_name} at {w}x{h}: {info}"
+                            assert not info["small"], f"Controls < 44px on Studio/{tab_name} at {w}x{h}: {info['small']}"
 
                         assert not exceptions, f"Uncaught JS exceptions on {page_path} {w}x{h}: {exceptions}"
                     finally:
@@ -317,40 +295,34 @@ def test_section20_real_performance_and_memory_benchmarks(tmp_path, monkeypatch)
         vid_id = client.post("/api/library", files={"file": ("sample.mp4", SAMPLE_MP4.open("rb"), "video/mp4")}).json()["id"]
         timings["import_video_s"] = round(time.perf_counter() - t0, 3)
 
-        # 2. Automatic media diagnosis / Deluxe analysis
+        # 2 & 3. Unified OUROBOROS full analysis + 3 proposals (720p, 540p, 360p)
         t0 = time.perf_counter()
-        tk = client.post("/api/ouroboros/deluxe/diagnose", params=params, json={"kind": "library", "id": vid_id}).json()["id"]
+        tk = client.post("/api/ouroboros/run", params=params, json={"kind": "library", "id": vid_id}).json()["id"]
         while True:
             st = client.get(f"/api/ouroboros/jobs/{tk}", params=params).json()
             if st["state"] != "working":
                 break
-            time.sleep(0.1)
-        assert st["state"] == "ready"
-        timings["diagnose_analyze_s"] = round(time.perf_counter() - t0, 3)
+            time.sleep(0.15)
+        assert st["state"] == "ready", st
+        timings["ouroboros_three_proposals_s"] = round(time.perf_counter() - t0, 3)
 
-        # 3. Deluxe render
-        t0 = time.perf_counter()
-        spec = {
-            "kind": "library", "id": vid_id, "start": 0.0, "end": 1.2, "frames": 8,
-            "resolution": 2, "wait": 0.1, "mode": "reconstruct_auto", "deluxeFinish": True,
-            "stabilizeCamera": False, "speedScale": 1.0,
-        }
-        rk = client.post("/api/ouroboros/deluxe/render", params=params, json=spec).json()["id"]
-        while True:
-            rst = client.get(f"/api/ouroboros/jobs/{rk}", params=params).json()
-            if rst["state"] != "working":
-                break
-            time.sleep(0.1)
-        assert rst["state"] == "ready"
-        timings["deluxe_render_s"] = round(time.perf_counter() - t0, 3)
-
-        ap = client.post("/api/ouroboros/deluxe/apply", params=params, json={"key": rst["key"], "expected": spec})
-        assert ap.status_code == 200
+        rep = client.get(f"/api/ouroboros/result/{st['key']}", params=params).json()
+        flex = next(p for p in rep["proposals"] if p["profileId"] == "flexibility")
+        ap = client.post(
+            "/api/ouroboros/apply",
+            params=params,
+            json={"key": st["key"], "profileId": "flexibility", "expectedRenderKey": flex["renderKey"]},
+        )
+        assert ap.status_code == 200, ap.text
         anim_job = ap.json()["jobId"]
 
         # 4. RAF ZIP export
         t0 = time.perf_counter()
-        raf_exp = client.post(f"/api/animated/{anim_job}/export", params=params, data={"frames": "8", "wait_seconds": "0.1"})
+        raf_exp = client.post(
+            f"/api/animated/{anim_job}/export",
+            params=params,
+            data={"frames": str(flex["frames"]), "wait_seconds": str(flex["wait"])},
+        )
         assert raf_exp.status_code == 200
         timings["raf_export_s"] = round(time.perf_counter() - t0, 3)
 
@@ -373,7 +345,13 @@ def test_section20_real_performance_and_memory_benchmarks(tmp_path, monkeypatch)
         pstate["slots"] = {"home": home_job}
         pstate["bgm"] = bgm_job
         pstate["bgmGain"] = bgm.json()["gain_db"]
-        pstate["anim"] = {"jobId": anim_job, "frames": 8, "wait": 0.1, "size": [640, 360], "backend": "native"}
+        pstate["anim"] = {
+            "jobId": anim_job,
+            "frames": int(flex["frames"]),
+            "wait": float(flex["wait"]),
+            "size": list(flex["size"]),
+            "backend": "native",
+        }
         cur = client.get(f"/api/projects/{pid}").json()
         assert client.put(f"/api/projects/{pid}", json={"name": "Bench F", "revision": cur["revision"], "state": pstate}).status_code == 200
 

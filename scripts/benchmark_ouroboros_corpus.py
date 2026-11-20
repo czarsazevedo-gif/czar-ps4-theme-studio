@@ -18,10 +18,11 @@ REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from app import media, ouroboros_media as io_media
+from app import media
 from app.config import ANIMATED_SIZES, dds_bytes_for
-from app.deluxe.circulo_supreme import search_supreme
-from app.deluxe.pipeline import render_deluxe_loop
+from app.ouroboros_engine import OuroborosEngine, media_io as io_media
+
+_ENGINE = OuroborosEngine()
 
 
 def _probe_duration(path: Path) -> float:
@@ -68,7 +69,7 @@ def benchmark_video(entry: dict) -> dict:
         an_dir = work / "an"
         an_dir.mkdir()
         t_an = time.perf_counter()
-        analysis = search_supreme(path, dur, an_dir, source_sha256=sha)
+        analysis = _ENGINE.analyze_and_search(path, dur, an_dir, source_sha256=sha)
         an_ms = round((time.perf_counter() - t_an) * 1000.0, 1)
 
         sent = analysis["sentinela"]
@@ -95,11 +96,11 @@ def benchmark_video(entry: dict) -> dict:
         start = float(cand["start"])
         end = float(cand["end"])
 
-        # Compare Natural Cut (post-DDS) vs Reconstruct Auto + Deluxe Finish (post-DDS)
+        # Compare Natural Cut (post-DDS) vs Unified Ouroboros Auto + Finish (post-DDS)
         nat_dir = work / "nat"
         nat_dir.mkdir()
         t_nat = time.perf_counter()
-        nat_res = render_deluxe_loop(
+        nat_res = _ENGINE.render_loop(
             path,
             dur,
             nat_dir,
@@ -109,7 +110,7 @@ def benchmark_video(entry: dict) -> dict:
             size=size,
             wait=wait,
             mode="natural",
-            deluxe_finish=False,
+            finish_enabled=False,
             source_sha256=sha,
         )
         nat_ms = round((time.perf_counter() - t_nat) * 1000.0, 1)
@@ -117,7 +118,7 @@ def benchmark_video(entry: dict) -> dict:
         rec_dir = work / "rec"
         rec_dir.mkdir()
         t_rec = time.perf_counter()
-        rec_res = render_deluxe_loop(
+        rec_res = _ENGINE.render_loop(
             path,
             dur,
             rec_dir,
@@ -126,8 +127,8 @@ def benchmark_video(entry: dict) -> dict:
             frames=frames,
             size=size,
             wait=wait,
-            mode="reconstruct_auto",
-            deluxe_finish=True,
+            mode="auto",
+            finish_enabled=True,
             source_sha256=sha,
         )
         rec_ms = round((time.perf_counter() - t_rec) * 1000.0, 1)
@@ -201,6 +202,7 @@ def benchmark_video(entry: dict) -> dict:
                 "totalCost": cand["costs"]["totalCost"],
             },
             "strategyUsed": rec_res["strategyUsed"],
+            "verdict": rec_res.get("verdict"),
             "finishSteps": rec_res["finish"]["appliedSteps"],
             "naturalPostDds": _extract_kpis(nat_res["finalPostDds"]),
             "refinedPostDds": _extract_kpis(rec_res["finalPostDds"]),
@@ -214,7 +216,7 @@ def benchmark_video(entry: dict) -> dict:
         }
 
 
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", default="/tmp/czar-real-corpus/manifest.json")
     ap.add_argument("--split", choices=("dev", "holdout", "all"), default="dev")
@@ -258,6 +260,13 @@ def main() -> None:
             }
         )
 
+    if not entries:
+        print(
+            f"ERRO: Nenhum vídeo encontrado para benchmark (manifest={args.manifest!r}, split={args.split!r}, ids={args.ids!r}).",
+            file=sys.stderr,
+        )
+        return 2
+
     results = []
     out_p = Path(args.out) if args.out else None
     if out_p is not None:
@@ -275,7 +284,7 @@ def main() -> None:
             ref = res["refinedPostDds"]
             print(
                 f"    class={res['sentinelaClass']} take={res['bestTake']['size'][0]}x{res['bestTake']['size'][1]}@{res['bestTake']['frames']}f "
-                f"strat={res['strategyUsed']} | "
+                f"strat={res['strategyUsed']} verdict={res.get('verdict')} | "
                 f"NAT(seam={nat['seamRatio']:.2f}, cos={nat['seamDirCos']:.2f}, opp={nat['seamOppFrac']:.2f}, vj={nat['velJump']:.2f}, iss={len(nat['issues'])}) -> "
                 f"REF(seam={ref['seamRatio']:.2f}, cos={ref['seamDirCos']:.2f}, opp={ref['seamOppFrac']:.2f}, vj={ref['velJump']:.2f}, iss={len(ref['issues'])}) "
                 f"[{res['timingsMs']['total']:.0f}ms]",
@@ -285,6 +294,15 @@ def main() -> None:
     if out_p is not None:
         print(f"Saved benchmark JSON to {out_p}")
 
+    ok_count = sum(1 for r in results if "error" not in r)
+    if ok_count == 0:
+        print(
+            f"ERRO: 0 de {len(results)} vídeos processados com sucesso no benchmark.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -26,10 +26,10 @@ import numpy as np
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from app import at9, dxt1, jobs, main, media, ouroboros_media as io_media, pkg, projects
-from app.deluxe import calibrator
-from app.deluxe.metrics import evaluate_loop
-from app.deluxe.sentinela_supreme import probe_source_extended
+from app import at9, dxt1, jobs, main, media, pkg, projects
+from app.ouroboros_engine import calibrator, media_io as io_media
+from app.ouroboros_engine.analyzer import probe_source_extended
+from app.ouroboros_engine.metrics import evaluate_loop
 from app.forge import pkg_forge, pkg_router
 from app.forge.pkg_inspector import inspect_and_validate_pkg
 from app.forge.subproc import kill_process_tree, run_cancellable_process
@@ -92,7 +92,7 @@ class AuditRemediationTest(unittest.TestCase):
         self.assertEqual(r.status_code, 201, r.text)
         return r.json()["id"]
 
-    def _poll_ouroboros(self, ticket_id: str, params: dict, timeout: float = 90.0) -> dict:
+    def _poll_ouroboros(self, ticket_id: str, params: dict, timeout: float = 180.0) -> dict:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             r = self.client.get(f"/api/ouroboros/jobs/{ticket_id}", params=params)
@@ -117,78 +117,54 @@ class AuditRemediationTest(unittest.TestCase):
         self.assertEqual(lib.status_code, 201, lib.text)
         lib_id = lib.json()["id"]
 
-        spec_a = {
-            "kind": "library",
-            "id": lib_id,
-            "start": 0.0,
-            "end": 1.0,
-            "frames": 6,
-            "resolution": 2,   # 640x360
-            "wait": 0.10,
-            "mode": "natural",
-            "deluxeFinish": False,
-            "stabilizeCamera": False,
-            "speedScale": 1.0,
-            "recipe": None,
-        }
-        spec_b = {
-            "kind": "library",
-            "id": lib_id,
-            "start": 0.2,
-            "end": 1.2,
-            "frames": 8,
-            "resolution": 1,   # 960x540
-            "wait": 0.075,
-            "mode": "natural",
-            "deluxeFinish": False,
-            "stabilizeCamera": False,
-            "speedScale": 1.0,
-            "recipe": None,
-        }
+        # Run unified OUROBOROS -> 3 independent proposals (720p, 540p, 360p)
+        run_r = self.client.post("/api/ouroboros/run", params=params, json={"kind": "library", "id": lib_id})
+        self.assertEqual(run_r.status_code, 202, run_r.text)
+        done = self._poll_ouroboros(run_r.json()["id"], params)
+        self.assertEqual(done["state"], "ready", done)
+        key = done["key"]
+        report = self.client.get(f"/api/ouroboros/result/{key}", params=params).json()
+        props = {p["profileId"]: p for p in report["proposals"]}
+        prop_a = props["flexibility"]  # 640x360
+        prop_b = props["balance"]      # 960x540
+        self.assertNotEqual(prop_a["renderKey"], prop_b["renderKey"])
 
-        # Render Take A
-        ra = self.client.post("/api/ouroboros/deluxe/render", params=params, json=spec_a)
-        self.assertEqual(ra.status_code, 202, ra.text)
-        done_a = self._poll_ouroboros(ra.json()["id"], params)
-        self.assertEqual(done_a["state"], "ready", done_a)
-        key_a = done_a["key"]
-
-        # CZAR-AUD-001: Attempt to apply Key A while active selection is B -> MUST reject with HTTP 409!
+        # CZAR-AUD-001: Attempt to apply flexibility while expecting balance renderKey -> MUST reject 409!
         stale_apply = self.client.post(
-            "/api/ouroboros/deluxe/apply",
+            "/api/ouroboros/apply",
             params=params,
-            json={"key": key_a, "expected": spec_b},
+            json={"key": key, "profileId": "flexibility", "expectedRenderKey": prop_b["renderKey"]},
         )
         self.assertEqual(stale_apply.status_code, 409, stale_apply.text)
-        # Project state must remain untouched (None)
         self.assertIsNone(self.client.get(f"/api/projects/{proj_id}").json()["state"])
 
-        # Now apply A honestly (to test CZAR-AUD-002 preview 360 -> 540 -> 360 roundtrip first)
+        # Apply Proposal A (flexibility 640x360) honestly and test 360 -> 540 -> 360 preview restoration
         ok_a = self.client.post(
-            "/api/ouroboros/deluxe/apply",
+            "/api/ouroboros/apply",
             params=params,
-            json={"key": key_a, "expected": spec_a},
+            json={"key": key, "profileId": "flexibility", "expectedRenderKey": prop_a["renderKey"]},
         )
         self.assertEqual(ok_a.status_code, 200, ok_a.text)
         job_a = ok_a.json()["jobId"]
+        n_a = int(prop_a["frames"])
+        w_a = float(prop_a["wait"])
 
-        # Export A ZIP and decode its 6 DDS frames as ground truth
         exp_a = self.client.post(
             f"/api/animated/{job_a}/export",
             params=params,
-            data={"frames": "6", "wait_seconds": "0.10", "backend": "native"},
+            data={"frames": str(n_a), "wait_seconds": str(w_a), "backend": "native"},
         )
         self.assertEqual(exp_a.status_code, 200, exp_a.text)
         zip_a_bytes = self.client.get(f"/api/animated/{job_a}/download", params=params).content
         with zipfile.ZipFile(io.BytesIO(zip_a_bytes)) as zf:
-            dds_rgb_a = [dxt1.decode_dds(zf.read(f"scene/background.raf/{i:02d}.dds"))[..., :3] for i in range(6)]
+            dds_rgb_a = [dxt1.decode_dds(zf.read(f"scene/background.raf/{i:02d}.dds"))[..., :3] for i in range(n_a)]
             a_hashes = {n: hashlib.sha256(zf.read(n)).hexdigest() for n in zf.namelist()}
 
-        # CZAR-AUD-002: Reframe 360p -> 540p -> 360p and verify ALL 6 previews match 360p DDS pixels!
+        # CZAR-AUD-002: Reframe 360p -> 540p -> 360p and verify ALL previews match 360p DDS pixels!
         r540 = self.client.post(
             f"/api/animated/{job_a}/frames",
             params=params,
-            data={"frames": "6", "size": "960x540"},
+            data={"frames": str(min(n_a, 24)), "size": "960x540"},
         )
         self.assertEqual(r540.status_code, 200, r540.text)
         with Image.open(io.BytesIO(self.client.get(r540.json()["frames"][0], params=params).content)) as im540:
@@ -197,7 +173,7 @@ class AuditRemediationTest(unittest.TestCase):
         r360 = self.client.post(
             f"/api/animated/{job_a}/frames",
             params=params,
-            data={"frames": "6", "size": "640x360"},
+            data={"frames": str(n_a), "size": "640x360"},
         )
         self.assertEqual(r360.status_code, 200, r360.text)
         for i, prev_url in enumerate(r360.json()["frames"]):
@@ -212,46 +188,40 @@ class AuditRemediationTest(unittest.TestCase):
         dup_id = dup.json()["id"]
         dup_params = {"project": dup_id}
         self.assertEqual(
-            self.client.post(f"/api/animated/{job_a}/frames", params=dup_params, data={"frames": "6", "size": "960x540"}).status_code,
+            self.client.post(f"/api/animated/{job_a}/frames", params=dup_params, data={"frames": str(min(n_a, 24)), "size": "960x540"}).status_code,
             200,
         )
-        dup360 = self.client.post(f"/api/animated/{job_a}/frames", params=dup_params, data={"frames": "6", "size": "640x360"})
+        dup360 = self.client.post(f"/api/animated/{job_a}/frames", params=dup_params, data={"frames": str(n_a), "size": "640x360"})
         self.assertEqual(dup360.status_code, 200)
         for i, prev_url in enumerate(dup360.json()["frames"]):
             with Image.open(io.BytesIO(self.client.get(prev_url, params=dup_params).content)) as im:
                 self.assertEqual(im.size, (640, 360))
                 self.assertTrue(np.array_equal(np.asarray(im.convert("RGB")), dds_rgb_a[i]))
 
-        # Now actually render Take B and apply B -> exported ZIP must match B byte-for-byte, NOT A!
-        rb = self.client.post("/api/ouroboros/deluxe/render", params=params, json=spec_b)
-        self.assertEqual(rb.status_code, 202, rb.text)
-        done_b = self._poll_ouroboros(rb.json()["id"], params)
-        self.assertEqual(done_b["state"], "ready", done_b)
-        key_b = done_b["key"]
-        self.assertNotEqual(key_a, key_b)
-
+        # Now apply Proposal B (balance 960x540) -> exported ZIP must match B byte-for-byte, NOT A!
         ok_b = self.client.post(
-            "/api/ouroboros/deluxe/apply",
+            "/api/ouroboros/apply",
             params=params,
-            json={"key": key_b, "expected": spec_b},
+            json={"key": key, "profileId": "balance", "expectedRenderKey": prop_b["renderKey"]},
         )
         self.assertEqual(ok_b.status_code, 200, ok_b.text)
         job_b = ok_b.json()["jobId"]
-        rep_b = self.client.get(f"/api/ouroboros/result/{key_b}", params=params).json()
+        n_b = int(prop_b["frames"])
+        w_b = float(prop_b["wait"])
         exp_b = self.client.post(
             f"/api/animated/{job_b}/export",
             params=params,
-            data={"frames": "8", "wait_seconds": "0.075", "backend": "native"},
+            data={"frames": str(n_b), "wait_seconds": str(w_b), "backend": "native"},
         )
         self.assertEqual(exp_b.status_code, 200, exp_b.text)
         zip_b_bytes = self.client.get(f"/api/animated/{job_b}/download", params=params).content
         with zipfile.ZipFile(io.BytesIO(zip_b_bytes)) as zf:
             b_dds_names = sorted(n for n in zf.namelist() if n.endswith(".dds"))
-            self.assertEqual(len(b_dds_names), 8)
-            for i in range(8):
+            self.assertEqual(len(b_dds_names), n_b)
+            for i in range(n_b):
                 fn = f"{i:02d}.dds"
                 actual_sha = hashlib.sha256(zf.read(f"scene/background.raf/{fn}")).hexdigest()
-                self.assertEqual(actual_sha, rep_b["ddsHashes"][fn])
+                self.assertEqual(actual_sha, prop_b["ddsHashes"][fn])
             b_hashes = {n: hashlib.sha256(zf.read(n)).hexdigest() for n in zf.namelist()}
             self.assertNotEqual(b_hashes, a_hashes)
 
