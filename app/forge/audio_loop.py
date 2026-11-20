@@ -456,10 +456,83 @@ def finish_audio_loop(
 
 
 def evaluate_post_at9_loop(at9_path: Path, sr: int = PS4_ATRAC9_SAMPLE_RATE) -> dict:
-    """Decode the final ATRAC9 file independently via FFmpeg and re-evaluate seam quality post-encoding."""
-    pcm = decode_to_float64_stereo(at9_path, sample_rate=sr)
-    metrics = _seam_metrics(pcm, sr)
-    lead_sil, trail_sil = _detect_silence_margins(pcm, sr)
+    """Decode the final ATRAC9 file independently and evaluate seam quality on the ACTUALLY REPEATED loop interval.
+
+    Fixes historical bug where evaluation always measured file boundaries [0..N] even when `smpl`
+    defined an internal loop [loop_start, loop_end]. Uses sample-accurate `vgmstream-cli` decoding
+    (zero encoder-delay offset) when installed, plus 3-cycle loop decode verification, falling back
+    to FFmpeg (preserving RIFF `smpl` delay-included offsets) if `vgmstream-cli` is unavailable.
+    """
+    from .audio_validation import (
+        decode_at9_vgmstream,
+        inspect_at9_vgmstream,
+        parse_at9_riff,
+    )
+
+    riff = None
+    try:
+        riff = parse_at9_riff(at9_path.read_bytes())
+    except Exception:
+        riff = None
+
+    vgm_info = inspect_at9_vgmstream(at9_path)
+    vgm_verified = bool(vgm_info and vgm_info.get("ok"))
+    vgm_multi_cycle_verified = False
+    decoder_used = "ffmpeg"
+
+    pcm = None
+    if vgm_verified:
+        try:
+            pcm = decode_at9_vgmstream(at9_path, ignore_loop=True, sample_rate=sr)
+            decoder_used = "vgmstream-cli"
+        except Exception:
+            pcm = None
+            vgm_verified = False
+    if pcm is None:
+        pcm = decode_to_float64_stereo(at9_path, sample_rate=sr)
+
+    total_samples = int(pcm.shape[0])
+    loop_start_sample = riff["loop_start"] if (riff and riff.get("has_smpl")) else None
+    loop_end_sample = riff["loop_end"] if (riff and riff.get("has_smpl")) else None
+    vgm_loop_start = vgm_info.get("loop_start") if vgm_info else None
+    vgm_loop_end = vgm_info.get("loop_end") if vgm_info else None
+
+    pcm_start = 0
+    pcm_end = total_samples
+    internal_loop_evaluated = False
+
+    if decoder_used == "vgmstream-cli" and vgm_loop_start is not None and vgm_loop_end is not None:
+        # vgmstream-cli -i trims encoder_delay exactly; vgm_loop_start..vgm_loop_end is exact [start, end)
+        s0 = max(0, min(int(vgm_loop_start), total_samples - 1))
+        s1 = max(s0 + 1, min(int(vgm_loop_end), total_samples))
+        if s1 - s0 >= 64:
+            pcm_start, pcm_end = s0, s1
+            internal_loop_evaluated = (pcm_start > 0) or (pcm_end < total_samples)
+    elif loop_start_sample is not None and loop_end_sample is not None and loop_end_sample > loop_start_sample:
+        if decoder_used == "vgmstream-cli":
+            delay = int((riff or {}).get("encoder_delay") or 0)
+            s0 = max(0, min(int(loop_start_sample) - delay, total_samples - 1))
+            s1 = max(s0 + 1, min(int(loop_end_sample) - delay + 1, total_samples))
+        else:
+            # FFmpeg atrac9 output includes encoder_delay samples at the front, matching raw smpl offsets!
+            s0 = max(0, min(int(loop_start_sample), total_samples - 1))
+            s1 = max(s0 + 1, min(int(loop_end_sample) + 1, total_samples))
+        if s1 - s0 >= 64:
+            pcm_start, pcm_end = s0, s1
+            internal_loop_evaluated = (pcm_start > 0) or (pcm_end < total_samples)
+
+    loop_pcm = pcm[pcm_start:pcm_end]
+    metrics = _seam_metrics(loop_pcm, sr)
+    lead_sil, trail_sil = _detect_silence_margins(loop_pcm, sr)
+
+    if vgm_verified and vgm_loop_start is not None and vgm_loop_end is not None and vgm_loop_end > vgm_loop_start:
+        try:
+            multi = decode_at9_vgmstream(at9_path, ignore_loop=False, loops=3, fade_sec=0.0, sample_rate=sr)
+            expected_min = int(vgm_loop_start) + 2 * (int(vgm_loop_end) - int(vgm_loop_start))
+            vgm_multi_cycle_verified = int(multi.shape[0]) >= max(128, expected_min - 2048)
+        except Exception:
+            vgm_multi_cycle_verified = False
+
     convincing = (
         metrics["click_risk"] <= 0.14
         and abs(metrics["energy_delta_db"]) <= 7.5
@@ -467,8 +540,20 @@ def evaluate_post_at9_loop(at9_path: Path, sr: int = PS4_ATRAC9_SAMPLE_RATE) -> 
     )
     return {
         "evaluated_after_atrac9": True,
-        "decoded_samples": int(pcm.shape[0]),
-        "decoded_duration_sec": round(pcm.shape[0] / float(sr), 4),
+        "decoder_used": decoder_used,
+        "vgmstream_verified": vgm_verified,
+        "vgmstream_multi_cycle_verified": vgm_multi_cycle_verified,
+        "internal_loop_evaluated": internal_loop_evaluated,
+        "loop_start_sample": loop_start_sample,
+        "loop_end_sample": loop_end_sample,
+        "vgmstream_loop_start": vgm_loop_start,
+        "vgmstream_loop_end": vgm_loop_end,
+        "pcm_loop_start": pcm_start,
+        "pcm_loop_end": pcm_end,
+        "loop_samples": int(loop_pcm.shape[0]),
+        "loop_duration_sec": round(loop_pcm.shape[0] / float(sr), 4),
+        "decoded_samples": total_samples,
+        "decoded_duration_sec": round(total_samples / float(sr), 4),
         "leading_silence_sec": lead_sil,
         "trailing_silence_sec": trail_sil,
         "convincing": convincing,

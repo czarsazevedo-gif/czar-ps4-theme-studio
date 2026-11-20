@@ -320,6 +320,91 @@ def _run_pkgtool_validate(
     return (not failed), out
 
 
+# Documented top-level SFO keys that LibOrbisPkg / orbis-pub-cmd may legitimately add/adjust during PKG creation
+_ALLOWED_PACKAGER_SFO_KEYS = frozenset({"PUBTOOLVER", "PUBTOOLMINVER"})
+
+# Documented PUBTOOLINFO sub-keys that LibOrbisPkg / orbis-pub-cmd may legitimately inject/adjust during PKG creation
+_ALLOWED_PACKAGER_PUBTOOLINFO_KEYS = frozenset(
+    {
+        "c_date",
+        "img0_l0_size",
+        "img0_l1_size",
+        "img0_sc_ksize",
+        "img0_pc_ksize",
+        "img0_stat_size",
+        "pkg_ver",
+        "sdk_ver",
+        "st_type",
+    }
+)
+
+
+def _parse_pubtoolinfo(raw: Any) -> dict[str, str]:
+    text = str(raw or "").strip()
+    out: dict[str, str] = {}
+    if not text:
+        return out
+    for part in text.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "=" in token:
+            k, v = token.split("=", 1)
+            out[k.strip()] = v.strip()
+        else:
+            out[token] = ""
+    return out
+
+
+def compare_param_sfo_fields(expected_sfo_bytes: bytes, extracted_sfo_bytes: bytes) -> list[str]:
+    """Strictly compare expected bundle sce_sys/param.sfo vs extracted Sc0/param.sfo.
+
+    Allows ONLY documented packager transformations (`PUBTOOLVER`, `PUBTOOLMINVER`, and packager
+    `PUBTOOLINFO` size/date/sdk metadata). Any divergence in theme identity, `IRO_TAG`, `CATEGORY`,
+    `TITLE`, `TITLE_ID`, `CONTENT_ID`, `VERSION`, `bgmhome_loud`, or unexpected extra keys is reported.
+    """
+    try:
+        exp_vals = parse_param_sfo(expected_sfo_bytes)["values"]
+    except Exception as exc:
+        return [f"param.sfo esperado inválido: {exc}"]
+    try:
+        ext_vals = parse_param_sfo(extracted_sfo_bytes)["values"]
+    except Exception as exc:
+        return [f"param.sfo extraído inválido: {exc}"]
+
+    diffs: list[str] = []
+    all_keys = sorted(set(exp_vals) | set(ext_vals))
+    for key in all_keys:
+        if key == "PUBTOOLINFO":
+            exp_pt = _parse_pubtoolinfo(exp_vals.get("PUBTOOLINFO"))
+            ext_pt = _parse_pubtoolinfo(ext_vals.get("PUBTOOLINFO"))
+            for pk in sorted(set(exp_pt) | set(ext_pt)):
+                if pk in _ALLOWED_PACKAGER_PUBTOOLINFO_KEYS:
+                    continue
+                if pk not in ext_pt:
+                    diffs.append(f"PUBTOOLINFO.{pk} ausente no PKG extraído (esperado {exp_pt[pk]!r})")
+                elif pk not in exp_pt:
+                    diffs.append(f"PUBTOOLINFO.{pk} não autorizado adicionado no PKG ({ext_pt[pk]!r})")
+                elif exp_pt[pk] != ext_pt[pk]:
+                    diffs.append(
+                        f"PUBTOOLINFO.{pk} diverge do bundle (esperado {exp_pt[pk]!r}, extraído {ext_pt[pk]!r})"
+                    )
+            continue
+
+        if key not in exp_vals:
+            if key not in _ALLOWED_PACKAGER_SFO_KEYS:
+                diffs.append(f"chave não autorizada '{key}' adicionada no PKG ({ext_vals[key]!r})")
+            continue
+        if key not in ext_vals:
+            diffs.append(f"chave obrigatória '{key}' ausente no PKG extraído (esperado {exp_vals[key]!r})")
+            continue
+        if key in _ALLOWED_PACKAGER_SFO_KEYS:
+            continue
+        if exp_vals[key] != ext_vals[key]:
+            diffs.append(f"chave '{key}' diverge do bundle (esperado {exp_vals[key]!r}, extraído {ext_vals[key]!r})")
+    return diffs
+
+
 def inspect_and_validate_pkg(
     pkg_path: Path,
     *,
@@ -550,7 +635,7 @@ def inspect_and_validate_pkg(
                     else:
                         expected_image0[rel] = _sha256_file(p)
 
-                # Sc0 icon0.png & pic1.png must match byte-for-byte (param.sfo gets img0_l0_size added by packager)
+                # Sc0 icon0.png & pic1.png must match byte-for-byte
                 for sc_key in ("Sc0/icon0.png", "Sc0/pic1.png"):
                     if sc_key in expected_sc0:
                         actual_sc_sha = (
@@ -558,6 +643,16 @@ def inspect_and_validate_pkg(
                         )
                         if actual_sc_sha != expected_sc0[sc_key]:
                             hash_mismatches.append(f"{sc_key}: SHA-256 diverge do bundle")
+
+                # Strict Sc0/param.sfo field comparison against expected bundle (Section 12)
+                exp_sfo_path = expected_content_dir / "sce_sys" / "param.sfo"
+                if exp_sfo_path.is_file():
+                    if "Sc0/param.sfo" not in sc0_blobs:
+                        hash_mismatches.append("Sc0/param.sfo: ausente no PKG extraído")
+                    else:
+                        sfo_diffs = compare_param_sfo_fields(exp_sfo_path.read_bytes(), sc0_blobs["Sc0/param.sfo"])
+                        for diff_msg in sfo_diffs:
+                            hash_mismatches.append(f"Sc0/param.sfo: {diff_msg}")
 
                 # Every Image0 file must exist and match SHA-256 byte-for-byte
                 for rel, exp_sha in sorted(expected_image0.items()):

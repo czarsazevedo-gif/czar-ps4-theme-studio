@@ -28,12 +28,23 @@ from .contracts import (
     LoudnessReport,
 )
 
+from ..config import PROJECT_ROOT
+
 ATRAC9_SUBFORMAT_GUID = bytes([
     0xD2, 0x42, 0xE1, 0x47, 0xBA, 0x36, 0x8D, 0x4D,
     0x88, 0xFC, 0x61, 0x65, 0x4F, 0x8C, 0x83, 0x6C,
 ])
 
-VGMSTREAM_CLI = shutil.which("vgmstream-cli") or shutil.which("vgmstream_cli")
+
+def find_vgmstream_cli() -> str | None:
+    """Locate vgmstream-cli preferring the project-local tools/bin installation."""
+    local = PROJECT_ROOT / "tools" / "bin" / "vgmstream-cli"
+    if local.is_file():
+        return str(local)
+    return shutil.which("vgmstream-cli") or shutil.which("vgmstream_cli")
+
+
+VGMSTREAM_CLI = find_vgmstream_cli()
 
 
 def decode_to_float64_stereo(
@@ -229,12 +240,14 @@ def patch_at9_smpl_loop(
     raise ValueError("Arquivo .at9 não contém bloco 'smpl' para atualizar pontos de loop.")
 
 
-def _vgmstream_check(path: Path) -> dict[str, Any] | None:
-    if not VGMSTREAM_CLI:
+def inspect_at9_vgmstream(path: Path) -> dict[str, Any] | None:
+    """Inspect an .at9 file using vgmstream-cli -m, parsing codec, sample rate, channels, total & loop samples."""
+    cli = find_vgmstream_cli()
+    if not cli:
         return None
     try:
         proc = subprocess.run(
-            [VGMSTREAM_CLI, "-m", str(path)],
+            [cli, "-m", str(path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=30,
@@ -245,7 +258,68 @@ def _vgmstream_check(path: Path) -> dict[str, Any] | None:
     if proc.returncode != 0:
         return {"ok": False, "output": proc.stderr.decode("utf-8", "replace")[:200]}
     text = proc.stdout.decode("utf-8", "replace")
-    return {"ok": "ATRAC9" in text.upper(), "output": text[:400]}
+
+    def _m_int(pattern: str) -> int | None:
+        m = re.search(pattern, text, re.IGNORECASE)
+        return int(m.group(1)) if m else None
+
+    enc_m = re.search(r"encoding:\s*(.+)", text, re.IGNORECASE)
+    encoding = enc_m.group(1).strip() if enc_m else ""
+    sr = _m_int(r"sample rate:\s*(\d+)\s*Hz")
+    ch = _m_int(r"channels:\s*(\d+)")
+    total_samples = _m_int(r"stream total samples:\s*(\d+)")
+    loop_start = _m_int(r"loop start:\s*(\d+)\s*samples")
+    loop_end = _m_int(r"loop end:\s*(\d+)\s*samples")
+    bitrate_kbps = _m_int(r"bitrate:\s*(\d+)\s*kbps")
+
+    return {
+        "ok": "ATRAC9" in encoding.upper() or "ATRAC9" in text.upper(),
+        "encoding": encoding,
+        "sample_rate": sr,
+        "channels": ch,
+        "total_samples": total_samples,
+        "loop_start": loop_start,
+        "loop_end": loop_end,
+        "bitrate_kbps": bitrate_kbps,
+        "output": text[:600],
+    }
+
+
+def decode_at9_vgmstream(
+    path: Path,
+    *,
+    ignore_loop: bool = True,
+    loops: int = 1,
+    fade_sec: float = 0.0,
+    sample_rate: int = PS4_ATRAC9_SAMPLE_RATE,
+) -> np.ndarray:
+    """Decode an .at9 file via vgmstream-cli with exact PS4 encoder-delay compensation or multi-cycle looping."""
+    cli = find_vgmstream_cli()
+    if not cli:
+        raise media.MediaError("vgmstream-cli indisponível.")
+    with tempfile.TemporaryDirectory(prefix="czar-vgm-") as td:
+        out_wav = Path(td) / "decoded.wav"
+        cmd = [cli]
+        if ignore_loop:
+            cmd.append("-i")
+        else:
+            cmd += ["-l", str(max(1, int(loops))), "-f", f"{max(0.0, float(fade_sec)):g}"]
+        cmd += ["-o", str(out_wav), str(path)]
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            creationflags=media.NO_WINDOW,
+        )
+        if proc.returncode != 0 or not out_wav.is_file():
+            err = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
+            raise media.MediaError(f"vgmstream-cli falhou ao decodificar {path.name}: {err[:200]}")
+        return decode_to_float64_stereo(out_wav, sample_rate=sample_rate)
+
+
+def _vgmstream_check(path: Path) -> dict[str, Any] | None:
+    return inspect_at9_vgmstream(path)
 
 
 def validate_at9(
@@ -382,7 +456,29 @@ def validate_at9(
     if vgm is not None:
         validator = "ffmpeg+vgmstream+riff"
         if not vgm["ok"]:
-            warnings.append(f"vgmstream-cli relatou alerta: {vgm['output']}")
+            errors.append(f"vgmstream-cli rejeitou o .at9: {vgm['output']}")
+        else:
+            if vgm.get("sample_rate") and vgm["sample_rate"] != riff["sample_rate"]:
+                errors.append(
+                    f"vgmstream-cli divergiu na taxa de amostragem ({vgm['sample_rate']} vs {riff['sample_rate']})."
+                )
+            if vgm.get("channels") and vgm["channels"] != riff["channels"]:
+                errors.append(f"vgmstream-cli divergiu nos canais ({vgm['channels']} vs {riff['channels']}).")
+            if require_loop and (vgm.get("loop_start") is None or vgm.get("loop_end") is None):
+                errors.append("vgmstream-cli não detectou pontos de loop válidos no arquivo .at9.")
+            elif (
+                vgm.get("loop_start") is not None
+                and vgm.get("loop_end") is not None
+                and riff.get("loop_start") is not None
+                and riff.get("loop_end") is not None
+            ):
+                delay = int(riff.get("encoder_delay") or 0)
+                exp_ls = max(0, int(riff["loop_start"]) - delay)
+                exp_le = max(exp_ls + 1, int(riff["loop_end"]) - delay + 1)
+                if abs(int(vgm["loop_start"]) - exp_ls) > 2 or abs(int(vgm["loop_end"]) - exp_le) > 2:
+                    warnings.append(
+                        f"vgmstream loop [{vgm['loop_start']}..{vgm['loop_end']}] difere do smpl descontado [{exp_ls}..{exp_le}]."
+                    )
 
     return At9ValidationReport(
         valid=len(errors) == 0,

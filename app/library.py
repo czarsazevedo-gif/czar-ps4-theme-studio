@@ -43,6 +43,7 @@ FORMATS = {
     ".tif": ("tiff_pipe", "TIFF", "image/tiff"),
     ".tiff": ("tiff_pipe", "TIFF", "image/tiff"),
     ".dds": ("dds_pipe", "DDS", "image/vnd-ms.dds"),
+    ".svg": ("svg", "SVG", "image/svg+xml"),
     ".mp4": ("mov", "ISO BMFF", "video/mp4"),
     ".m4v": ("mov m4v", "M4V", "video/mp4"),
     ".mov": ("mov", "QuickTime", "video/quicktime"),
@@ -175,9 +176,28 @@ def webm_header(source: Path) -> bool:
 
 
 def inspect_source(source: Path, thumb: Path) -> dict:
+    extension = source.suffix
+    if extension == ".svg":
+        try:
+            media.validate_svg_safe(source)
+            media.render_image(source, thumb, (320, 180))
+        except media.MediaError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if not thumb.is_file():
+            raise HTTPException(422, "O arquivo SVG não produziu uma imagem legível.")
+        return {
+            "kind": "image",
+            "format": "SVG",
+            "mime": "image/svg+xml",
+            "codec": "svg",
+            "width": 512,
+            "height": 512,
+            "fps": None,
+            "duration": None,
+            "hasThumbnail": True,
+        }
     if not media.FFPROBE or not media.FFMPEG:
         raise HTTPException(503, "Instale FFmpeg e FFprobe no Codespace.")
-    extension = source.suffix
     allowed, format_name, mime = FORMATS[extension]
     names = allowed.split()
     if "mov" in names:

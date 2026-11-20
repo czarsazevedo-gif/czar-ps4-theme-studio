@@ -73,6 +73,15 @@ def raster(root: Path, ident: str) -> Path:
     cache.mkdir(parents=True, exist_ok=True)
     target = cache / f"{ident}.png"
     if not target.is_file():
+        if source.suffix.lower() == ".svg":
+            with tempfile.TemporaryDirectory(dir=cache) as stage:
+                output = Path(stage) / "raster.png"
+                try:
+                    media.render_image(source, output, (512, 512))
+                except media.MediaError as exc:
+                    raise HTTPException(422, str(exc)) from exc
+                output.replace(target)
+            return target
         if not media.FFMPEG:
             raise HTTPException(503, "FFmpeg indisponível no servidor.")
         with tempfile.TemporaryDirectory(dir=cache) as stage:

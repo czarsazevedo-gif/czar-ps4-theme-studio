@@ -311,8 +311,74 @@ def iter_raw_frames(
         yield last
 
 
+def _find_svg_rasterizer() -> str | None:
+    from .config import PROJECT_ROOT
+
+    local = PROJECT_ROOT / "tools" / "bin" / "magick"
+    if local.is_file():
+        return str(local)
+    return shutil.which("magick") or shutil.which("convert")
+
+
+def validate_svg_safe(src: Path) -> None:
+    """Validate that an SVG file is clean UTF-8 XML without XXE, external links, or active scripts."""
+    raw = src.read_bytes()
+    if not raw or len(raw) > 4 * 1024 * 1024 or b"\x00" in raw:
+        raise MediaError("Arquivo SVG inválido ou vazio.")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MediaError("Arquivo SVG precisa estar codificado em UTF-8.") from exc
+    low = text.lower()
+    if "<svg" not in low:
+        raise MediaError("Arquivo .svg não contém um elemento <svg> válido.")
+    for forbidden in ("<!entity", "<!doctype", "<script", "javascript:", "href=\"http", "href='http", "href=\"file:", "href='file:"):
+        if forbidden in low:
+            raise MediaError(f"SVG contém recurso externo ou script não permitido ({forbidden}).")
+
+
+def _rasterize_svg_rgba(src: Path, size: tuple[int, int]) -> "Image.Image":
+    """Rasterize an SVG cleanly onto transparent RGBA with zero dark alpha halo via ImageMagick + Pillow Lanczos."""
+    import tempfile
+    from PIL import Image
+
+    validate_svg_safe(src)
+    magick = _find_svg_rasterizer()
+    if not magick:
+        raise MediaError("ImageMagick (magick/convert) indisponível para rasterizar ícones SVG.")
+    width, height = size
+    supersample = min(1024, max(width, height) * 2)
+    with tempfile.TemporaryDirectory(prefix="czar-svg-") as td:
+        out_png = Path(td) / "raster.png"
+        _run([
+            magick,
+            "-background", "none",
+            "-density", "384",
+            str(src),
+            "-resize", f"{supersample}x{supersample}",
+            f"PNG32:{out_png}",
+        ])
+        if not out_png.is_file():
+            raise MediaError("Falha ao rasterizar ícone SVG com ImageMagick.")
+        with Image.open(out_png) as im:
+            rgba = im.convert("RGBA")
+            sw, sh = rgba.size
+            if sw <= 0 or sh <= 0:
+                raise MediaError("SVG rasterizado possui dimensões inválidas.")
+            # Preserve aspect ratio cleanly inside target square/box without cropping strokes
+            if width == height and sw == sh:
+                return rgba.resize((width, height), Image.Resampling.LANCZOS) if (sw, sh) != (width, height) else rgba.copy()
+            scale = min(width / sw, height / sh)
+            nw = max(1, int(round(sw * scale)))
+            nh = max(1, int(round(sh * scale)))
+            resized = rgba.resize((nw, nh), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            canvas.paste(resized, ((width - nw) // 2, (height - nh) // 2), resized)
+            return canvas
+
+
 def _render_transparent_rgba(src: Path, size: tuple[int, int]) -> "Image.Image | None":
-    """Return a premultiplied-alpha Lanczos cover-cropped RGBA image when `src` has real transparency.
+    """Return a premultiplied-alpha Lanczos cover-cropped RGBA image when `src` has real transparency or is SVG.
 
     FFmpeg's swscale resamples straight RGBA channels independently, creating dark fringe halos
     around transparent antialiased icon edges. Pillow's Lanczos filter properly premultiplies alpha.
@@ -321,7 +387,10 @@ def _render_transparent_rgba(src: Path, size: tuple[int, int]) -> "Image.Image |
     """
     from PIL import Image, ImageOps
 
-    if src.suffix.lower() in {".dds", ".gif", ".apng"}:
+    ext = src.suffix.lower()
+    if ext == ".svg":
+        return _rasterize_svg_rgba(src, size)
+    if ext in {".dds", ".gif", ".apng"}:
         return None
     try:
         with Image.open(src) as im:

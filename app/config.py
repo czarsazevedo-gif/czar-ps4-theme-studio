@@ -353,7 +353,7 @@ PREVIEW_WEBP_QUALITY = 82
 
 # Extensions accepted by each screen.
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".gif", ".apng", ".wmv", ".flv"}
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".gif", ".dds"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".gif", ".dds", ".svg"}
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 
 
