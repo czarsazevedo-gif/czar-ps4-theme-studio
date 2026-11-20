@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict
 
 from . import at9, compositor, jobs, library, mdx, media, ouroboros, pkg, projects, raf, theme, theme_xml, vag
 from .forge import audio_router as forge_audio
+from .forge import bundle_service as forge_bundle
 from .forge.audio_validation import measure_loudness, validate_at9
 from .config import (
     ANIMATED_FRAME_BYTES,
@@ -67,6 +68,7 @@ app.include_router(library.router)
 app.include_router(compositor.router)
 app.include_router(ouroboros.router)
 app.include_router(forge_audio.router)
+app.include_router(forge_bundle.router)
 
 #: The UI used to allow going over the cap "so the red bar could be seen".
 #: That let you assemble a theme the console rejects with CE-38196-7, so it no
@@ -1028,23 +1030,65 @@ def _add_animated_scene(
 ) -> dict:
     """Writes scene/background.raf/ with the frames, the plane and the scene.
 
-    The animated background is a 3D scene: one shared plane, one material per
-    frame and a sequence that cross-fades the actors' alpha.
+    Reuses pre-approved Ouroboros/Deluxe DDS frames byte-for-byte when available
+    and no compositor overlay alters them, preserving exact RAF equivalence.
     """
     raf_dir = content_dir / THEME_PATHS["raf_dir"]
     raf_dir.mkdir(parents=True, exist_ok=True)
 
     size = _composed_animation_size(job, animation_size)
     overlay = _render_animation_overlay(composition, size)
-    info = media.probe(job.source)
-    frames_in = media.iter_raw_frames(job.source, frames, size, info.duration)
     names: list[str] = []
     total = 0
-    for index, blob in encode_sequence(compositor.compose_frames(frames_in, overlay), backend):
-        name = theme.frame_name(index)
-        (raf_dir / name).write_bytes(blob)
-        names.append(name)
-        total += len(blob)
+
+    deluxe = job.meta.get("deluxe")
+    deluxe_match = (
+        isinstance(deluxe, dict)
+        and deluxe.get("frames") == frames
+        and list(deluxe.get("size") or []) == list(size)
+    )
+    dds_dir = job.root / "deluxe_dds"
+    png_dir = job.root / "deluxe_frames"
+
+    if (
+        deluxe_match
+        and overlay is None
+        and backend == DEFAULT_BACKEND
+        and dds_dir.is_dir()
+        and all((dds_dir / theme.frame_name(i)).is_file() for i in range(frames))
+    ):
+        for index in range(frames):
+            name = theme.frame_name(index)
+            blob = (dds_dir / name).read_bytes()
+            (raf_dir / name).write_bytes(blob)
+            names.append(name)
+            total += len(blob)
+    elif (
+        deluxe_match
+        and png_dir.is_dir()
+        and all((png_dir / f"{i:02d}.png").is_file() for i in range(frames))
+    ):
+        from PIL import Image
+        import numpy as np
+
+        def _deluxe_rgba():
+            for index in range(frames):
+                with Image.open(png_dir / f"{index:02d}.png") as im:
+                    yield np.asarray(im.convert("RGBA"))
+
+        for index, blob in encode_sequence(compositor.compose_frames(_deluxe_rgba(), overlay), backend):
+            name = theme.frame_name(index)
+            (raf_dir / name).write_bytes(blob)
+            names.append(name)
+            total += len(blob)
+    else:
+        info = media.probe(job.source)
+        frames_in = media.iter_raw_frames(job.source, frames, size, info.duration)
+        for index, blob in encode_sequence(compositor.compose_frames(frames_in, overlay), backend):
+            name = theme.frame_name(index)
+            (raf_dir / name).write_bytes(blob)
+            names.append(name)
+            total += len(blob)
 
     half_w, half_h = raf.plane_half_size()
     plane = mdx.quad_model(node_name=raf.MODEL_ID, half_w=half_w, half_h=half_h)
