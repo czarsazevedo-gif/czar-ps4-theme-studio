@@ -215,7 +215,10 @@ def build_and_validate_theme_pkg(
         check()
         progress("Publicando PKG validado de forma atômica", 95)
         tmp_final = dest_dir / f".{final_pkg_name}.tmp"
-        shutil.copyfile(built_pkg, tmp_final)
-        tmp_final.replace(final_pkg_path)
+        try:
+            shutil.copyfile(built_pkg, tmp_final)
+            tmp_final.replace(final_pkg_path)
+        finally:
+            tmp_final.unlink(missing_ok=True)
 
     return final_pkg_path, bundle_report, pkg_report, log_steps

@@ -158,11 +158,19 @@ PkgVerificationLevel = Literal[
     "full_bundle_verified",
 ]
 
+PackageStatusTier = Literal[
+    "FALHA DE EMPACOTAMENTO",
+    "PACOTE GERADO",
+    "PACOTE VALIDADO ESTRUTURALMENTE",
+    "PACOTE TESTADO NO PS4",
+]
+
 
 class PkgValidationReport(ForgeModel):
     pkg_created: bool
     structure_validated: bool
     theme_type_valid: bool
+    package_status: PackageStatusTier = "FALHA DE EMPACOTAMENTO"
     verification_level: PkgVerificationLevel = "failed"
     header_and_crypto_valid: bool = False
     sc0_validated: bool = False

@@ -419,7 +419,11 @@ def forge_pkg_history() -> dict:
                     "iro_tag_header": pr.get("iro_tag_header"),
                     "iro_tag_sfo": pr.get("iro_tag_sfo"),
                     "category": pr.get("category", ""),
-                    "verification_level": pr.get("verification_level", "full_bundle_verified"),
+                    "verification_level": pr.get("verification_level", "failed"),
+                    "package_status": pr.get(
+                        "package_status",
+                        "PACOTE VALIDADO ESTRUTURALMENTE" if pr.get("structure_validated") else "PACOTE GERADO",
+                    ),
                     "structure_validated": pr.get("structure_validated", False),
                     "theme_type_valid": pr.get("theme_type_valid", False),
                     "physical_compatibility": pr.get("physical_compatibility", "pending"),

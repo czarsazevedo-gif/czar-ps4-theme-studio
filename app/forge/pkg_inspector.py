@@ -583,26 +583,32 @@ def inspect_and_validate_pkg(
         and iro_tag_sfo == PS4_THEME_IRO_TAG
     )
 
-    # CZAR-AUD-004: strict, honest verification tiers — NEVER mark structure_validated=True
-    # when Image0 could not be extracted, and NEVER mark extracted_match=True without bundle comparison!
+    # CZAR-AUD-004 + Section 19: strict, honest verification tiers — NEVER mark structure_validated=True
+    # when Image0 could not be extracted, NEVER mark extracted_match=True without bundle comparison,
+    # and NEVER automatically claim PACOTE TESTADO NO PS4!
     base_ok = len(errors) == 0 and theme_type_valid and header_and_crypto_valid and sc0_validated
     if not base_ok:
         verification_level = "failed"
         structure_validated = False
+        package_status = "FALHA DE EMPACOTAMENTO"
     elif not image0_extracted:
         verification_level = "header_and_sc0_only"
         structure_validated = False
+        package_status = "PACOTE GERADO"
     elif bundle_compared and bundle_hashes_matched:
         verification_level = "full_bundle_verified"
         structure_validated = True
+        package_status = "PACOTE VALIDADO ESTRUTURALMENTE"
     else:
         verification_level = "extracted_uncompared"
         structure_validated = True
+        package_status = "PACOTE VALIDADO ESTRUTURALMENTE"
 
     return PkgValidationReport(
         pkg_created=True,
         structure_validated=structure_validated,
         theme_type_valid=theme_type_valid,
+        package_status=package_status,
         verification_level=verification_level,
         header_and_crypto_valid=header_and_crypto_valid,
         sc0_validated=sc0_validated,

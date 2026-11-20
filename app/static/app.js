@@ -1913,18 +1913,19 @@ function forgeVerificationLabel(level) {
 function forgeRenderPkgResult(record) {
   const pr = record.pkg_report || {};
   const valid = Boolean(pr.structure_validated);
+  const pkgStatus = pr.package_status || (valid ? "PACOTE VALIDADO ESTRUTURALMENTE" : (pr.pkg_created ? "PACOTE GERADO" : "FALHA DE EMPACOTAMENTO"));
   const dlUrl = Projects.mediaUrl(record.download || `/api/forge/pkg/${record.pkg_id}/download`);
   $("pkg-result").hidden = false;
   $("pkg-result").innerHTML = `
-    <h2 class="card-title">${valid ? "PKG PS4 construído e validado" : "PKG com falha de validação"} · ${fmtBytes(record.pkg_bytes || pr.pkg_bytes || 0)}</h2>
+    <h2 class="card-title">${forgeEsc(pkgStatus)} · ${fmtBytes(record.pkg_bytes || pr.pkg_bytes || 0)}</h2>
     <div class="forge-report-kv">
       <div><span>Arquivo</span><code>${forgeEsc(record.pkg_name || "")}</code></div>
+      <div><span>Estágio do pacote</span><b>PACOTE GERADO: ${pr.pkg_created !== false ? "Sim" : "Não"} · PACOTE VALIDADO ESTRUTURALMENTE: ${valid ? "Sim" : "Não"} · PACOTE TESTADO NO PS4: Pendente (PS4 Slim 12.52)</b></div>
       <div><span>Tipo / Volume</span><b>${forgeEsc(pr.volume_type || "pkg_ps4_theme")}</b></div>
       <div><span>Nível de verificação</span><b>${forgeEsc(forgeVerificationLabel(pr.verification_level))}</b></div>
       <div><span>IRO_TAG</span><b>cabeçalho 0x98 = ${forgeEsc(pr.iro_tag_header)} · SFO = ${forgeEsc(pr.iro_tag_sfo)}</b></div>
       <div><span>CATEGORY</span><b>${forgeEsc(pr.category || "ac")}</b></div>
       <div><span>bgmhome_loud</span><b>${pr.bgmhome_loud ? `${forgeEsc(pr.bgmhome_loud)} LKFS` : "Não aplicável (sem música)"}</b></div>
-      <div><span>Compatibilidade física</span><b>PENDENTE DE TESTE FÍSICO (PS4 Slim 12.52)</b></div>
     </div>
     <div class="forge-actions" style="margin-top:12px">
       <a class="dl-btn" href="${dlUrl}" download="${forgeEsc(record.pkg_name || "tema-ps4.pkg")}">BAIXAR PKG</a>
@@ -2127,8 +2128,9 @@ async function forgeOpenReport(pkgId = "") {
       : (pr.image0_extracted ? "Image0 extraído (sem bundle de referência)" : "Image0 não extraído");
     parts.push(`
       <div class="forge-report-kv">
-        <div><span>PKG CRIADO</span><b>${pr.pkg_created ? "Sim" : "Não"}</b></div>
-        <div><span>ESTRUTURA VALIDADA</span><b>${pr.structure_validated ? "Sim" : "Não"}</b></div>
+        <div><span>PACOTE GERADO</span><b>${pr.pkg_created ? "Sim" : "Não"}</b></div>
+        <div><span>PACOTE VALIDADO ESTRUTURALMENTE</span><b>${pr.structure_validated ? "Sim" : "Não"}</b></div>
+        <div><span>PACOTE TESTADO NO PS4</span><b>${pr.physical_compatibility === "verified" ? "Sim" : "Pendente (PS4 Slim 12.52)"}</b></div>
         <div><span>NÍVEL DE VERIFICAÇÃO</span><b>${forgeEsc(forgeVerificationLabel(pr.verification_level))}</b></div>
         <div><span>CABEÇALHO &amp; Sc0</span><b>Cabeçalho: ${pr.header_and_crypto_valid ? "OK" : "Falhou"} · Sc0: ${pr.sc0_validated ? "OK" : "Falhou"}</b></div>
         <div><span>TIPO DE TEMA</span><b>${forgeEsc(pr.volume_type)}</b></div>
@@ -2140,7 +2142,6 @@ async function forgeOpenReport(pkgId = "") {
         <div><span>SHA-256 do PKG</span><code>${forgeEsc(pr.pkg_sha256 || "")}</code></div>
         <div><span>Extração ↔ Bundle (SHA-256)</span><b>${forgeEsc(cmpText)}</b></div>
         <div><span>Builder / Validador</span><code>${forgeEsc(pr.builder_backend)} / ${forgeEsc(pr.validator_backend)}</code></div>
-        <div><span>COMPATIBILIDADE FÍSICA</span><b>PENDENTE DE TESTE FÍSICO (PS4 Slim 12.52)</b></div>
       </div>
       ${(pr.errors || []).length ? `<div class="notice notice-warn"><b>Erros PKG:</b> ${(pr.errors || []).map(forgeEsc).join("; ")}</div>` : ""}
       ${(pr.warnings || []).length ? `<p class="card-note"><b>Avisos PKG:</b> ${(pr.warnings || []).map(forgeEsc).join("; ")}</p>` : ""}
