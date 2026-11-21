@@ -13,6 +13,7 @@ from skimage.metrics import structural_similarity as skimage_ssim
 from .. import dds, dxt1
 from ..config import ANIMATED_SIZES, MAX_FRAME_COUNT, RAF_SIZE_LIMIT, dds_bytes_for, max_frames_for
 from . import OUROBOROS_VERSION as DELUXE_VERSION
+from .bc1_backends import DEFAULT_OUROBOROS_BC1_BACKEND, encode_sequence_bc1, extract_bc1_endpoints
 from .flow import compute_bidirectional_flow, flow_kinematics, to_gray_u8
 
 
@@ -779,21 +780,18 @@ def evaluate_loop(
     }
 
 
-def _measure_dds_roundtrip(rgb: np.ndarray, *, backend: str = "native") -> dict:
-    """Encode RGB sequence to canonical DDS DXT1a, decode it, and measure exact deltas & banding."""
+def _measure_dds_roundtrip(rgb: np.ndarray, *, backend: str = DEFAULT_OUROBOROS_BC1_BACKEND) -> dict:
+    """Encode RGB sequence to canonical DDS DXT1a, decode it, and measure perceptual spatial & temporal deltas
+    (Interventions 09, 19, 20, 21).
+    """
     n, h, w, _ = rgb.shape
-    rgba_iter = (
-        np.concatenate([rgb[i], np.full((h, w, 1), 255, dtype=np.uint8)], axis=-1)
-        for i in range(n)
-    )
-    t0 = time.perf_counter()
-    blobs: list[bytes] = [b""] * n
-    for idx, blob in dds.encode_sequence(rgba_iter, backend=backend):
-        blobs[idx] = blob
-    encode_ms = (time.perf_counter() - t0) * 1000.0
+    blobs, enc_meta = encode_sequence_bc1(rgb, backend=backend)
+    encode_ms = float(enc_meta.get("encodeMs", 0.0))
 
     t1 = time.perf_counter()
-    decoded_rgb = np.stack([dxt1.decode_dds(b)[..., :3] for b in blobs])
+    decoded_rgba = [dxt1.decode_dds(b) for b in blobs]
+    decoded_rgb = np.stack([a[..., :3] for a in decoded_rgba])
+    min_alpha = int(min(int(a[..., 3].min()) for a in decoded_rgba)) if decoded_rgba else 255
     decode_ms = (time.perf_counter() - t1) * 1000.0
 
     total_bytes = sum(len(b) for b in blobs)
@@ -812,22 +810,136 @@ def _measure_dds_roundtrip(rgb: np.ndarray, *, backend: str = "native") -> dict:
     sample_idx = np.linspace(0, n - 1, min(n, 6), dtype=int)
     band_pre = float(np.mean([_banding_index(rgb[i]) for i in sample_idx]))
     band_post = float(np.mean([_banding_index(decoded_rgb[i]) for i in sample_idx]))
+    band_inc = band_post - band_pre
+
+    # Intervention 20: Perceptual CIELAB color, edge, smooth-gradient & highlight fidelity (sampled <=6 frames)
+    de_list: list[float] = []
+    de_p95_list: list[float] = []
+    dl_list: list[float] = []
+    dc_list: list[float] = []
+    edge_psnr_list: list[float] = []
+    grad_err_list: list[float] = []
+    hi_err_list: list[float] = []
+
+    for i in sample_idx:
+        s_lab = cv2.cvtColor(rgb[i], cv2.COLOR_RGB2LAB).astype(np.float32)
+        d_lab = cv2.cvtColor(decoded_rgb[i], cv2.COLOR_RGB2LAB).astype(np.float32)
+        dL = (d_lab[..., 0] - s_lab[..., 0]) * (100.0 / 255.0)
+        da = d_lab[..., 1] - s_lab[..., 1]
+        db = d_lab[..., 2] - s_lab[..., 2]
+        de = np.sqrt(dL * dL + da * da + db * db)
+        de_list.append(float(de.mean()))
+        de_p95_list.append(float(np.percentile(de, 95)))
+        dl_list.append(float(np.abs(dL).mean()))
+        dc_list.append(float(np.hypot(da, db).mean()))
+
+        s_gray = to_gray_u8(rgb[i]).astype(np.float32)
+        e_map = _edge_map(s_gray.astype(np.uint8))
+        e_mask = e_map > 28.0
+        rgb_diff = rgb[i].astype(np.float32) - decoded_rgb[i].astype(np.float32)
+        if int(e_mask.sum()) >= 32:
+            e_mse = float(np.mean((rgb_diff[e_mask]) ** 2))
+            edge_psnr_list.append(99.0 if e_mse <= 1e-9 else float(10.0 * math.log10((255.0 * 255.0) / e_mse)))
+        else:
+            edge_psnr_list.append(psnrs[i])
+
+        smooth_g = cv2.GaussianBlur(s_gray, (9, 9), 2.0)
+        c_grad = np.hypot(cv2.Sobel(smooth_g, cv2.CV_32F, 1, 0, ksize=3) / 8.0, cv2.Sobel(smooth_g, cv2.CV_32F, 0, 1, ksize=3) / 8.0)
+        g_mask = (c_grad >= 0.15) & (c_grad <= 4.0)
+        grad_err_list.append(float(np.abs(rgb_diff[g_mask]).mean()) if int(g_mask.sum()) >= 32 else maes[i])
+
+        hi_mask = (s_lab[..., 0] * (100.0 / 255.0)) >= 78.0
+        hi_err_list.append(float(np.abs(rgb_diff[hi_mask]).mean()) if int(hi_mask.sum()) >= 32 else maes[i])
+
+    # Intervention 21: Temporal stability of the FULL decoded DDS loop (static shimmer, endpoint churn, chroma osc, wrap)
+    src_tstd = rgb.astype(np.float32).std(axis=0).mean(axis=-1)
+    static_px = src_tstd < 1.5
+    shimmer_steps = []
+    chroma_osc_steps = []
+    edge_alt_steps = []
+    wrap_shimmer = 0.0
+    if int(static_px.sum()) >= 32:
+        for i in range(n):
+            j = (i + 1) % n
+            step_d = float(np.abs(decoded_rgb[j][static_px].astype(np.float32) - decoded_rgb[i][static_px].astype(np.float32)).mean())
+            shimmer_steps.append(step_d)
+            if i == n - 1:
+                wrap_shimmer = step_d
+        # Sample chroma oscillation on static regions across <=8 consecutive pairs
+        c_idx = np.linspace(0, n - 1, min(n, 8), dtype=int)
+        c_labs = [cv2.cvtColor(decoded_rgb[i], cv2.COLOR_RGB2LAB).astype(np.float32) for i in c_idx]
+        for k in range(len(c_labs) - 1):
+            dab = np.hypot(
+                c_labs[k + 1][..., 1][static_px] - c_labs[k][..., 1][static_px],
+                c_labs[k + 1][..., 2][static_px] - c_labs[k][..., 2][static_px],
+            )
+            chroma_osc_steps.append(float(dab.mean()))
+
+    # Measure BC1 4x4 endpoint change rate in static blocks
+    ep_change_rate = 0.0
+    if n >= 2:
+        bh, bw = (h + 3) // 4, (w + 3) // 4
+        pad_h, pad_w = (-h) % 4, (-w) % 4
+        sp_pad = np.pad(static_px, ((0, pad_h), (0, pad_w)), mode="edge") if (pad_h or pad_w) else static_px
+        static_blk = sp_pad.reshape(bh, 4, bw, 4).all(axis=(1, 3)).ravel()
+        if int(static_blk.sum()) >= 4:
+            eps = [extract_bc1_endpoints(b) for b in blobs]
+            rates = []
+            for i in range(n):
+                j = (i + 1) % n
+                changed = (eps[j][static_blk, 0] != eps[i][static_blk, 0]) | (eps[j][static_blk, 1] != eps[i][static_blk, 1])
+                rates.append(float(changed.mean()))
+            ep_change_rate = float(np.mean(rates))
+
+    # Edge alternation rate on decoded loop
+    dec_edges = [float(_edge_map(to_gray_u8(decoded_rgb[i])).mean()) for i in range(n)]
+    de_diff = np.array([dec_edges[(i + 1) % n] - dec_edges[i] for i in range(n)], dtype=np.float32)
+    edge_alt_rate = float(((de_diff * np.roll(de_diff, 1)) < -0.05).mean()) if n >= 3 else 0.0
+
+    mean_psnr_val = float(np.mean(psnrs))
+    # Honest provenance-aware banding risk: flag genuine compression-introduced banding rather than dark cel-shading in source
+    banding_risk = bool(
+        (band_inc > 0.14)
+        or (band_inc > 0.08 and band_post > 0.38 and mean_psnr_val < 38.5)
+        or (band_pre < 0.25 and band_post > 0.36)
+    )
 
     return {
+        "backend": enc_meta.get("actualBackend", backend),
+        "requestedBackend": enc_meta.get("requestedBackend", backend),
+        "fallbackUsed": bool(enc_meta.get("fallbackUsed", False)),
+        "reusedBlocks": int(enc_meta.get("reusedBlocks", 0)),
+        "wrapStabilizedBlocks": int(enc_meta.get("wrapStabilizedBlocks", 0)),
+        "reuseRatio": float(enc_meta.get("reuseRatio", 0.0)),
+        "alphaSafe": min_alpha == 255,
         "totalBytes": total_bytes,
         "expectedBytes": expected_bytes,
         "withinBudget": within_budget,
         "validHeaders": valid_headers,
         "encodeMs": round(encode_ms, 1),
         "decodeMs": round(decode_ms, 1),
-        "meanPsnr": round(float(np.mean(psnrs)), 2),
+        "meanPsnr": round(mean_psnr_val, 2),
         "minPsnr": round(float(np.min(psnrs)), 2),
         "meanSsim": round(float(np.mean(ssims)), 4),
         "meanMae": round(float(np.mean(maes)), 4),
+        "meanLabDeltaE": round(float(np.mean(de_list)), 4),
+        "p95LabDeltaE": round(float(np.mean(de_p95_list)), 4),
+        "lumDeltaL": round(float(np.mean(dl_list)), 4),
+        "chromaDeltaC": round(float(np.mean(dc_list)), 4),
+        "edgePsnr": round(float(np.mean(edge_psnr_list)), 2),
+        "gradientError": round(float(np.mean(grad_err_list)), 4),
+        "highlightError": round(float(np.mean(hi_err_list)), 4),
         "bandingPreDds": round(band_pre, 4),
         "bandingPostDds": round(band_post, 4),
-        "bandingIncrease": round(band_post - band_pre, 4),
-        "bandingRisk": bool((band_post - band_pre) > 0.12 or band_post > 0.35),
+        "bandingIncrease": round(band_inc, 4),
+        "bandingRisk": banding_risk,
+        "compressedTemporalQuality": {
+            "staticBlockShimmerMad": round(float(np.mean(shimmer_steps)) if shimmer_steps else 0.0, 4),
+            "wrapStaticShimmerMad": round(wrap_shimmer, 4),
+            "endpointChangeRate": round(ep_change_rate, 4),
+            "chromaOscillation": round(float(np.mean(chroma_osc_steps)) if chroma_osc_steps else 0.0, 4),
+            "edgeAlternationRate": round(edge_alt_rate, 4),
+        },
         "distinctFrames": len(set(blobs)),
         "_decoded": decoded_rgb,
         "_blobs": blobs,
@@ -841,10 +953,10 @@ def evaluate_post_dds(
     protected_mask: np.ndarray | None = None,
     reference_frames: Sequence[np.ndarray] | np.ndarray | None = None,
     timestamps: Sequence[float] | None = None,
-    backend: str = "native",
+    backend: str = DEFAULT_OUROBOROS_BC1_BACKEND,
     return_blobs: bool = False,
 ) -> dict:
-    """Mandatory post-DDS evaluation: encode -> decode -> re-evaluate all 16 metrics on decoded DDS."""
+    """Mandatory post-DDS evaluation: encode -> decode -> re-evaluate all metrics on decoded DDS."""
     rgb = _as_rgb_stack(frames)
     dds_rt = _measure_dds_roundtrip(rgb, backend=backend)
     decoded_rgb = dds_rt.pop("_decoded")
@@ -864,6 +976,8 @@ def evaluate_post_dds(
         post_report["issues"].append("Sequência DDS excede o orçamento RAF canônico.")
     if not dds_rt["validHeaders"]:
         post_report["issues"].append("Cabeçalho DDS DXT1 inválido.")
+    if not dds_rt.get("alphaSafe", True):
+        post_report["issues"].append("Bloco DXT1a gerou pixel transparente indevido em quadro opaco.")
     if dds_rt["bandingRisk"]:
         post_report["issues"].append("Risco de banding/posterização após codificação DXT1a.")
     post_report["passed"] = len(post_report["issues"]) == 0

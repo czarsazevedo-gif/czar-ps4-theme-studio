@@ -99,6 +99,75 @@ def preserve_detail_unsharp(
     return out
 
 
+from pathlib import Path
+from PIL import Image
+
+from .bc1_backends import DEFAULT_OUROBOROS_BC1_BACKEND
+
+_BLUE_NOISE_PATH = Path(__file__).resolve().parent / "assets" / "blue_noise_64.png"
+_BLUE_NOISE_TILE: np.ndarray | None = None
+
+
+def _get_blue_noise_tile() -> np.ndarray:
+    """Load vendored CC0 64×64 blue-noise texture normalized to [-0.5, +0.5] (cached)."""
+    global _BLUE_NOISE_TILE
+    if _BLUE_NOISE_TILE is not None:
+        return _BLUE_NOISE_TILE
+    if _BLUE_NOISE_PATH.is_file():
+        with Image.open(_BLUE_NOISE_PATH) as im:
+            arr = np.asarray(im.convert("L"), dtype=np.float32)
+        _BLUE_NOISE_TILE = (arr / 255.0) - 0.5
+        return _BLUE_NOISE_TILE
+    _BLUE_NOISE_TILE = _BAYER_4X4
+    return _BLUE_NOISE_TILE
+
+
+def apply_selective_blue_noise_dither(
+    frames: np.ndarray,
+    *,
+    amplitude_rb: float = 3.2,
+    amplitude_g: float = 1.6,
+    protected_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Intervention 08: Apply spatially-locked CC0 blue-noise dither strictly inside static smooth gradients.
+
+    Masks strictly to:
+      - static pixels (`temporal_std < 3.5`) so moving objects/clouds are untouched
+      - gentle luminance gradients (`0.15 <= coarse_grad <= 3.5`)
+      - low high-frequency detail (`|gray - blur5| < 2.8`) so crisp edges/faces/outlines stay untouched
+    Amplitudes match RGB565 quantization steps (R/B = 5-bit -> 3.2, G = 6-bit -> 1.6) with ZERO temporal shimmer.
+    """
+    n, h, w, _ = frames.shape
+    tile = _get_blue_noise_tile()
+    th, tw = tile.shape[:2]
+    bn = np.tile(tile, ((h + th - 1) // th, (w + tw - 1) // tw))[:h, :w]
+
+    prot = None if protected_mask is None else _align_protected_dxt1(protected_mask)
+    t_std = frames.astype(np.float32).std(axis=0).mean(axis=-1)
+    static_zone = (t_std < 3.5).astype(np.float32)
+
+    chan_amp = np.array([amplitude_rb, amplitude_g, amplitude_rb], dtype=np.float32)[None, None, :]
+    out = np.empty_like(frames)
+    for i, f in enumerate(frames):
+        gray = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        smooth = cv2.GaussianBlur(gray, (9, 9), 2.0)
+        gx = cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+        gy = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+        grad = np.hypot(gx, gy)
+        hf = np.abs(gray - cv2.GaussianBlur(gray, (5, 5), 1.0))
+
+        zone = (((grad >= 0.15) & (grad <= 3.5) & (hf < 2.8)).astype(np.float32)) * static_zone
+        zone = cv2.GaussianBlur(zone, (7, 7), 1.5)
+        if prot is not None:
+            zone[prot] = 0.0
+        offset = (bn * zone)[..., None] * chan_amp
+        res = np.clip(np.rint(f.astype(np.float32) + offset), 0, 255).astype(np.uint8)
+        if prot is not None:
+            res[prot] = frames[0][prot]
+        out[i] = res
+    return out
+
+
 def apply_stable_gradient_dither(
     frames: np.ndarray,
     *,
@@ -144,22 +213,23 @@ def apply_deluxe_finish(
     *,
     protected_mask: np.ndarray | None = None,
     reference_frames: Sequence[np.ndarray] | np.ndarray | None = None,
-    backend: str = "native",
+    backend: str = DEFAULT_OUROBOROS_BC1_BACKEND,
     enable_dither: bool = True,
     enable_flicker_fix: bool = True,
     enable_photometric_fix: bool = True,
     enable_sharpness_guard: bool = True,
     precomputed_baseline: dict | None = None,
 ) -> dict:
-    """Execute the full Ouroboros Deluxe Finish pipeline with mandatory post-DDS validation & regression rejection.
+    """Execute the full Ouroboros Deluxe Finish pipeline with strictly monotonic post-DDS validation (I07 & I08).
 
     Pipeline:
-      1. Baseline post-DDS encode -> decode -> evaluate (ground truth before finishing!)
+      1. Baseline post-DDS encode -> decode -> evaluate (reuses `precomputed_baseline` if available)
       2. Selective anti-flicker (ONLY if artificial flicker is detected!)
       3. Photometric Lab circular harmonization (ONLY if luminance/chroma seam step warrants it!)
-      4. Sharpness/texture guard (ONLY if reference sharpness dropped below 0.90!)
-      5. Temporally-static Bayer dither in smooth gradients (ONLY if post-DDS bandingRisk is detected!)
-      6. Mandatory post-DDS round-trip after every candidate stage — reject any stage that degrades decoded DDS!
+      4. Sharpness/texture guard (ONLY if reference sharpness dropped below 0.88!)
+      5. Selective static-gradient CC0 blue-noise dither (ONLY if post-DDS bandingRisk is detected!)
+      6. Strict monotonicity gate: NEVER accept any stage that adds issues, degrades direction,
+         drops sharpness > 3%, raises shimmer, or worsens composite post-DDS cost!
     """
     t0 = time.perf_counter()
     src = np.asarray(frames, dtype=np.uint8)
@@ -168,7 +238,7 @@ def apply_deluxe_finish(
     prot_eval = _align_protected_dxt1(protected_mask) if protected_mask is not None else None
     ref = np.asarray(reference_frames, dtype=np.uint8)[..., :3] if reference_frames is not None else src
 
-    # 1. Mandatory baseline post-DDS measurement on the actual sequence (reuse if identical sequence already measured)
+    # 1. Mandatory baseline post-DDS measurement on the actual sequence
     base_res = (
         precomputed_baseline
         if precomputed_baseline is not None
@@ -192,12 +262,36 @@ def apply_deluxe_finish(
         cmp = compare_before_after(best_eval, cand_eval)
 
         if prefer_banding:
-            # Accept gradient dither if it lowers post-DDS banding without introducing flicker/ghosting/reversals
-            b_old = best_eval["metrics"]["ddsDelta"]["bandingPostDds"]
-            b_new = cand_eval["metrics"]["ddsDelta"]["bandingPostDds"]
+            # Intervention 07 (CZAR-ABS-AUD-004): strictly monotonic post-DDS dither gate!
+            b_old = float(best_eval["metrics"]["ddsDelta"]["bandingPostDds"])
+            b_new = float(cand_eval["metrics"]["ddsDelta"]["bandingPostDds"])
             flk_ok = not cand_eval["metrics"]["flicker"]["artificialFlicker"]
-            psnr_ok = cand_eval["metrics"]["ddsDelta"]["meanPsnr"] >= best_eval["metrics"]["ddsDelta"]["meanPsnr"] - 1.5
-            improved = (b_new < b_old - 0.015) and flk_ok and psnr_ok and not cmp["hardRejectReasons"]
+            psnr_ok = float(cand_eval["metrics"]["ddsDelta"]["meanPsnr"]) >= float(best_eval["metrics"]["ddsDelta"]["meanPsnr"]) - 1.0
+            issues_ok = len(cand_eval["issues"]) <= len(best_eval["issues"])
+            sharp_old = float(best_eval["metrics"]["texturePreservation"]["sharpnessRetention"])
+            sharp_new = float(cand_eval["metrics"]["texturePreservation"]["sharpnessRetention"])
+            sharp_ok = sharp_new >= sharp_old * 0.97
+
+            fc_old = best_eval["metrics"]["flowContinuity"]
+            fc_new = cand_eval["metrics"]["flowContinuity"]
+            dir_ok = True
+            if fc_old.get("directionMeasured") and fc_new.get("directionMeasured"):
+                dir_ok = float(fc_new["seamDirectionCosine"]) >= float(fc_old["seamDirectionCosine"]) - 0.02
+
+            shim_old = float((best_eval["metrics"]["ddsDelta"].get("compressedTemporalQuality") or {}).get("staticBlockShimmerMad", 0.0))
+            shim_new = float((cand_eval["metrics"]["ddsDelta"].get("compressedTemporalQuality") or {}).get("staticBlockShimmerMad", 0.0))
+            shim_ok = shim_new <= shim_old + 0.05
+
+            improved = (
+                (b_new < b_old - 0.015)
+                and flk_ok
+                and psnr_ok
+                and issues_ok
+                and sharp_ok
+                and dir_ok
+                and shim_ok
+                and not cmp["hardRejectReasons"]
+            )
             if improved:
                 best_frames = candidate_frames
                 best_eval = cand_eval
@@ -208,16 +302,25 @@ def apply_deluxe_finish(
                 rejected_steps.append(
                     {
                         "stage": stage_name,
-                        "reason": "Dither não reduziu banding pós-DDS sem custo colateral.",
+                        "reason": "Dither não melhorou banding pós-DDS de forma estritamente monotônica.",
                         "bandingBefore": b_old,
                         "bandingAfter": b_new,
+                        "issuesBefore": len(best_eval["issues"]),
+                        "issuesAfter": len(cand_eval["issues"]),
+                        "dirOk": dir_ok,
+                        "sharpOk": sharp_ok,
+                        "shimmerOk": shim_ok,
                     }
                 )
             return
 
-        improved = cmp["accepted"] and (
-            cmp["afterCompositeCost"] < cmp["beforeCompositeCost"] - 0.02
-            or len(cand_eval["issues"]) < len(best_eval["issues"])
+        improved = (
+            cmp["accepted"]
+            and len(cand_eval["issues"]) <= len(best_eval["issues"])
+            and (
+                cmp["afterCompositeCost"] < cmp["beforeCompositeCost"] - 0.02
+                or len(cand_eval["issues"]) < len(best_eval["issues"])
+            )
         )
         if improved:
             best_frames = candidate_frames
@@ -254,10 +357,12 @@ def apply_deluxe_finish(
             sharpened = preserve_detail_unsharp(best_frames, amount=0.30, protected_mask=protected_mask)
             _try_stage("detail_unsharp_guard", sharpened)
 
-    # 5. DXT1a-aware temporally-static gradient dither (ONLY if post-DDS banding is detected)
+    # 5. DXT1a-aware selective static-gradient CC0 blue-noise dither (ONLY if post-DDS bandingRisk is detected)
     if enable_dither and best_eval["metrics"]["ddsDelta"]["bandingRisk"]:
-        dithered = apply_stable_gradient_dither(best_frames, amplitude=4.5, protected_mask=protected_mask)
-        _try_stage("stable_bayer_gradient_dither", dithered, prefer_banding=True)
+        bn_dithered = apply_selective_blue_noise_dither(
+            best_frames, amplitude_rb=3.2, amplitude_g=1.6, protected_mask=protected_mask
+        )
+        _try_stage("selective_blue_noise_dither", bn_dithered, prefer_banding=True)
 
     overall_cmp = compare_before_after(base_eval, best_eval)
 

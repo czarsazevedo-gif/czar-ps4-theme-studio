@@ -359,3 +359,95 @@ def test_i06_i17_i18_ghosting_spatial_audit_provenance_and_static_rejection():
     assert prov["originalDefects"] == ["Corte abrupto"]
     assert prov["compressionDefects"] == ["Risco de banding/posterização após codificação DXT1a."]
     assert prov["reconstructionDefects"] == ["Salto de luminância na junção."]
+
+
+# ==================== CHECKPOINT D: POST-DDS SUPREMACY (07, 08, 09, 19, 20, 21) ====================
+
+
+def test_i09_i19_bc1_backends_alpha_safety_temporal_reuse_and_fallback(monkeypatch):
+    """Interventions 09 & 19: RGBCX temporal beats canonical PSNR & reduces static shimmer, stays alpha-safe, falls back cleanly."""
+    from app import dxt1
+    from app.ouroboros_engine import bc1_backends
+    from app.ouroboros_engine.metrics import evaluate_post_dds
+
+    # Static background gradient + small moving bright object on right
+    n, h, w = 8, 96, 160
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    base = np.stack(
+        [
+            np.clip(20 + 0.9 * xx, 0, 255).astype(np.uint8),
+            np.clip(30 + 1.4 * yy, 0, 255).astype(np.uint8),
+            np.clip(80 + 0.5 * xx + 0.4 * yy, 0, 255).astype(np.uint8),
+        ],
+        axis=-1,
+    )
+    seq = []
+    for i in range(n):
+        f = base.copy()
+        cx = 110 + int(12 * np.sin(2.0 * np.pi * i / n))
+        f[36:56, cx : cx + 16] = (230, 180, 90)
+        seq.append(f)
+    arr = np.stack(seq, axis=0)
+
+    ev_nat = evaluate_post_dds(arr, 0.1, backend="native")
+    ev_rgb = evaluate_post_dds(arr, 0.1, backend="rgbcx_temporal")
+    ev_icbc = evaluate_post_dds(arr, 0.1, backend="icbc")
+
+    d_nat = ev_nat["metrics"]["ddsDelta"]
+    d_rgb = ev_rgb["metrics"]["ddsDelta"]
+    d_icbc = ev_icbc["metrics"]["ddsDelta"]
+
+    assert d_rgb["validHeaders"] and d_rgb["withinBudget"] and d_rgb["alphaSafe"]
+    assert d_icbc["validHeaders"] and d_icbc["withinBudget"] and d_icbc["alphaSafe"]
+    assert d_rgb["meanPsnr"] >= d_nat["meanPsnr"], f"RGBCX ({d_rgb['meanPsnr']}) should beat/match native ({d_nat['meanPsnr']})"
+    assert d_rgb["reusedBlocks"] > 0, "Temporal Mode A/B must reuse static 4x4 blocks"
+    assert d_rgb["wrapStabilizedBlocks"] > 0, "Circular wrap consistency must stabilize static N-1 -> 0 blocks"
+
+    # Interventions 20 & 21: Perceptual Lab metrics & compressedTemporalQuality present
+    for key in ("meanLabDeltaE", "p95LabDeltaE", "lumDeltaL", "chromaDeltaC", "edgePsnr", "gradientError", "highlightError"):
+        assert key in d_rgb
+    ctq = d_rgb["compressedTemporalQuality"]
+    for key in ("staticBlockShimmerMad", "wrapStaticShimmerMad", "endpointChangeRate", "chromaOscillation", "edgeAlternationRate"):
+        assert key in ctq
+    assert ctq["staticBlockShimmerMad"] <= d_nat["compressedTemporalQuality"]["staticBlockShimmerMad"] + 0.05
+
+    # Graceful fallback when libczar_bc1.so is unavailable
+    monkeypatch.setattr(bc1_backends, "_load_bc1_lib", lambda: None)
+    blobs_fb, meta_fb = bc1_backends.encode_sequence_bc1(arr[:2], backend="rgbcx_temporal")
+    assert meta_fb["actualBackend"] == "native" and meta_fb["fallbackUsed"] is True
+    assert len(blobs_fb) == 2 and dxt1.decode_dds(blobs_fb[0]).shape == (h, w, 4)
+
+
+def test_i07_i08_selective_blue_noise_dither_and_strictly_monotonic_finish():
+    """Interventions 07 & 08: CC0 blue-noise tile loads, leaves moving regions untouched, and finish never adds issues."""
+    from app.ouroboros_engine.finish import _get_blue_noise_tile, apply_deluxe_finish, apply_selective_blue_noise_dither
+
+    tile = _get_blue_noise_tile()
+    assert tile.shape == (64, 64), f"Expected vendored 64x64 CC0 blue-noise tile, got {tile.shape}"
+
+    # Left half: static smooth gradient; right half: moving wave
+    n, h, w = 8, 96, 160
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    frames = []
+    for i in range(n):
+        f = np.zeros((h, w, 3), dtype=np.uint8)
+        f[:, :80, 0] = np.clip(40 + xx[:, :80] * 1.1, 0, 255).astype(np.uint8)
+        f[:, :80, 1] = np.clip(50 + yy[:, :80] * 0.8, 0, 255).astype(np.uint8)
+        f[:, :80, 2] = np.clip(70 + xx[:, :80] * 0.9, 0, 255).astype(np.uint8)
+        wave = np.clip(128 + 80 * np.sin(xx[:, 80:] * 0.25 - i * 0.9), 0, 255).astype(np.uint8)
+        f[:, 80:, 0] = wave
+        f[:, 80:, 1] = wave
+        f[:, 80:, 2] = wave
+        frames.append(f)
+    arr = np.stack(frames, axis=0)
+
+    dith = apply_selective_blue_noise_dither(arr)
+    # Moving right half must be untouched (0 diff except soft feather at x=80 border)
+    right_diff = float(np.abs(dith[:, :, 92:].astype(np.float32) - arr[:, :, 92:].astype(np.float32)).mean())
+    left_diff = float(np.abs(dith[:, 8:-8, 8:72].astype(np.float32) - arr[:, 8:-8, 8:72].astype(np.float32)).mean())
+    assert right_diff < 0.05, f"Blue-noise dither leaked into moving region: {right_diff:.4f}"
+    assert left_diff > 0.20, f"Blue-noise dither did not touch static smooth gradient: {left_diff:.4f}"
+
+    # Strictly monotonic finish gate (Intervention 07 / CZAR-ABS-AUD-004): never increases issue count!
+    fin = apply_deluxe_finish(arr, 0.1)
+    assert len(fin["finalPostDds"]["issues"]) <= len(fin["baselinePostDds"]["issues"])
