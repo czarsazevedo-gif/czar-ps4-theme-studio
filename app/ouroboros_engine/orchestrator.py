@@ -322,15 +322,21 @@ class OuroborosEngine:
 
         overall_cmp = compare_before_after(raw_post_dds, final_post_dds)
         ten_cycle = evaluate_ten_cycles(final_post_dds)
-        from .metrics import classify_loop_verdict
+        from .metrics import classify_artifact_provenance, classify_loop_verdict
 
-        verdict_info = classify_loop_verdict(final_post_dds, ten_cycle)
+        verdict_info = classify_loop_verdict(final_post_dds, ten_cycle, strategy_used=strategy_used)
 
-        # Attribute issues honestly: present in source baseline vs newly introduced by processing
+        # Attribute issues honestly: present in source baseline vs newly introduced by reconstruction vs DXT1a compression
         raw_issues = set(raw_post_dds.get("issues") or [])
         final_issues = list(final_post_dds.get("issues") or [])
         source_issues = [iss for iss in final_issues if iss in raw_issues]
         introduced_issues = [iss for iss in final_issues if iss not in raw_issues]
+        artifact_provenance = classify_artifact_provenance(
+            final_issues,
+            raw_issues,
+            (final_post_dds.get("metrics") or {}).get("ddsDelta"),
+            strategy_used=strategy_used,
+        )
 
         progress("Gravando prévias dos DDS decodificados e cena RAF canônica", 88)
         check()
@@ -382,6 +388,7 @@ class OuroborosEngine:
                 "sourceIssues": source_issues,
                 "introducedIssues": introduced_issues,
             },
+            "artifactProvenance": artifact_provenance,
             "tenCycleAudit": ten_cycle,
             "beforeAfterRaw": overall_cmp,
             "ddsHashes": dds_hashes,

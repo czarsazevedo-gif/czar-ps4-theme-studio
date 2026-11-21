@@ -431,11 +431,13 @@ def evaluate_loop(
         reg_flicker = float(np.abs(reg_d2L[reg_flip]).mean() * reg_flip.mean()) if reg_flip.any() else 0.0
         flicker_score = max(flicker_score, reg_flicker)
 
-    # --- 9. Ghosting detector ---
+    # --- 9. Ghosting detector (Intervention 06 / CZAR-ABS-AUD-007: moving-region Laplacian dip + midpoint blend) ---
     sharp_ref = max(float(np.percentile(sharpness_all, 85)), 1.0)
     sharp_min_ratio = float(sharpness_all.min() / sharp_ref)
     seam_sharp_ratio = float(min(sharpness_all[0], sharpness_all[-1]) / sharp_ref)
+    laps = np.stack([cv2.Laplacian(g, cv2.CV_32F, ksize=3) for g in grays])
     blend_scores = []
+    double_edge_scores = []
     for i in range(n):
         prev_f = grays[(i - 1) % n].astype(np.float32)
         curr_f = grays[i].astype(np.float32)
@@ -443,32 +445,67 @@ def evaluate_loop(
         span_diff = float(np.abs(next_f - prev_f).mean())
         if span_diff < 2.0:
             blend_scores.append(0.0)
+            double_edge_scores.append(0.0)
             continue
+        moving_px = np.abs(next_f - prev_f) > max(12.0, span_diff * 1.6)
+        if int(moving_px.sum()) < 32:
+            blend_scores.append(0.0)
+            double_edge_scores.append(0.0)
+            continue
+
+        # On a real crossfade curr = 0.5*(prev+next), moving-region Laplacian variance drops sharply (~0.5x)
+        # whereas on clean translated motion / periodic waves, moving-region variance stays ~1.0x!
+        mov_var_prev = float(np.var(laps[(i - 1) % n][moving_px]))
+        mov_var_next = float(np.var(laps[(i + 1) % n][moving_px]))
+        mov_var_curr = float(np.var(laps[i][moving_px]))
+        mov_var_nbr = max(0.5 * (mov_var_prev + mov_var_next), 1.0)
+        moving_sharp_dip = max(0.0, 1.0 - mov_var_curr / mov_var_nbr)
+
         nbr_sharp = max(0.5 * (float(sharpness_all[(i - 1) % n]) + float(sharpness_all[(i + 1) % n])), 1.0)
         local_sharp_dip = max(0.0, 1.0 - float(sharpness_all[i]) / nbr_sharp)
-        mid_avg = 0.5 * (prev_f + next_f)
-        moving_px = np.abs(next_f - prev_f) > max(10.0, span_diff * 1.5)
-        if int(moving_px.sum()) >= 32 and (local_sharp_dip > 0.06 or sharp_min_ratio < 0.88):
+        frame_sharp_dip = max(0.0, 1.0 - float(sharpness_all[i]) / sharp_ref)
+
+        e_prev = edges[(i - 1) % n]
+        e_curr = edges[i]
+        e_next = edges[(i + 1) % n]
+        prev_only_edge = (e_prev > 35.0) & (e_next < 10.0)
+        next_only_edge = (e_next > 35.0) & (e_prev < 10.0)
+        dbl_e = 0.0
+        if local_sharp_dip > 0.08 and moving_sharp_dip > 0.16 and int(prev_only_edge.sum()) >= 16 and int(next_only_edge.sum()) >= 16:
+            p_echo = float((e_curr[prev_only_edge] / (e_prev[prev_only_edge] + 1e-3)).mean())
+            n_echo = float((e_curr[next_only_edge] / (e_next[next_only_edge] + 1e-3)).mean())
+            dbl_e = float(np.clip(min(p_echo, n_echo) * 1.6, 0.0, 1.0)) if (p_echo > 0.28 and n_echo > 0.28) else 0.0
+        double_edge_scores.append(dbl_e)
+
+        # Require genuine local sharpness dip (>16%) AND moving-region Laplacian drop (>22%),
+        # OR strong double-edge echo (>0.45) with moving-region sharpness drop (>20%).
+        if ((local_sharp_dip > 0.16 and moving_sharp_dip > 0.22) or (dbl_e > 0.45 and moving_sharp_dip > 0.20)):
+            mid_avg = 0.5 * (prev_f + next_f)
             rel_mid = float(
                 np.abs(curr_f[moving_px] - mid_avg[moving_px]).mean()
                 / (np.abs(next_f[moving_px] - prev_f[moving_px]).mean() + 1e-5)
             )
-            blend_scores.append(
-                max(0.0, (0.28 - rel_mid) / 0.28)
-                * min(1.0, (local_sharp_dip + max(0.0, 0.90 - sharp_min_ratio)) * 5.0)
-            )
+            sharp_evidence = min(1.0, max((local_sharp_dip - 0.08) * 3.8, (moving_sharp_dip - 0.12) * 3.2))
+            blend_evidence = max(0.0, (0.24 - rel_mid) / 0.24)
+            blend_scores.append(blend_evidence * max(sharp_evidence, dbl_e))
         else:
             blend_scores.append(0.0)
     ghosting_blend_peak = float(max(blend_scores)) if blend_scores else 0.0
-    ghosting_score = float(max(0.0, max(0.0, 0.92 - sharp_min_ratio) * 0.75 + ghosting_blend_peak * 0.85))
+    double_edge_peak = float(max(double_edge_scores)) if double_edge_scores else 0.0
+    ghosting_score = float(max(0.0, max(0.0, 0.84 - seam_sharp_ratio) * 0.75 + ghosting_blend_peak * 0.90))
+    ghosting_detected = bool(
+        ghosting_score > 0.42 and (ghosting_blend_peak > 0.35 or double_edge_peak > 0.48)
+    )
 
     # --- 10. Texture preservation / sharpness ---
     med_sharp = float(np.median(sharpness_all))
     sharp_retention = 1.0
+    ref_border_empty = 0.0
     if reference_frames is not None:
         ref_arr = _as_rgb_stack(reference_frames)
         ref_sharp = float(np.median([_laplacian_sharpness(to_gray_u8(f)) for f in ref_arr]))
         sharp_retention = float(med_sharp / max(ref_sharp, 1.0))
+        ref_border_empty = float(max(_border_empty_fraction(f) for f in ref_arr))
 
     # --- 11. Static / protected region integrity ---
     static_max_diff = 0.0
@@ -485,10 +522,64 @@ def evaluate_loop(
             static_mean_diff = float(diffs.mean())
             static_changed_frac = float((diffs.max(axis=-1) > 0).mean())
 
-    # --- 12. Reconstruction artifacts ---
+    # --- 12. Reconstruction artifacts (CZAR-ABS-AUD-011: differential border check vs reference) ---
     border_empty = float(max(_border_empty_fraction(f) for f in rgb))
+    border_empty_delta = max(0.0, border_empty - ref_border_empty) if reference_frames is not None else border_empty
     max_foldover = float(max(foldovers)) if foldovers else 0.0
     banding_pre = float(np.mean([_banding_index(rgb[i]) for i in np.linspace(0, n - 1, min(n, 6), dtype=int)]))
+
+    # --- Spatial per-region metrics (Intervention 17) ---
+    temp_std_map = rgb.astype(np.float32).std(axis=0).mean(axis=-1)
+    seam_abs_map = np.abs(rgb[-1].astype(np.float32) - rgb[0].astype(np.float32)).mean(axis=-1)
+    static_reg_mask = temp_std_map <= 2.0
+    moving_reg_mask = ~static_reg_mask
+    static_reg_seam_mae = float(seam_abs_map[static_reg_mask].mean()) if static_reg_mask.any() else 0.0
+    static_reg_shimmer = float(temp_std_map[static_reg_mask].mean()) if static_reg_mask.any() else 0.0
+    moving_reg_seam_mae = float(seam_abs_map[moving_reg_mask].mean()) if moving_reg_mask.any() else 0.0
+    moving_area_frac = float(moving_reg_mask.mean())
+    b_strip = max(2, min(8, min(h, w) // 20))
+    border_seam_mae = float(
+        np.concatenate(
+            [
+                seam_abs_map[:b_strip, :].ravel(),
+                seam_abs_map[-b_strip:, :].ravel(),
+                seam_abs_map[:, :b_strip].ravel(),
+                seam_abs_map[:, -b_strip:].ravel(),
+            ]
+        ).mean()
+    )
+    hotspot_excess_map = (blk_mae[-1] - base_blk_mae) / (base_blk_mae + 4.5)
+    worst_idx = int(np.argmax(hotspot_excess_map))
+    worst_r, worst_c = divmod(worst_idx, gw_b)
+    spatial_regions = {
+        "wholeFrame": {"seamMae": round(seam_mae, 4), "seamSsim": round(seam_ssim, 4), "seamRatio": round(visual_seam_ratio, 4)},
+        "staticRegions": {
+            "areaFraction": round(1.0 - moving_area_frac, 4),
+            "meanTempStd": round(static_reg_shimmer, 4),
+            "seamMae": round(static_reg_seam_mae, 4),
+        },
+        "movingRegions": {
+            "areaFraction": round(moving_area_frac, 4),
+            "seamMae": round(moving_reg_seam_mae, 4),
+        },
+        "protectedObjects": {
+            "checked": protected_mask is not None,
+            "maxAbsDiff": round(static_max_diff, 3),
+            "meanAbsDiff": round(static_mean_diff, 4),
+        },
+        "boundaries": {
+            "seamMae": round(border_seam_mae, 4),
+            "emptyFraction": round(border_empty, 5),
+            "emptyDeltaVsSource": round(border_empty_delta, 5),
+        },
+        "seamHotspot": {
+            "gridSize": [gw_b, gh_b],
+            "worstCell": [int(worst_c), int(worst_r)],
+            "worstCellMae": round(float(blk_mae[-1, worst_r, worst_c]), 4),
+            "localSeamExcess": round(local_seam_excess, 4),
+            "localEdgeExcess": round(local_edge_excess, 4),
+        },
+    }
 
     # --- 13. Reversals (Ping-Pong) ---
     rev_info = _detect_reversals(small_grays, flows_fwd, confs, int_mae)
@@ -551,9 +642,9 @@ def evaluate_loop(
         issues.append("Inconsistência estrutural / de bordas na junção.")
     if flicker_score > 1.8 and alternation_rate > 0.45:
         issues.append("Flicker artificial de alta frequência detectado.")
-    if ghosting_score > 0.45 and ghosting_blend_peak > 0.35:
+    if ghosting_detected:
         issues.append("Sinal de ghosting / mistura dupla detectado.")
-    if border_empty > 0.08:
+    if border_empty > 0.08 and border_empty_delta > 0.04:
         issues.append("Bordas vazias/pretas introduzidas por reconstrução.")
     if static_max_diff > 0 and protected_mask is not None:
         issues.append(f"Região protegida alterada (diff máx {static_max_diff:.1f}).")
@@ -635,9 +726,10 @@ def evaluate_loop(
             "ghosting": {
                 "score": round(ghosting_score, 4),
                 "blendPeak": round(ghosting_blend_peak, 4),
+                "doubleEdgePeak": round(double_edge_peak, 4),
                 "sharpnessMinRatio": round(sharp_min_ratio, 4),
                 "seamSharpnessRatio": round(seam_sharp_ratio, 4),
-                "detected": bool(ghosting_score > 0.45 and ghosting_blend_peak > 0.35),
+                "detected": ghosting_detected,
             },
             "texturePreservation": {
                 "medianSharpness": round(med_sharp, 2),
@@ -652,9 +744,11 @@ def evaluate_loop(
             },
             "reconstructionArtifacts": {
                 "emptyBorderFraction": round(border_empty, 5),
+                "emptyBorderDelta": round(border_empty_delta, 5),
                 "maxFlowFoldover": round(max_foldover, 5),
                 "bandingIndex": round(banding_pre, 4),
             },
+            "spatialRegions": spatial_regions,
             "reversals": {
                 "detected": has_reversal,
                 "internalMirrorDetected": rev_info["detected"],
@@ -794,12 +888,18 @@ def evaluate_ten_cycles(eval_report: dict) -> dict:
     fl = m.get("flicker") or {}
     gh = m.get("ghosting") or {}
 
+    sr = m.get("spatialRegions") or {}
+    seam_hs = sr.get("seamHotspot") or {}
+    static_r = sr.get("staticRegions") or {}
+    moving_r = sr.get("movingRegions") or {}
+
     dir_ok = (not fc.get("directionMeasured")) or (
         float(fc.get("seamDirectionCosine", 1.0)) >= 0.40 and float(fc.get("seamOppositeFraction", 0.0)) <= 0.28
     )
+    hotspot_visible = float(seam_hs.get("localSeamExcess", vs.get("localSeamExcess", 0.0))) > 1.8
     seam_visible = bool(
         float(vs.get("seamRatio", 1.0)) > 1.75
-        or float(vs.get("localSeamExcess", 0.0)) > 1.8
+        or hotspot_visible
         or (fc.get("directionMeasured") and not dir_ok)
         or float(vc.get("relativeJump", 0.0)) > 0.55
     )
@@ -825,6 +925,49 @@ def evaluate_ten_cycles(eval_report: dict) -> dict:
         "seamVisibleRisk": seam_visible,
         "directionalContinuityOk": dir_ok,
         "continuousTenCyclePass": continuous_ok,
+        "spatialAudit": {
+            "wholeFrame": sr.get("wholeFrame"),
+            "staticRegions": static_r,
+            "movingRegions": moving_r,
+            "protectedObjects": sr.get("protectedObjects"),
+            "boundaries": sr.get("boundaries"),
+            "seamHotspot": seam_hs,
+            "hotspotVisibleRisk": hotspot_visible,
+        },
+    }
+
+
+def classify_artifact_provenance(
+    final_issues: list[str],
+    raw_issues: list[str] | set[str],
+    dds_delta: dict | None = None,
+    *,
+    strategy_used: str | None = None,
+) -> dict:
+    """Intervention 18: Separate original source defects vs reconstruction defects vs DXT1a compression defects."""
+    raw_set = set(raw_issues or ())
+    original_defects: list[str] = []
+    reconstruction_defects: list[str] = []
+    compression_defects: list[str] = []
+
+    comp_markers = ("DXT1a", "banding", "posterização", "orçamento RAF", "Cabeçalho DDS", "shimmer")
+    for iss in final_issues or []:
+        if any(tok in iss for tok in comp_markers):
+            compression_defects.append(iss)
+        elif iss in raw_set:
+            original_defects.append(iss)
+        elif strategy_used in {"natural", "level1_natural_cut", "level1_natural"}:
+            original_defects.append(iss)
+        else:
+            reconstruction_defects.append(iss)
+
+    return {
+        "originalDefects": original_defects,
+        "reconstructionDefects": reconstruction_defects,
+        "compressionDefects": compression_defects,
+        "bandingPreDds": (dds_delta or {}).get("bandingPreDds"),
+        "bandingPostDds": (dds_delta or {}).get("bandingPostDds"),
+        "bandingIncrease": (dds_delta or {}).get("bandingIncrease"),
     }
 
 
@@ -936,13 +1079,13 @@ def compare_before_after(before: dict, after: dict) -> dict:
     }
 
 
-def check_prohibited_artifacts(eval_report: dict) -> dict:
+def check_prohibited_artifacts(eval_report: dict, *, strategy_used: str | None = None) -> dict:
     """Explicitly check every prohibited loop artifact from Section 20.
 
     Prohibited approvals:
       - ping-pong / artificial reversal
-      - disguised freeze / duplicate stall
-      - gross ghosting / destructive crossfade
+      - disguised freeze / duplicate stall / frozen static scene
+      - gross ghosting / destructive crossfade (strategy-aware — Intervention 06)
       - excessive blur / texture loss
       - protected-region deformation
       - abrupt position or velocity jump
@@ -956,14 +1099,20 @@ def check_prohibited_artifacts(eval_report: dict) -> dict:
     st = m.get("staticIntegrity") or {}
     rv = m.get("reversals") or {}
     fz = m.get("freezes") or {}
+    issues = list(eval_report.get("issues") or [])
 
     violations: list[str] = []
+    if any("praticamente estática" in iss for iss in issues):
+        violations.append("Cena congelada / praticamente estática (sem movimento real no ciclo).")
     if rv.get("detected"):
         violations.append("Inversão artificial / efeito ping-pong detectado.")
     if fz.get("detected"):
         violations.append("Congelamento ou repetição disfarçada detectada.")
-    if gh.get("detected") or float(gh.get("score", 0.0)) > 0.35:
-        violations.append("Ghosting grosseiro ou crossfade destrutivo na junção.")
+    if gh.get("detected") or (float(gh.get("score", 0.0)) > 0.42 and float(gh.get("blendPeak", 0.0)) > 0.30):
+        if strategy_used in {"natural", "level1_natural_cut", "level1_natural"}:
+            violations.append("Ghosting / dupla exposição presente na mídia de origem.")
+        else:
+            violations.append("Ghosting grosseiro ou crossfade destrutivo na junção.")
     if float(tp.get("sharpnessRetention", 1.0)) < 0.70:
         violations.append("Perda excessiva de nitidez/textura.")
     if st.get("checked") and float(st.get("maxAbsDiff", 0.0)) > 6.0:
@@ -981,9 +1130,14 @@ def check_prohibited_artifacts(eval_report: dict) -> dict:
     }
 
 
-def classify_loop_verdict(eval_report: dict, ten_cycle: dict | None = None) -> dict:
+def classify_loop_verdict(
+    eval_report: dict,
+    ten_cycle: dict | None = None,
+    *,
+    strategy_used: str | None = None,
+) -> dict:
     """Honest verdict classification: APROVADO, CONDICIONAL, or REPROVADO (never falsifies quality)."""
-    prohibited = check_prohibited_artifacts(eval_report)
+    prohibited = check_prohibited_artifacts(eval_report, strategy_used=strategy_used)
     issues = list(eval_report.get("issues") or [])
     m = eval_report.get("metrics") or {}
     dds_d = m.get("ddsDelta") or {}

@@ -2,15 +2,38 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
+import hashlib
+from threading import Lock
 
 import cv2
 import numpy as np
 
 
+_FLOW_CACHE_MAX = 256
+_FLOW_CACHE: OrderedDict[tuple, "FlowResult"] = OrderedDict()
+_FLOW_CACHE_LOCK = Lock()
+
+
+def clear_flow_cache() -> None:
+    """Clear the bounded in-memory optical flow LRU cache."""
+    with _FLOW_CACHE_LOCK:
+        _FLOW_CACHE.clear()
+
+
+def _frame_digest(gray: np.ndarray) -> bytes:
+    """Fast collision-resistant key for a uint8 grayscale frame."""
+    h = hashlib.blake2b(digest_size=16)
+    h.update(gray.shape[0].to_bytes(4, "little"))
+    h.update(gray.shape[1].to_bytes(4, "little"))
+    h.update(memoryview(np.ascontiguousarray(gray)))
+    return h.digest()
+
+
 @dataclass(frozen=True)
 class FlowResult:
-    """Bidirectional dense optical flow with occlusion and confidence estimates."""
+    """Bidirectional dense optical flow with occlusion and multi-factor confidence estimates."""
 
     fwd: np.ndarray        # (H, W, 2) float32, dx, dy from a -> b
     bwd: np.ndarray        # (H, W, 2) float32, dx, dy from b -> a
@@ -39,6 +62,9 @@ def compute_flow_pair(
     b = gray_b.astype(np.uint8, copy=False)
     if method == "dis" and hasattr(cv2, "DISOpticalFlow_create"):
         dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+        return dis.calc(a, b, None).astype(np.float32, copy=False)
+    if method == "dis_fast" and hasattr(cv2, "DISOpticalFlow_create"):
+        dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
         return dis.calc(a, b, None).astype(np.float32, copy=False)
     return cv2.calcOpticalFlowFarneback(
         a,
@@ -70,12 +96,26 @@ def compute_bidirectional_flow(
     method: str = "farneback",
     fb_alpha: float = 0.05,
     fb_beta: float = 0.75,
+    multi_factor: bool = True,
 ) -> FlowResult:
-    """Compute forward & backward dense flow with Sundaram-style occlusion detection."""
+    """Compute forward & backward dense flow with Sundaram occlusion and Intervention 15 multi-factor confidence.
+
+    Combines:
+      1. Forward-backward consistency error
+      2. Local Sobel texture strength (penalizes flat untextured regions)
+      3. Post-warp photometric residual |I_b(x + u) - I_a(x)|
+      4. Multi-estimator agreement (DIS vs Farnebäck) when OpenCV DIS is available
+    """
     ga = to_gray_u8(frame_a)
     gb = to_gray_u8(frame_b)
-    h, w = ga.shape
+    cache_key = (_frame_digest(ga), _frame_digest(gb), method, round(fb_alpha, 4), round(fb_beta, 4), multi_factor)
+    with _FLOW_CACHE_LOCK:
+        hit = _FLOW_CACHE.get(cache_key)
+        if hit is not None:
+            _FLOW_CACHE.move_to_end(cache_key)
+            return hit
 
+    h, w = ga.shape
     fwd = compute_flow_pair(ga, gb, method=method)
     bwd = compute_flow_pair(gb, ga, method=method)
 
@@ -84,7 +124,9 @@ def compute_bidirectional_flow(
     ty = yy + fwd[..., 1]
     out_of_bounds = (tx < 0) | (tx > w - 1) | (ty < 0) | (ty > h - 1)
 
-    bwd_at_fwd = _sample_flow(bwd, np.clip(tx, 0, w - 1), np.clip(ty, 0, h - 1))
+    tx_c = np.clip(tx, 0, w - 1).astype(np.float32, copy=False)
+    ty_c = np.clip(ty, 0, h - 1).astype(np.float32, copy=False)
+    bwd_at_fwd = _sample_flow(bwd, tx_c, ty_c)
     fb_vec = fwd + bwd_at_fwd
     fb_err = np.hypot(fb_vec[..., 0], fb_vec[..., 1]).astype(np.float32)
 
@@ -94,25 +136,55 @@ def compute_bidirectional_flow(
     thresh = fb_alpha * (mag_f + mag_b) + fb_beta
     occluded = out_of_bounds | (fb_err > thresh)
 
-    # Local texture gradient strength (flat areas cannot yield reliable optical flow)
+    # 1. Local texture gradient strength (flat areas cannot yield reliable optical flow)
     gx = cv2.Sobel(ga, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(ga, cv2.CV_32F, 0, 1, ksize=3)
     grad = np.hypot(gx, gy)
     grad_smooth = cv2.GaussianBlur(grad, (5, 5), 0)
     tex_conf = np.clip(grad_smooth / 22.0, 0.0, 1.0)
 
+    # 2. Forward-backward consistency confidence
     fb_conf = np.exp(-fb_err / np.maximum(thresh, 0.5))
-    confidence = (fb_conf * (0.25 + 0.75 * tex_conf)).astype(np.float32)
+
+    if multi_factor:
+        # 3. Post-warp photometric residual |I_b(x + u) - I_a(x)|
+        warped_gb = cv2.remap(gb.astype(np.float32), tx_c, ty_c, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        photo_err = np.abs(warped_gb - ga.astype(np.float32))
+        photo_err_s = cv2.GaussianBlur(photo_err, (3, 3), 0)
+        photo_conf = np.exp(-photo_err_s / 24.0)
+
+        # 4. Multi-estimator agreement (DIS vs Farnebäck) when DIS is available
+        agree_conf = 1.0
+        if method == "farneback" and hasattr(cv2, "DISOpticalFlow_create") and min(h, w) >= 24:
+            fwd_dis = compute_flow_pair(ga, gb, method="dis_fast")
+            agree_err = np.hypot(fwd[..., 0] - fwd_dis[..., 0], fwd[..., 1] - fwd_dis[..., 1])
+            agree_scale = np.maximum(1.5, 0.45 * mag_f + 1.0)
+            agree_conf = np.exp(-agree_err / agree_scale)
+
+        confidence = (
+            fb_conf
+            * (0.28 + 0.72 * tex_conf)
+            * (0.45 + 0.55 * photo_conf)
+            * (0.55 + 0.45 * agree_conf)
+        ).astype(np.float32)
+    else:
+        confidence = (fb_conf * (0.25 + 0.75 * tex_conf)).astype(np.float32)
+
     confidence[out_of_bounds] = 0.0
     confidence[occluded] *= 0.25
 
-    return FlowResult(
+    res = FlowResult(
         fwd=fwd,
         bwd=bwd,
         fb_error=fb_err,
         occluded=occluded,
         confidence=confidence,
     )
+    with _FLOW_CACHE_LOCK:
+        _FLOW_CACHE[cache_key] = res
+        while len(_FLOW_CACHE) > _FLOW_CACHE_MAX:
+            _FLOW_CACHE.popitem(last=False)
+    return res
 
 
 def compute_flow_capped(

@@ -15,8 +15,20 @@ from .synthesis import SynthesisRejected, _align_protected_dxt1, estimate_2d_flo
 from .metrics import compare_before_after, evaluate_loop, evaluate_post_dds
 
 
-def multiband_blend(img_a: np.ndarray, img_b: np.ndarray, mask_a: np.ndarray, levels: int = 4) -> np.ndarray:
-    """Laplacian pyramid multiband blending of uint8 RGB images `img_a` and `img_b` using float mask `mask_a` in [0,1]."""
+def multiband_blend(
+    img_a: np.ndarray,
+    img_b: np.ndarray,
+    mask_a: np.ndarray,
+    levels: int = 4,
+    *,
+    preserve_hf: bool = False,
+) -> np.ndarray:
+    """Laplacian pyramid multiband blending of uint8 RGB images `img_a` and `img_b` using float mask `mask_a` in [0,1].
+
+    When `preserve_hf=True` (Intervention 04), the finest Laplacian detail band applies bounded
+    energy-preserving gain (1 / sqrt(m^2 + (1-m)^2), capped at 1.35x) so blended seam pixels keep
+    natural texture variance instead of softening into crossfade blur.
+    """
     h, w = img_a.shape[:2]
     max_lvl = max(1, min(levels, int(math.log2(max(4, min(h, w)))) - 2))
     a = img_a.astype(np.float32)
@@ -44,11 +56,18 @@ def multiband_blend(img_a: np.ndarray, img_b: np.ndarray, mask_a: np.ndarray, le
 
     # Blend each frequency band with the corresponding Gaussian mask level
     ls = []
+    finest_idx = len(la) - 1
     for k in range(len(la)):
         mk = gm[max_lvl - k]
         if mk.ndim == 2:
             mk = mk[..., None]
-        ls.append(la[k] * mk + lb[k] * (1.0 - mk))
+        blended = la[k] * mk + lb[k] * (1.0 - mk)
+        if preserve_hf and k == finest_idx:
+            # Preserve local texture variance across soft transitions without overshooting flat areas
+            energy_norm = np.sqrt(np.maximum(mk * mk + (1.0 - mk) * (1.0 - mk), 0.5))
+            gain = np.minimum(1.35, 1.0 / energy_norm)
+            blended = blended * gain
+        ls.append(blended)
 
     # Reconstruct from coarsest to finest
     out = ls[0]
@@ -65,8 +84,13 @@ def _optimal_seam_mask(
     *,
     a_on_low_side: bool = True,
     max_dp_dim: int = 240,
+    flow_mag: np.ndarray | None = None,
+    fb_error: np.ndarray | None = None,
+    protected_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Compute a fast minimum-cost spatial seam mask (Graphcut-inspired DP) at <= 240px and smoothly upsample."""
+    """Compute a minimum-cost spatial seam mask (Intervention 16) combining Lab color, Sobel edges,
+    flow magnitude, deformation (FB error), and infinite/heavy avoidance of protected regions.
+    """
     h, w = img_a.shape[:2]
     scale = min(1.0, max_dp_dim / float(max(h, w)))
     if scale < 0.99:
@@ -75,14 +99,30 @@ def _optimal_seam_mask(
         sa = cv2.resize(img_a, (sw, sh), interpolation=cv2.INTER_AREA)
         sb = cv2.resize(img_b, (sw, sh), interpolation=cv2.INTER_AREA)
     else:
+        sw, sh = w, h
         sa, sb = img_a, img_b
 
-    diff = np.abs(sa.astype(np.float32) - sb.astype(np.float32)).mean(axis=-1)
+    # Perceptual CIE Lab color difference (weighted luminance + chroma)
+    la = cv2.cvtColor(sa, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lb = cv2.cvtColor(sb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    diff = np.sqrt(((la - lb) ** 2).sum(axis=-1)) * 0.65
+
     g_a = to_gray_u8(sa)
     g_b = to_gray_u8(sb)
     ga = cv2.Sobel(g_a, cv2.CV_32F, 1, 0, ksize=3) ** 2 + cv2.Sobel(g_a, cv2.CV_32F, 0, 1, ksize=3) ** 2
     gb = cv2.Sobel(g_b, cv2.CV_32F, 1, 0, ksize=3) ** 2 + cv2.Sobel(g_b, cv2.CV_32F, 0, 1, ksize=3) ** 2
-    cost = diff + 0.02 * np.abs(np.sqrt(ga) - np.sqrt(gb))
+    cost = diff + 0.03 * np.abs(np.sqrt(ga) - np.sqrt(gb))
+
+    # Penalize routing seams through high-speed moving objects or high FB-deformation zones
+    if flow_mag is not None:
+        fm = cv2.resize(flow_mag.astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA) if flow_mag.shape[:2] != (sh, sw) else flow_mag.astype(np.float32)
+        cost = cost + np.clip(fm, 0.0, 20.0) * 1.4
+    if fb_error is not None:
+        fe = cv2.resize(fb_error.astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA) if fb_error.shape[:2] != (sh, sw) else fb_error.astype(np.float32)
+        cost = cost + np.clip(fe, 0.0, 15.0) * 3.5
+    if protected_mask is not None and np.any(protected_mask):
+        pm = cv2.resize(protected_mask.astype(np.uint8), (sw, sh), interpolation=cv2.INTER_NEAREST) > 0 if protected_mask.shape[:2] != (sh, sw) else protected_mask.astype(bool)
+        cost = cost + pm.astype(np.float32) * 1000.0
 
     if not vertical:
         cost = cost.T
@@ -346,36 +386,61 @@ def _bridge_pair_upstream(
     prot: np.ndarray | None,
     ref_frame0: np.ndarray,
 ) -> np.ndarray:
-    """Stitch `outgoing` -> `incoming` with a DP spatial seam sweeping strictly ALONG dominant motion.
+    """Stitch `outgoing` -> `incoming` with a cost-optimal DP spatial seam sweeping strictly ALONG dominant motion
+    (Interventions 04 & 16).
 
-    When flow moves +x (left->right), `incoming` enters from x=0 and sweeps rightward (`blend_pos=alpha_t`)
-    so the transition rides WITH the current rather than against it! Same for -x, +y (waterfall), and -y (smoke).
+    - Zeros flow warp on static, occluded, low-confidence, or protected pixels.
+    - Routes the spatial seam around protected objects, edges, and high-deformation zones.
+    - Preserves high-frequency texture variance across the Laplacian transition band (`preserve_hf=True`).
     """
     vertical_seam = abs(dom_vx) >= abs(dom_vy)
     positive_dir = (dom_vx >= 0.0) if vertical_seam else (dom_vy >= 0.0)
 
     fr = compute_flow_capped(outgoing, incoming, max_width=384)
-    # Gate cross-warp strictly to small local correspondences that don't oppose dominant flow
+    # Gate cross-warp strictly to reliable, non-occluded, non-static local correspondences
     max_local = max(4.0, min(outgoing.shape[:2]) * 0.045)
-    valid = (fr.confidence > 0.35) & (~fr.occluded)
+    pair_diff = np.abs(outgoing.astype(np.float32) - incoming.astype(np.float32)).mean(axis=-1)
+    non_static = pair_diff > 2.5
     mag = np.hypot(fr.fwd[..., 0], fr.fwd[..., 1])
-    valid = valid & (mag <= max_local * 2.5)
-    w_fwd = np.clip(fr.fwd * valid[..., None], -max_local, max_local)
-    w_bwd = np.clip(fr.bwd * valid[..., None], -max_local, max_local)
+    valid = (fr.confidence > 0.35) & (~fr.occluded) & non_static & (mag <= max_local * 2.5)
+    if prot is not None:
+        valid = valid & (~prot)
+    gate = cv2.GaussianBlur(valid.astype(np.float32), (7, 7), 1.5)
+    if prot is not None:
+        gate[prot] = 0.0
 
-    w_out = warp_frame(outgoing, w_fwd * (alpha_t * 0.55))
-    w_in = warp_frame(incoming, w_bwd * ((1.0 - alpha_t) * 0.55))
+    w_fwd = np.clip(fr.fwd * gate[..., None], -max_local, max_local)
+    w_bwd = np.clip(fr.bwd * gate[..., None], -max_local, max_local)
+
+    w_out = warp_frame(outgoing, w_fwd * (alpha_t * 0.55), border_mode=cv2.BORDER_REFLECT_101)
+    w_in = warp_frame(incoming, w_bwd * ((1.0 - alpha_t) * 0.55), border_mode=cv2.BORDER_REFLECT_101)
 
     if positive_dir:
-        # Incoming piece occupies low side (x < seam_x or y < seam_y) and sweeps forward 0 -> 1
-        seam_incoming = _optimal_seam_mask(w_in, w_out, blend_pos=alpha_t, vertical=vertical_seam, a_on_low_side=True)
+        seam_incoming = _optimal_seam_mask(
+            w_in,
+            w_out,
+            blend_pos=alpha_t,
+            vertical=vertical_seam,
+            a_on_low_side=True,
+            flow_mag=mag,
+            fb_error=fr.fb_error,
+            protected_mask=prot,
+        )
     else:
-        # Flow moves negative: incoming piece enters from high side (right/bottom) and sweeps 1 -> 0
-        seam_incoming = _optimal_seam_mask(w_in, w_out, blend_pos=1.0 - alpha_t, vertical=vertical_seam, a_on_low_side=False)
+        seam_incoming = _optimal_seam_mask(
+            w_in,
+            w_out,
+            blend_pos=1.0 - alpha_t,
+            vertical=vertical_seam,
+            a_on_low_side=False,
+            flow_mag=mag,
+            fb_error=fr.fb_error,
+            protected_mask=prot,
+        )
 
-    # Outgoing weight mask = 1 - incoming weight (spatial seam dominates -> minimal double exposure!)
-    mask_out = np.clip(0.78 * (1.0 - seam_incoming) + 0.22 * (1.0 - alpha_t), 0.0, 1.0)
-    stitched = multiband_blend(w_out, w_in, mask_out, levels=4)
+    # Spatial seam dominates (0.86 weight) with HF-preserving Laplacian blending -> minimal ghosting or blur!
+    mask_out = np.clip(0.86 * (1.0 - seam_incoming) + 0.14 * (1.0 - alpha_t), 0.0, 1.0)
+    stitched = multiband_blend(w_out, w_in, mask_out, levels=4, preserve_hf=True)
     if prot is not None:
         stitched[prot] = ref_frame0[prot]
     return stitched
@@ -487,9 +552,19 @@ def level6_multi_region_reconstruct(
     n, h, w, _ = rgb.shape
 
     specs = list(region_specs or [])
+    auto_mode = False
     if not specs and sentinela_report is not None:
+        auto_mode = True
+        # Compute real per-pixel temporal std so subtle moving clouds/mist are NEVER wrongly frozen as static!
+        temporal_std = rgb.astype(np.float32).std(axis=0).mean(axis=-1)
+        truly_static_px = temporal_std <= 1.5
+
         merged_masks: dict[str, np.ndarray] = {}
-        for reg in sentinela_report.get("levelB", {}).get("regions", []):
+        # Cluster progressive_flow cells by velocity similarity (Intervention 05 / CZAR-ABS-AUD-008):
+        # cells with similar speed & direction form one coherent layer (max 3 layers), while layers
+        # with distinct velocities (e.g. slow clouds vs fast river) stay strictly independent!
+        animate_clusters: list[dict] = []
+        for idx_r, reg in enumerate(sentinela_report.get("levelB", {}).get("regions", [])):
             beh = reg["behavior"]
             strat = {
                 "static": "protect",
@@ -499,22 +574,117 @@ def level6_multi_region_reconstruct(
                 "photometric": "fix_seam",
             }.get(beh, "fix_seam")
             rmask = _region_mask_from_sentinela(sentinela_report, reg, (h, w))
-            if strat not in merged_masks:
-                merged_masks[strat] = rmask.copy()
+            if strat == "protect":
+                # Exclude genuinely moving pixels (temporal_std > 1.5) from auto-protection
+                rmask = rmask & truly_static_px
+                if not rmask.any():
+                    continue
+                if "protect" not in merged_masks:
+                    merged_masks["protect"] = rmask.copy()
+                else:
+                    merged_masks["protect"] |= rmask
+            elif strat == "animate":
+                if not rmask.any():
+                    continue
+                spd = float(reg.get("meanSpeedPx") or reg.get("speedPx") or 0.0)
+                ang = float(reg.get("angleDeg") or 0.0)
+                vx = float(reg.get("meanVec", [spd * math.cos(math.radians(ang)), spd * math.sin(math.radians(ang))])[0]) if isinstance(reg.get("meanVec"), (list, tuple)) and len(reg.get("meanVec")) == 2 else spd * math.cos(math.radians(ang))
+                vy = float(reg.get("meanVec", [0.0, 0.0])[1]) if isinstance(reg.get("meanVec"), (list, tuple)) and len(reg.get("meanVec")) == 2 else spd * math.sin(math.radians(ang))
+                has_vel = (spd > 1e-4) or (abs(vx) + abs(vy) > 1e-4)
+                matched = None
+                if has_vel:
+                    for cl in animate_clusters:
+                        if not cl["has_vel"]:
+                            continue
+                        c_spd = cl["spd"]
+                        ratio = max(spd, c_spd) / max(min(spd, c_spd), 1e-4)
+                        dot = vx * cl["vx"] + vy * cl["vy"]
+                        denom = max(math.hypot(vx, vy) * math.hypot(cl["vx"], cl["vy"]), 1e-5)
+                        cos_a = max(-1.0, min(1.0, dot / denom))
+                        if cos_a >= 0.86 and ratio <= 1.60:
+                            matched = cl
+                            break
+                if matched is not None:
+                    matched["mask"] |= rmask
+                    cnt_c = matched["count"] + 1
+                    matched["vx"] = (matched["vx"] * matched["count"] + vx) / cnt_c
+                    matched["vy"] = (matched["vy"] * matched["count"] + vy) / cnt_c
+                    matched["spd"] = math.hypot(matched["vx"], matched["vy"])
+                    matched["count"] = cnt_c
+                elif len(animate_clusters) < 3:
+                    animate_clusters.append(
+                        {"id": idx_r, "mask": rmask.copy(), "vx": vx, "vy": vy, "spd": math.hypot(vx, vy), "has_vel": has_vel, "count": 1}
+                    )
+                else:
+                    # Merge into closest existing cluster if >3 distinct motion regions
+                    best_cl = min(
+                        animate_clusters,
+                        key=lambda cl: math.hypot(vx - cl["vx"], vy - cl["vy"]),
+                    )
+                    best_cl["mask"] |= rmask
             else:
-                merged_masks[strat] |= rmask
-        # Process in deterministic order: protect -> remove_transient -> animate -> fix_seam
-        for strat in ("protect", "remove_transient", "animate", "fix_seam"):
-            if strat in merged_masks and merged_masks[strat].any():
-                specs.append(
-                    {
-                        "id": f"auto_{strat}",
-                        "mask": merged_masks[strat],
-                        "strategy": strat,
-                        "speedScale": 1.0,
-                        "featherPx": 6,
-                    }
-                )
+                if strat not in merged_masks:
+                    merged_masks[strat] = rmask.copy()
+                else:
+                    merged_masks[strat] |= rmask
+
+        animate_regions: list[tuple[int, np.ndarray]] = [(cl["id"], cl["mask"]) for cl in animate_clusters]
+
+        # Guard against auto-protect freezing almost the entire scene (e.g. subtle night-sky clouds)
+        prot_frac = float(merged_masks["protect"].mean()) if "protect" in merged_masks else 0.0
+        anim_union = np.zeros((h, w), dtype=bool)
+        for _, am in animate_regions:
+            anim_union |= am
+        if "fix_seam" in merged_masks:
+            anim_union |= merged_masks["fix_seam"]
+        if prot_frac > 0.85 and float(anim_union.mean()) < 0.05:
+            return rgb.copy(), {
+                "applied": False,
+                "regionsProcessed": 0,
+                "reason": "Proteção automática cobriria quase toda a cena; reconstrução regional recusada.",
+            }
+
+        # Deterministic order: protect -> remove_transient -> independent animate_i -> fix_seam
+        if "protect" in merged_masks and merged_masks["protect"].any():
+            specs.append(
+                {
+                    "id": "auto_protect",
+                    "mask": merged_masks["protect"],
+                    "strategy": "protect",
+                    "speedScale": 1.0,
+                    "featherPx": 6,
+                }
+            )
+        if "remove_transient" in merged_masks and merged_masks["remove_transient"].any():
+            specs.append(
+                {
+                    "id": "auto_remove_transient",
+                    "mask": merged_masks["remove_transient"],
+                    "strategy": "remove_transient",
+                    "speedScale": 1.0,
+                    "featherPx": 6,
+                }
+            )
+        for idx_r, amask in animate_regions:
+            specs.append(
+                {
+                    "id": f"auto_animate_{idx_r}",
+                    "mask": amask,
+                    "strategy": "animate",
+                    "speedScale": 1.0,
+                    "featherPx": 6,
+                }
+            )
+        if "fix_seam" in merged_masks and merged_masks["fix_seam"].any():
+            specs.append(
+                {
+                    "id": "auto_fix_seam",
+                    "mask": merged_masks["fix_seam"],
+                    "strategy": "fix_seam",
+                    "speedScale": 1.0,
+                    "featherPx": 6,
+                }
+            )
 
     if not specs:
         return rgb.copy(), {"applied": False, "regionsProcessed": 0}
@@ -527,6 +697,12 @@ def level6_multi_region_reconstruct(
                 m = cv2.resize(m.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
             protected_master |= m
     protected_aligned = _align_protected_dxt1(protected_master) if protected_master.any() else None
+    if auto_mode and protected_aligned is not None and float(protected_aligned.mean()) > 0.90:
+        return rgb.copy(), {
+            "applied": False,
+            "regionsProcessed": 0,
+            "reason": "Máscara protegida alinhada a blocos 4×4 congelaria a cena; recusado.",
+        }
 
     canvas = level2_photometric_harmonize(rgb, protected_mask=protected_aligned)
     base_plate = rgb[0].copy()
@@ -730,21 +906,31 @@ def reconstruct_best(
     best_cost = best_cmp["beforeCompositeCost"]
     attempts = []
 
+    base_static = any("praticamente estática" in iss for iss in (base_eval.get("issues") or []))
     for strat_name, cand_frames, strat_meta in candidates:
         ev = eval_fn(cand_frames, wait, protected_mask=prot_eval, reference_frames=src)
         cmp_res = compare_before_after(base_eval, ev)
+        cand_static = any("praticamente estática" in iss for iss in (ev.get("issues") or []))
+        motion_ret = float((cmp_res.get("matrix") or {}).get("motionRetention", {}).get("after", 1.0))
+        extra_reject = []
+        if cand_static and not base_static:
+            extra_reject.append("Reconstrução congelou a cena (resultado praticamente estático).")
+        if strat_name == "level6_multi_region" and motion_ret < 0.70:
+            extra_reject.append(f"Reconstrução regional reduziu o movimento excessivamente (retenção {motion_ret:.2f}).")
+        accepted = bool(cmp_res["accepted"] and not extra_reject)
+        hard_reasons = list(cmp_res["hardRejectReasons"]) + extra_reject
         attempts.append(
             {
                 "strategy": strat_name,
-                "accepted": cmp_res["accepted"],
+                "accepted": accepted,
                 "afterCost": cmp_res["afterCompositeCost"],
                 "beforeCost": cmp_res["beforeCompositeCost"],
-                "hardRejectReasons": cmp_res["hardRejectReasons"],
+                "hardRejectReasons": hard_reasons,
                 "issues": ev["issues"],
                 "meta": strat_meta,
             }
         )
-        if cmp_res["accepted"] and cmp_res["afterCompositeCost"] < best_cost - 0.02:
+        if accepted and cmp_res["afterCompositeCost"] < best_cost - 0.02:
             best_cost = cmp_res["afterCompositeCost"]
             best_strategy = strat_name
             best_frames = cand_frames

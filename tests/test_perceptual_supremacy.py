@@ -239,3 +239,123 @@ def test_i13_regional_periodicity_detects_local_periodic_motion():
     assert res["detected"] is True
     assert any(abs(p - 1.5) < 0.35 for p in res["periodsSec"])
     assert len(res["regionalPeriods"]) >= 1
+
+
+# ==================== CHECKPOINT C: FLOW, RECONSTRUCTION & METRICS (04, 05, 06, 15, 16, 17, 18) ====================
+
+
+def test_i15_multifactor_flow_confidence_and_lru_cache():
+    """Intervention 15: Multi-factor confidence penalizes occluded/untextured areas and caches repeated pairs."""
+    from app.ouroboros_engine.flow import clear_flow_cache, compute_bidirectional_flow
+
+    clear_flow_cache()
+    seq = _make_cyclic_wave(8, h=64, w=96)
+    fr1 = compute_bidirectional_flow(seq[0], seq[1], multi_factor=True)
+    fr2 = compute_bidirectional_flow(seq[0], seq[1], multi_factor=True)
+    assert fr1 is fr2, "Second identical call must hit bounded LRU flow cache"
+    assert 0.0 <= float(fr1.confidence.min()) <= float(fr1.confidence.max()) <= 1.0
+
+    # Flat untextured pair must yield low confidence compared to textured wave
+    flat = np.full((64, 96, 3), 120, dtype=np.uint8)
+    fr_flat = compute_bidirectional_flow(flat, flat, multi_factor=True)
+    assert float(fr_flat.confidence.mean()) < float(fr1.confidence.mean())
+
+
+def test_i04_and_i16_hf_multiband_and_protected_seam_routing():
+    """Interventions 04 & 16: HF-preserving multiband keeps sharpness; optimal seam routes around protected regions."""
+    from app.ouroboros_engine.metrics import _laplacian_sharpness
+    from app.ouroboros_engine.reconstruction import _optimal_seam_mask, multiband_blend
+
+    seq = _make_cyclic_wave(8, h=64, w=96)
+    mask = np.tile(np.linspace(0.0, 1.0, 96, dtype=np.float32)[None, :], (64, 1))
+    b_std = multiband_blend(seq[0], seq[3], mask, levels=3, preserve_hf=False)
+    b_hf = multiband_blend(seq[0], seq[3], mask, levels=3, preserve_hf=True)
+    assert _laplacian_sharpness(b_hf[..., 0]) >= _laplacian_sharpness(b_std[..., 0])
+
+    # Protected mask right across center column x=48 -> seam must bend away from protected band
+    prot = np.zeros((64, 96), dtype=bool)
+    prot[:, 42:54] = True
+    seam = _optimal_seam_mask(seq[0], seq[3], blend_pos=0.5, vertical=True, protected_mask=prot)
+    # Inside protected band, seam values should be nearly uniform (not cutting through center)
+    cut_inside = float(((seam[:, 42:54] > 0.25) & (seam[:, 42:54] < 0.75)).mean())
+    assert cut_inside < 0.20, f"Seam cut through protected region: {cut_inside:.3f}"
+
+
+def test_i05_level6_keeps_animated_regions_independent_and_never_freezes_subtle_motion():
+    """Intervention 05 (CZAR-ABS-AUD-008) & Full Moon Clouds fix: independent progressive regions + no total freeze."""
+    from app.ouroboros_engine.reconstruction import level6_multi_region_reconstruct
+
+    # Build a subtle moving night-sky scene (temporal std ~3.5) with 95% marked "static" by Sentinela
+    n, h, w = 8, 64, 96
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    clouds = np.stack(
+        [
+            np.stack(
+                [
+                    np.clip(25 + 14 * np.sin(xx * 0.12 - i * 0.6), 0, 255).astype(np.uint8),
+                    np.clip(28 + 14 * np.sin(xx * 0.12 - i * 0.6), 0, 255).astype(np.uint8),
+                    np.clip(45 + 18 * np.sin(xx * 0.12 - i * 0.6), 0, 255).astype(np.uint8),
+                ],
+                axis=-1,
+            )
+            for i in range(n)
+        ],
+        axis=0,
+    )
+    fake_sentinela = {
+        "levelB": {
+            "hasMixedStaticDynamic": True,
+            "regions": [
+                {"bboxNorm": [0.0, 0.0, 0.5, 0.5], "behavior": "progressive_flow"},
+                {"bboxNorm": [0.5, 0.5, 1.0, 1.0], "behavior": "progressive_flow"},
+                {"bboxNorm": [0.0, 0.5, 0.5, 1.0], "behavior": "static"},
+            ],
+        }
+    }
+    out, meta = level6_multi_region_reconstruct(clouds, 0.1, sentinela_report=fake_sentinela)
+    anim_ids = [d["id"] for d in meta.get("details", []) if d["strategy"] == "animate"]
+    # Both progressive_flow regions must stay independent (auto_animate_0 and auto_animate_1)!
+    assert len(anim_ids) == 2 and len(set(anim_ids)) == 2, f"Expected 2 independent animate regions, got {anim_ids}"
+    # Because clouds have temporal_std > 1.5 everywhere, auto-protect must NOT freeze moving clouds!
+    assert meta.get("protectedFraction", 0.0) < 0.30
+    assert float(np.abs(out[0].astype(np.float32) - out[4].astype(np.float32)).mean()) > 1.0
+
+
+def test_i06_i17_i18_ghosting_spatial_audit_provenance_and_static_rejection():
+    """Interventions 06, 17, 18 & CZAR-ABS-AUD-011: no false ghosting on clean wave, spatial audit, provenance, static REPROVADO."""
+    from app.ouroboros_engine.metrics import (
+        classify_artifact_provenance,
+        classify_loop_verdict,
+        evaluate_loop,
+        evaluate_ten_cycles,
+    )
+
+    clean = _make_cyclic_wave(12, h=64, w=96, add_seam_jump=False)
+    ev = evaluate_loop(clean, wait=1.0 / 12.0)
+    assert not ev["metrics"]["ghosting"]["detected"], f"False ghosting on clean wave: {ev['metrics']['ghosting']}"
+    assert "spatialRegions" in ev["metrics"]
+    ten = evaluate_ten_cycles(ev)
+    assert "spatialAudit" in ten and "seamHotspot" in ten["spatialAudit"]
+
+    # Differential border check (CZAR-ABS-AUD-011): dark letterbox present in BOTH source and output must not fire
+    dark_src = clean.copy()
+    dark_src[:, :8, :, :] = 0
+    dark_src[:, -8:, :, :] = 0
+    ev_dark = evaluate_loop(dark_src, wait=1.0 / 12.0, reference_frames=dark_src)
+    assert not any("Bordas vazias" in iss for iss in ev_dark["issues"])
+
+    # Static scene MUST be classified REPROVADO (never CONDICIONAL!)
+    static_seq = np.repeat(clean[:1], 8, axis=0)
+    ev_stat = evaluate_loop(static_seq, wait=0.1)
+    verdict_stat = classify_loop_verdict(ev_stat, evaluate_ten_cycles(ev_stat))
+    assert verdict_stat["verdict"] == "REPROVADO"
+
+    # Provenance separation (Intervention 18)
+    prov = classify_artifact_provenance(
+        ["Risco de banding/posterização após codificação DXT1a.", "Corte abrupto", "Salto de luminância na junção."],
+        raw_issues={"Corte abrupto"},
+        strategy_used="level4_content_bridge",
+    )
+    assert prov["originalDefects"] == ["Corte abrupto"]
+    assert prov["compressionDefects"] == ["Risco de banding/posterização após codificação DXT1a."]
+    assert prov["reconstructionDefects"] == ["Salto de luminância na junção."]
