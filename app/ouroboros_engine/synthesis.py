@@ -241,18 +241,17 @@ def _contrast_preserving_dual_blend(
     low_blend = w_low * low_a + (1.0 - w_low) * low_b
 
     if spatial_phase is not None and phi_a is not None:
-        # Staggered cyclic phase per spatial band prevents all pixels from hitting 50/50 simultaneously!
+        # Smooth C1-continuous spatially-staggered phase handoff across [0.14, 0.86] (prevents both backward drift and mid-cycle KLT burst!)
         phi_loc = (float(phi_a) + spatial_phase) % 1.0
         raw_w = 0.5 * (1.0 - np.cos(2.0 * math.pi * phi_loc)).astype(np.float32)
-        # Sharpened smoothstep S-curve narrows the overlap ribbon while staying C1-continuous
-        u = np.clip((raw_w - 0.22) / 0.56, 0.0, 1.0)
+        u = np.clip((raw_w - 0.14) / 0.72, 0.0, 1.0)
         w_hi = (u * u * (3.0 - 2.0 * u))[..., None]
     else:
-        u = np.clip((w_low - 0.18) / 0.64, 0.0, 1.0)
+        u = np.clip((w_low - 0.14) / 0.72, 0.0, 1.0)
         w_hi = u * u * (3.0 - 2.0 * u)
 
     w_hi_b = 1.0 - w_hi
-    norm_gain = np.minimum(1.38, 1.0 / np.sqrt(np.maximum(w_hi * w_hi + w_hi_b * w_hi_b, 1e-4)))
+    norm_gain = np.minimum(1.30, 1.0 / np.sqrt(np.maximum(w_hi * w_hi + w_hi_b * w_hi_b, 1e-4)))
     high_blend = (w_hi * high_a + w_hi_b * high_b) * norm_gain
     return np.clip(np.rint(low_blend + high_blend), 0, 255).astype(np.uint8)
 
@@ -300,8 +299,8 @@ def synthesize_periodic_2d(
     """Synthesize an N-frame strictly unidirectional infinite loop using dual-phase Eulerian advection.
 
     Uses two photometrically matched phase textures (`base_frame` and `base_frame_b`) with
-    spatially staggered high-frequency phase transitions so the full N-frame cycle produces
-    N distinct, crisp, ghost-free DDS frames advancing strictly along +flow_field.
+    bounded cycle travel (`<= 7.5` steps) and a widened C1 phase-handoff curve (`[0.14, 0.86]`)
+    so high-contrast contours (clouds, crowns, geometry) advance strictly forward without mid-cycle jumps.
     """
     base = np.asarray(base_frame, dtype=np.uint8)
     if base.shape[-1] == 4:
@@ -322,17 +321,14 @@ def synthesize_periodic_2d(
     alpha = _feather_mask(active, feather_px=feather_px, protected_mask=prot)
     alpha_3 = alpha[..., None]
 
-    # Cycle advection span: span = n_frames preserves exact 1.0x measured physical velocity per frame!
-    # Cap only so extreme half-cycle travel stays safely within frame geometry.
-    if cycle_steps is not None:
-        span = float(cycle_steps)
-    else:
-        max_sp = float(np.percentile(np.hypot(flow_field[..., 0][active], flow_field[..., 1][active]), 90)) if active.any() else 1.0
-        max_safe_span = (0.44 * min(h, w)) / max(max_sp * float(speed_scale), 1.0)
-        span = float(np.clip(float(n_frames), 4.0, min(28.0, max(4.0, max_safe_span)))) * float(speed_scale)
     scaled_flow = flow_field.astype(np.float32) * float(speed_scale)
+    max_sp = float(np.percentile(np.hypot(scaled_flow[..., 0][active], scaled_flow[..., 1][active]), 90)) if active.any() else 1.0
+    max_safe_span = (0.44 * min(h, w)) / max(max_sp, 1.0)
+    if cycle_steps is not None:
+        span = float(min(float(cycle_steps), 7.5, max(4.0, max_safe_span)))
+    else:
+        span = float(np.clip(float(n_frames), 4.0, min(7.5, max(4.0, max_safe_span))))
 
-    # Second phase reference texture: photometrically matched to `base` to prevent tone pulsation
     if base_frame_b is not None:
         base_b = np.asarray(base_frame_b, dtype=np.uint8)
         if base_b.shape[-1] == 4:
@@ -361,12 +357,10 @@ def synthesize_periodic_2d(
             k_cycles = max(1, int(round(nat_travel / py)))
             wrap_step = (v_sign * k_cycles * py) / float(n_frames)
 
-    # Smooth spatial phase offset perpendicular to dominant flow so detail transitions stagger organically
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     u_m = float(scaled_flow[..., 0][active].mean()) if active.any() else 1.0
     v_m = float(scaled_flow[..., 1][active].mean()) if active.any() else 0.0
     norm_uv = max(math.hypot(u_m, v_m), 1e-5)
-    # Cross-stream coordinate (perpendicular to flow) + mild stream coordinate for organic stagger
     perp = (-v_m / norm_uv) * (xx / max(w, 1)) + (u_m / norm_uv) * (yy / max(h, 1))
     along = (u_m / norm_uv) * (xx / max(w, 1)) + (v_m / norm_uv) * (yy / max(h, 1))
     spatial_phase = (0.14 * np.sin(2.0 * math.pi * (perp * 1.5 + along * 0.5))).astype(np.float32)
@@ -382,8 +376,6 @@ def synthesize_periodic_2d(
                 my = np.mod(yy - i * wrap_step, h).astype(np.float32)
             dyn = cv2.remap(base, mx, my, interpolation=cv2.INTER_CUBIC, borderMode=cv2.BORDER_WRAP)
         else:
-            # Dual-phase Eulerian advection with two photometrically-matched source layers:
-            # Both advance STRICTLY FORWARD along +flow_field and produce N distinct crisp frames!
             phi_a = i / float(n_frames)
             phi_b = (phi_a + 0.5) % 1.0
             t_a = (phi_a - 0.5) * span

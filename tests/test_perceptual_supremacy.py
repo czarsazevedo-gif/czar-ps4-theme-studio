@@ -638,3 +638,59 @@ def test_checkpoint_g_banding_macro_turn_filter_and_cel_dedup():
     cross_cand = dict(native_cand, _crossPool=True, _origFrames=10)
     assert _score_candidate_for_profile(native_cand, "balance") > _score_candidate_for_profile(cross_cand, "balance")
 
+
+def test_checkpoint_h_kinematic_trajectory_closure_and_dual_engine_score():
+    """Checkpoint H: Dual-Engine Kinematic & Trajectory Closure Score (O-KTCS vs INDEP-KLT) and Open-Loop Drift Anchoring."""
+    from app.ouroboros_engine.metrics import evaluate_loop
+    from app.ouroboros_engine.reconstruction import level4_content_bridge_reconstruct
+
+    # 1. Build a smooth closed periodic loop vs an open-loop jump sequence
+    n, h, w = 12, 128, 192
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    closed_frames = []
+    jumpy_frames = []
+    for i in range(n):
+        phase = 2.0 * np.pi * i / n
+        dx = 6.0 * np.sin(phase)
+        dy = 4.0 * np.cos(phase)
+        pat = 128.0 + 60.0 * np.sin((xx - dx) * 0.14) * np.cos((yy - dy) * 0.14)
+        rgb = np.clip(np.stack([pat, pat * 0.9, pat * 1.05], axis=-1), 0, 255).astype(np.uint8)
+        closed_frames.append(rgb)
+
+        # Jumpy sequence: sudden +28px phase jump at frame 3
+        j_dx = i * 2.2 + (28.0 if i == 3 else 0.0)
+        j_pat = 128.0 + 60.0 * np.sin((xx - j_dx) * 0.14) * np.cos(yy * 0.14)
+        j_rgb = np.clip(np.stack([j_pat, j_pat * 0.9, j_pat * 1.05], axis=-1), 0, 255).astype(np.uint8)
+        jumpy_frames.append(j_rgb)
+
+    ev_closed = evaluate_loop(np.stack(closed_frames, axis=0), 0.08)
+    ev_jumpy = evaluate_loop(np.stack(jumpy_frames, axis=0), 0.08)
+
+    tk_closed = ev_closed["metrics"]["trajectoryKinematics"]
+    tk_jumpy = ev_jumpy["metrics"]["trajectoryKinematics"]
+
+    assert tk_closed["definitiveLoopScore"] > tk_jumpy["definitiveLoopScore"] + 1.5, (tk_closed, tk_jumpy)
+    assert tk_closed["independentKltScore"] > tk_jumpy["independentKltScore"], (tk_closed, tk_jumpy)
+    assert tk_jumpy["kltMaxStepBurstRatio"] > tk_closed["kltMaxStepBurstRatio"], (tk_closed, tk_jumpy)
+
+    # 2. Verify level4_content_bridge_reconstruct activates open-loop drift anchoring on high-drift structural zones
+    drift_seq = []
+    for i in range(16):
+        img = np.zeros((128, 192, 3), dtype=np.uint8)
+        top_phase = 2.0 * np.pi * i / 12.0
+        top_pat = 120.0 + 50.0 * np.sin((xx[:64, :] - 2.0 * np.sin(top_phase)) * 0.15)
+        img[:64, :, :] = np.clip(top_pat[:, :, None], 0, 255).astype(np.uint8)
+        bot_pat = 120.0 + 70.0 * np.sin((xx[64:, :] - i * 3.1) * 0.08) * np.cos(yy[64:, :] * 0.12)
+        img[64:, :, :] = np.clip(bot_pat[:, :, None], 0, 255).astype(np.uint8)
+        drift_seq.append(img)
+    drift_arr = np.stack(drift_seq[4:16], axis=0)
+    lead_in_arr = np.stack(drift_seq[:4], axis=0)
+    bridged, bridge_meta = level4_content_bridge_reconstruct(drift_arr, lead_in=lead_in_arr)
+    assert bridge_meta["applied"] is True, bridge_meta
+    assert bridge_meta.get("driftAnchoredFraction", 0.0) > 0.15, bridge_meta
+    pre_seam = float(np.abs(drift_arr[-1, 64:].astype(np.float32) - drift_arr[0, 64:].astype(np.float32)).mean())
+    post_seam = float(np.abs(bridged[-1, 64:].astype(np.float32) - bridged[0, 64:].astype(np.float32)).mean())
+    assert post_seam < pre_seam * 0.65, f"Expected drift anchoring to reduce open-loop seam ({pre_seam:.2f} -> {post_seam:.2f})"
+
+
+

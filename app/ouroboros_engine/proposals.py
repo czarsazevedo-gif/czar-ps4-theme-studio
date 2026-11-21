@@ -320,6 +320,7 @@ def _compact_metrics_summary(render_report: dict[str, Any]) -> dict[str, Any]:
     vc = m.get("velocityContinuity") or {}
     gh = m.get("ghosting") or {}
     fl = m.get("flicker") or {}
+    tk = m.get("trajectoryKinematics") or {}
     dds_d = m.get("ddsDelta") or {}
     ctq = dds_d.get("compressedTemporalQuality") or {}
     ten = render_report.get("tenCycleAudit") or {}
@@ -340,6 +341,11 @@ def _compact_metrics_summary(render_report: dict[str, Any]) -> dict[str, Any]:
         "withinBudget": bool(dds_d.get("withinBudget", True)),
         "tenCyclePass": bool(ten.get("continuousTenCyclePass", False)),
         "tenCycleDurationSec": ten.get("tenCycleDurationSec"),
+        "ouroborosKtcsScore": tk.get("ouroborosKtcsScore"),
+        "independentKltScore": tk.get("independentKltScore"),
+        "definitiveLoopScore": tk.get("definitiveLoopScore"),
+        "kltMaxStepBurstRatio": tk.get("kltMaxStepBurstRatio"),
+        "tailPoseReversalSeverity": tk.get("tailPoseReversalSeverity"),
         "issues": list(ev.get("issues") or []),
     }
 
@@ -366,7 +372,12 @@ def _build_proposal_tradeoffs(
     else:
         advantages.append(f"Maior margem temporal ({rend['frames']} quadros · {rend['duration']:.2f}s no teto de 6 MiB)")
 
-    if metrics["passed"] and metrics["tenCyclePass"]:
+    if metrics.get("definitiveLoopScore") is not None:
+        advantages.append(
+            f"Nota Definitiva {float(metrics['definitiveLoopScore']):.2f}/10 "
+            f"(O-KTCS {float(metrics.get('ouroborosKtcsScore') or 0):.2f} vs KLT {float(metrics.get('independentKltScore') or 0):.2f})"
+        )
+    elif metrics["passed"] and metrics["tenCyclePass"]:
         advantages.append("Validado pós-DDS e estável ao longo de 10 ciclos contínuos")
     elif metrics["seamSsim"] >= 0.90:
         advantages.append(f"Emenda visual discreta (SSIM {metrics['seamSsim']:.3f})")

@@ -246,6 +246,174 @@ def _detect_reversals(
     }
 
 
+def _evaluate_kinematic_trajectories(
+    small_grays: np.ndarray,
+    flows_fwd: list[np.ndarray],
+    confs: list[np.ndarray],
+    mae_all: np.ndarray,
+    *,
+    seam_ssim: float,
+    wait: float,
+    flow_scale: float = 1.0,
+    mean_psnr: float | None = None,
+) -> dict:
+    """Evaluate Lagrangian trajectory closure, intra-cycle phase-handoff burst, and regional pose continuity.
+
+    Confronts TWO distinct calculation engines:
+      1. O-KTCS (Ouroboros Kinematic & Trajectory Closure Score, 0..10):
+         8x6 regional flow integration, open-loop vs closed-loop drift, tail/bridge pose snap-back, and MAD wave.
+      2. INDEP-KLT (Independent External Verification Tool, 0..10):
+         Shi-Tomasi + Pyramidal Lucas-Kanade sparse particle tracking with FB check + Fourier phaseCorrelate.
+    """
+    n, hs, ws = small_grays.shape
+    gh, gw = 6, 8
+    ch, cw = max(1, hs // gh), max(1, ws // gw)
+
+    cell_vecs = np.zeros((n, gh, gw, 2), dtype=np.float32)
+    cell_mags = np.zeros((n, gh, gw), dtype=np.float32)
+    for i in range(n):
+        fw = flows_fwd[i] * float(flow_scale)
+        cf = confs[i]
+        for r in range(gh):
+            for c in range(gw):
+                ys, xs = slice(r * ch, min(hs, (r + 1) * ch)), slice(c * cw, min(ws, (c + 1) * cw))
+                w_c = cf[ys, xs]
+                u_c = fw[ys, xs, 0]
+                v_c = fw[ys, xs, 1]
+                mag_c = np.hypot(u_c, v_c)
+                sel = (w_c > 0.25) & (mag_c > 0.15)
+                if int(sel.sum()) >= 8:
+                    vx = float(np.median(u_c[sel]))
+                    vy = float(np.median(v_c[sel]))
+                    cell_vecs[i, r, c] = (vx, vy)
+                    cell_mags[i, r, c] = float(math.hypot(vx, vy))
+
+    # 1. O-KTCS Trajectory Closure & Regional Pose Snap-Back
+    net_disp = cell_vecs[:-1].sum(axis=0)
+    net_dist = np.hypot(net_disp[..., 0], net_disp[..., 1])
+    total_path = cell_mags[:-1].sum(axis=0)
+    mov_cells = total_path > 1.8
+    prog_unclosed = np.where(mov_cells, net_dist / np.maximum(total_path, 1e-4), 0.0)
+    max_unclosed_px = float(net_dist[mov_cells].max()) if mov_cells.any() else 0.0
+    p90_unclosed_ratio = float(np.percentile(prog_unclosed[mov_cells], 90)) if mov_cells.any() else 0.0
+
+    frame_mad_max_min = float(np.max(mae_all) / max(float(np.min(mae_all)), 0.15))
+    k_body = max(2, int(n * 0.6))
+    v_body = np.median(cell_vecs[:k_body], axis=0)
+    tail_vecs = cell_vecs[k_body:]
+    b_mag = np.hypot(v_body[..., 0], v_body[..., 1])
+    cell_rev_sev = np.zeros((gh, gw), dtype=np.float32)
+    for r in range(gh):
+        for c in range(gw):
+            if b_mag[r, c] < 0.22:
+                continue
+            worst_dot = 1.0
+            for t_idx in range(len(tail_vecs)):
+                tv = tail_vecs[t_idx, r, c]
+                t_mag = float(math.hypot(float(tv[0]), float(tv[1])))
+                if t_mag > 0.15:
+                    cos_t = float((tv[0] * v_body[r, c, 0] + tv[1] * v_body[r, c, 1]) / (t_mag * b_mag[r, c] + 1e-5))
+                    worst_dot = min(worst_dot, cos_t)
+            cell_rev_sev[r, c] = max(0.0, -worst_dot) * float(b_mag[r, c])
+    max_tail_rev = float(cell_rev_sev.max())
+    rev_cells_cnt = int((cell_rev_sev > 0.18).sum())
+
+    # 2. Independent External Tracker (Shi-Tomasi + Pyramidal Lucas-Kanade + Fourier Phase Correlation)
+    p0 = cv2.goodFeaturesToTrack(small_grays[0], maxCorners=180, qualityLevel=0.01, minDistance=max(4, min(hs, ws) // 32))
+    surv_rate = 1.0
+    klt_unclosed_ratio = 0.0
+    klt_unclosed_px = 0.0
+    if p0 is not None and len(p0) >= 6:
+        cur = p0.copy()
+        alive = np.ones(len(p0), dtype=bool)
+        traj = [p0.reshape(-1, 2)]
+        for i in range(n):
+            j = (i + 1) % n
+            nxt, st1, _ = cv2.calcOpticalFlowPyrLK(small_grays[i], small_grays[j], cur, None)
+            bck, st2, _ = cv2.calcOpticalFlowPyrLK(small_grays[j], small_grays[i], nxt, None)
+            fb = np.hypot((cur - bck)[..., 0], (cur - bck)[..., 1]).ravel()
+            alive &= (st1.ravel() == 1) & (st2.ravel() == 1) & (fb < 1.8)
+            cur = nxt
+            traj.append(cur.reshape(-1, 2))
+        traj_arr = np.stack(traj)
+        surv_rate = float(alive.mean())
+        if int(alive.sum()) >= 4:
+            tr_a = traj_arr[:, alive, :]
+            steps_v = np.diff(tr_a[:-1], axis=0)
+            path_len = np.hypot(steps_v[..., 0], steps_v[..., 1]).sum(axis=0)
+            net_err = np.hypot(tr_a[-2, :, 0] - tr_a[0, :, 0], tr_a[-2, :, 1] - tr_a[0, :, 1])
+            mov_p = path_len > 1.2
+            if mov_p.any():
+                klt_unclosed_ratio = float(np.percentile(net_err[mov_p] / np.maximum(path_len[mov_p], 1e-4), 85))
+                klt_unclosed_px = float(np.percentile(net_err[mov_p], 90))
+
+    klt_step_p95: list[float] = []
+    pc_peaks: list[float] = []
+    for i in range(n):
+        j = (i + 1) % n
+        pa = cv2.goodFeaturesToTrack(small_grays[i], maxCorners=150, qualityLevel=0.01, minDistance=max(4, min(hs, ws) // 32))
+        if pa is not None and len(pa) >= 4:
+            pb, st1, _ = cv2.calcOpticalFlowPyrLK(small_grays[i], small_grays[j], pa, None)
+            good = st1.ravel() == 1
+            d = np.hypot((pb[good] - pa[good])[..., 0], (pb[good] - pa[good])[..., 1]).ravel() if good.any() else np.array([0.0])
+            klt_step_p95.append(float(np.percentile(d, 95)))
+        else:
+            klt_step_p95.append(0.0)
+        (_, _), resp = cv2.phaseCorrelate(small_grays[i].astype(np.float32), small_grays[j].astype(np.float32))
+        pc_peaks.append(float(resp))
+
+    med_klt_p95 = float(np.median(klt_step_p95[:-1])) if len(klt_step_p95) > 1 else 0.25
+    klt_burst = float(max(klt_step_p95) / max(med_klt_p95, 0.25)) if klt_step_p95 else 1.0
+    klt_burst_step = int(np.argmax(klt_step_p95)) if klt_step_p95 else 0
+    pc_drop = float(np.median(pc_peaks) - min(pc_peaks)) if pc_peaks else 0.0
+
+    fps = 1.0 / max(float(wait), 1e-4)
+    psnr_val = float(mean_psnr) if mean_psnr is not None else 38.0
+    s_closure = 10.0 - min(7.5, max(0.0, p90_unclosed_ratio - 0.25) * 6.5 + max(0.0, max_unclosed_px - 8.0) * 0.045)
+    s_kinematic = 10.0 - min(7.5, max_tail_rev * 0.65 + max(0.0, frame_mad_max_min - 1.45) * 1.85)
+    s_seam_cad = min(10.0, 5.5 * float(seam_ssim) + 4.5 * min(fps / 12.0, 1.0))
+    s_dds = min(10.0, max(0.0, (psnr_val - 28.0) / 1.4))
+    ouroboros_score = round(0.35 * s_closure + 0.35 * s_kinematic + 0.15 * s_seam_cad + 0.15 * s_dds, 2)
+
+    ind_closure = 10.0 - min(7.5, max(0.0, klt_unclosed_ratio - 0.25) * 6.5 + max(0.0, klt_unclosed_px - 6.0) * 0.08)
+    ind_burst = 10.0 - min(7.5, max(0.0, klt_burst - 1.35) * 1.45 + pc_drop * 12.0 + (1.0 - surv_rate) * 4.5)
+    ind_cad_dds = 0.5 * s_seam_cad + 0.5 * s_dds
+    independent_score = round(0.40 * ind_closure + 0.40 * ind_burst + 0.20 * ind_cad_dds, 2)
+
+    raw_avg = 0.5 * (ouroboros_score + independent_score)
+    # Kinematic dominance cap: open trajectory or violent intra-cycle burst caps the definitive score honestly!
+    kin_cap = min(s_closure, ind_closure if surv_rate > 0.35 else s_closure) + 2.4
+    if klt_burst > 4.0:
+        kin_cap = min(kin_cap, 10.0 - min(4.5, (klt_burst - 2.0) * 0.35))
+    definitive_score = round(min(raw_avg, max(3.5, kin_cap)), 2)
+
+    return {
+        "ouroborosKtcsScore": ouroboros_score,
+        "independentKltScore": independent_score,
+        "definitiveLoopScore": definitive_score,
+        "subScores": {
+            "trajectoryClosure": round(s_closure, 2),
+            "poseContinuity": round(s_kinematic, 2),
+            "seamAndCadence": round(s_seam_cad, 2),
+            "postDdsFidelity": round(s_dds, 2),
+            "independentClosure": round(ind_closure, 2),
+            "independentBurst": round(ind_burst, 2),
+        },
+        "p90UnclosedTrajectoryRatio": round(p90_unclosed_ratio, 4),
+        "maxUnclosedDisplacementPx": round(max_unclosed_px, 2),
+        "tailPoseReversalSeverity": round(max_tail_rev, 3),
+        "tailPoseReversalCells": rev_cells_cnt,
+        "intraCycleMadWaveRatio": round(frame_mad_max_min, 3),
+        "kltParticleSurvivalRate": round(surv_rate, 4),
+        "kltUnclosedTrajectoryRatio": round(klt_unclosed_ratio, 4),
+        "kltMaxStepBurstRatio": round(klt_burst, 3),
+        "kltWorstBurstStep": klt_burst_step,
+        "phaseCorrelationDrop": round(pc_drop, 4),
+        "intraCycleJumpDetected": bool(klt_burst > 3.8 and frame_mad_max_min > 2.4),
+        "poseSnapBackDetected": bool(max_tail_rev > 4.2 and rev_cells_cnt >= 14),
+    }
+
+
 def evaluate_loop(
     frames: Sequence[np.ndarray] | np.ndarray,
     wait: float,
@@ -615,6 +783,18 @@ def evaluate_loop(
     if evaluate_dds:
         dds_info = _measure_dds_roundtrip(rgb, backend=backend)
 
+    # --- 17. Lagrangian Trajectory Closure & Dual-Engine Score (O-KTCS vs INDEP-KLT) ---
+    traj_kin = _evaluate_kinematic_trajectories(
+        small_grays,
+        flows_fwd,
+        confs,
+        mae_all,
+        seam_ssim=seam_ssim,
+        wait=wait,
+        flow_scale=flow_scale,
+        mean_psnr=(dds_info or {}).get("meanPsnr"),
+    )
+
     # --- Hard-cut detection inside sequence (including seam) ---
     cut_thresh = max(16.0, 3.0 * med_mae + 6.0)
     cut_indices = [
@@ -654,6 +834,11 @@ def evaluate_loop(
         issues.append("Bordas vazias/pretas introduzidas por reconstrução.")
     if static_max_diff > 0 and protected_mask is not None:
         issues.append(f"Região protegida alterada (diff máx {static_max_diff:.1f}).")
+    if traj_kin["intraCycleJumpDetected"]:
+        issues.append(
+            f"Salto intra-ciclo de trajetória/fase detectado no passo {traj_kin['kltWorstBurstStep']} "
+            f"(KLT burst {traj_kin['kltMaxStepBurstRatio']:.1f}x)."
+        )
 
     # Confidence reflects measurable signal strength & FB flow reliability
     mean_conf = float(np.mean([c.mean() for c in confs]))
@@ -755,6 +940,7 @@ def evaluate_loop(
                 "bandingIndex": round(banding_pre, 4),
             },
             "spatialRegions": spatial_regions,
+            "trajectoryKinematics": traj_kin,
             "reversals": {
                 "detected": has_reversal,
                 "internalMirrorDetected": rev_info["detected"],
@@ -977,6 +1163,34 @@ def evaluate_post_dds(
         evaluate_dds=False,
     )
     post_report["metrics"]["ddsDelta"] = dds_rt
+    tk = post_report["metrics"].get("trajectoryKinematics")
+    if tk is not None and dds_rt.get("meanPsnr") is not None:
+        s_dds = round(min(10.0, max(0.0, (float(dds_rt["meanPsnr"]) - 28.0) / 1.4)), 2)
+        sub = tk["subScores"]
+        sub["postDdsFidelity"] = s_dds
+        o_sc = round(
+            0.35 * sub["trajectoryClosure"]
+            + 0.35 * sub["poseContinuity"]
+            + 0.15 * sub["seamAndCadence"]
+            + 0.15 * s_dds,
+            2,
+        )
+        i_sc = round(
+            0.40 * sub["independentClosure"]
+            + 0.40 * sub["independentBurst"]
+            + 0.20 * (0.5 * sub["seamAndCadence"] + 0.5 * s_dds),
+            2,
+        )
+        raw_avg = 0.5 * (o_sc + i_sc)
+        surv_r = float(tk.get("kltParticleSurvivalRate", 1.0))
+        kin_cap = min(sub["trajectoryClosure"], sub["independentClosure"] if surv_r > 0.35 else sub["trajectoryClosure"]) + 2.4
+        k_burst = float(tk.get("kltMaxStepBurstRatio", 1.0))
+        if k_burst > 4.0:
+            kin_cap = min(kin_cap, 10.0 - min(4.5, (k_burst - 2.0) * 0.35))
+        tk["ouroborosKtcsScore"] = o_sc
+        tk["independentKltScore"] = i_sc
+        tk["definitiveLoopScore"] = round(min(raw_avg, max(3.5, kin_cap)), 2)
+
     if not dds_rt["withinBudget"]:
         post_report["issues"].append("Sequência DDS excede o orçamento RAF canônico.")
     if not dds_rt["validHeaders"]:
@@ -1099,6 +1313,9 @@ def compare_before_after(before: dict, after: dict) -> dict:
     a_spd = float(am["velocityContinuity"]["internalMedianSpeedPx"])
     motion_retention = float(a_spd / max(b_spd, 0.15)) if b_spd >= 0.25 else 1.0
 
+    b_tk = bm.get("trajectoryKinematics") or {}
+    a_tk = am.get("trajectoryKinematics") or {}
+
     comparisons = {
         "seamMae": (bm["visualSimilarity"]["seamMae"], am["visualSimilarity"]["seamMae"], "lower"),
         "seamSsim": (bm["visualSimilarity"]["seamSsim"], am["visualSimilarity"]["seamSsim"], "higher"),
@@ -1113,6 +1330,11 @@ def compare_before_after(before: dict, after: dict) -> dict:
         "ghostingScore": (bm["ghosting"]["score"], am["ghosting"]["score"], "lower"),
         "sharpnessRetention": (bm["texturePreservation"]["sharpnessRetention"], am["texturePreservation"]["sharpnessRetention"], "higher"),
         "motionRetention": (1.0, round(min(motion_retention, 2.0), 4), "higher"),
+        "definitiveLoopScore": (
+            float(b_tk.get("definitiveLoopScore", 6.0)),
+            float(a_tk.get("definitiveLoopScore", 6.0)),
+            "higher",
+        ),
     }
 
     matrix = {}
@@ -1135,7 +1357,7 @@ def compare_before_after(before: dict, after: dict) -> dict:
             regressions.append(name)
 
     # Hard rejection triggers: never accept reversals, freezes, ghosting, blur, protected drift,
-    # directional degradation, or artificial motion dampening!
+    # directional degradation, intra-cycle phase-handoff jumps, or artificial motion dampening!
     hard_reject = []
     if am["reversals"]["detected"] and not bm["reversals"]["detected"]:
         hard_reject.append("Introduziu reversão artificial.")
@@ -1143,6 +1365,8 @@ def compare_before_after(before: dict, after: dict) -> dict:
         hard_reject.append("Introduziu congelamento/duplicação.")
     if am["ghosting"]["detected"] and not bm["ghosting"]["detected"]:
         hard_reject.append("Introduziu ghosting perceptível.")
+    if a_tk.get("intraCycleJumpDetected") and not b_tk.get("intraCycleJumpDetected"):
+        hard_reject.append("Introduziu salto intra-ciclo de trajetória/fase.")
     if am["texturePreservation"]["sharpnessRetention"] < 0.72 and (
         am["texturePreservation"]["sharpnessRetention"] < bm["texturePreservation"]["sharpnessRetention"] - 0.12
     ):
@@ -1166,16 +1390,23 @@ def compare_before_after(before: dict, after: dict) -> dict:
     def _perceptual_cost(rep: dict) -> float:
         rm = rep["metrics"]
         fc = rm["flowContinuity"]
+        tk_r = rm.get("trajectoryKinematics") or {}
         dir_pen = (
             (1.0 - max(-1.0, min(1.0, float(fc["seamDirectionCosine"])))) * 1.15
             + float(fc["seamOppositeFraction"]) * 2.10
             if fc["directionMeasured"]
             else 0.0
         )
+        traj_pen = (
+            max(0.0, float(tk_r.get("kltMaxStepBurstRatio", 1.0)) - 1.5) * 0.35
+            + max(0.0, float(tk_r.get("tailPoseReversalSeverity", 0.0)) - 0.8) * 0.22
+            + max(0.0, float((rm["visualSimilarity"]).get("localSeamExcess", 0.0)) - 0.35) * 0.45
+        )
         return (
             float(rm["visualSimilarity"]["seamRatio"])
             + float(fc["flowErrorRatio"]) * 0.60
             + dir_pen
+            + traj_pen
             + float(rm["velocityContinuity"]["relativeJump"]) * 0.85
             + max(0.0, float(rm["edgeConsistency"]["edgeRatio"]) - 1.0) * 0.60
             + float(rm["ghosting"]["score"]) * 2.00
@@ -1207,7 +1438,7 @@ def check_prohibited_artifacts(eval_report: dict, *, strategy_used: str | None =
       - gross ghosting / destructive crossfade (strategy-aware — Intervention 06)
       - excessive blur / texture loss
       - protected-region deformation
-      - abrupt position or velocity jump
+      - abrupt position or velocity jump (including intra-cycle phase-handoff burst)
     """
     m = eval_report.get("metrics") or {}
     vs = m.get("visualSimilarity") or {}
@@ -1218,6 +1449,7 @@ def check_prohibited_artifacts(eval_report: dict, *, strategy_used: str | None =
     st = m.get("staticIntegrity") or {}
     rv = m.get("reversals") or {}
     fz = m.get("freezes") or {}
+    tk = m.get("trajectoryKinematics") or {}
     issues = list(eval_report.get("issues") or [])
 
     violations: list[str] = []
@@ -1227,6 +1459,11 @@ def check_prohibited_artifacts(eval_report: dict, *, strategy_used: str | None =
         violations.append("Inversão artificial / efeito ping-pong detectado.")
     if fz.get("detected"):
         violations.append("Congelamento ou repetição disfarçada detectada.")
+    if tk.get("intraCycleJumpDetected"):
+        violations.append(
+            f"Salto intra-ciclo de trajetória/fase detectado no passo {tk.get('kltWorstBurstStep')} "
+            f"(KLT burst {float(tk.get('kltMaxStepBurstRatio', 0.0)):.1f}x)."
+        )
     if gh.get("detected") or (float(gh.get("score", 0.0)) > 0.42 and float(gh.get("blendPeak", 0.0)) > 0.30):
         if strategy_used in {"natural", "level1_natural_cut", "level1_natural"}:
             violations.append("Ghosting / dupla exposição presente na mídia de origem.")

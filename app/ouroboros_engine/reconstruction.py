@@ -483,6 +483,62 @@ def level4_content_bridge_reconstruct(
     dom_vx = 0.5 * (float(fr_head.fwd[..., 0].mean()) + float(fr_tail.fwd[..., 0].mean()))
     dom_vy = 0.5 * (float(fr_head.fwd[..., 1].mean()) + float(fr_tail.fwd[..., 1].mean()))
 
+    def _anchor_open_loop_drift(bridged: np.ndarray, k_use: int, bridge_at_tail: bool) -> tuple[np.ndarray, float]:
+        if n < 8:
+            return bridged, 0.0
+        ref_idx = max(1, n - k_use - 1) if bridge_at_tail else min(n - 2, k_use)
+        anchor_idx = 0 if bridge_at_tail else n - 1
+        pre_bridge_diff = np.abs(work[ref_idx].astype(np.float32) - work[anchor_idx].astype(np.float32)).mean(axis=-1)
+        med_step = np.median(
+            np.abs(work[1:].astype(np.float32) - work[:-1].astype(np.float32)).mean(axis=-1),
+            axis=0,
+        )
+        drift_zone = (pre_bridge_diff > np.maximum(10.0, 2.8 * med_step)).astype(np.float32)
+        if prot is not None:
+            drift_zone[prot] = 0.0
+        drift_frac = float(drift_zone.mean())
+        if drift_frac < 0.03:
+            return bridged, 0.0
+        k_b = (min(h, w) // 12) | 1
+        drift_mask = cv2.GaussianBlur(drift_zone, (k_b, k_b), max(1.5, k_b * 0.35))
+        drift_mask = np.clip(drift_mask * 1.35, 0.0, 0.92)
+        if prot is not None:
+            drift_mask[prot] = 0.0
+        try:
+            flow_f, _ = estimate_2d_flow_field(work, protected_mask=prot)
+            steady_seq = synthesize_periodic_2d(
+                work[anchor_idx],
+                flow_f,
+                n,
+                protected_mask=prot,
+                cycle_steps=min(float(n), 6.0),
+                align_dxt1_blocks=False,
+            )
+            res_full = bridged.copy()
+            res_ramp = bridged.copy()
+            ramp_len = min(n - 2, max(k_use + 2, n // 2))
+            for i in range(n):
+                res_full[i] = multiband_blend(steady_seq[i], bridged[i], drift_mask, levels=3, preserve_hf=True)
+                if prot is not None:
+                    res_full[i][prot] = work[0][prot]
+                dist = (n - 1 - i) if bridge_at_tail else i
+                if dist < ramp_len:
+                    u_t = 1.0 - (dist / float(max(ramp_len, 1)))
+                    w_t = float(u_t * u_t * (3.0 - 2.0 * u_t))
+                    res_ramp[i] = multiband_blend(steady_seq[i], bridged[i], drift_mask * w_t, levels=3, preserve_hf=True)
+                    if prot is not None:
+                        res_ramp[i][prot] = work[0][prot]
+            # Pick full-sequence anchoring whenever it avoids interior duplicate-frame stalls (e.g. anime on twos at >14 FPS);
+            # otherwise pick whichever has higher seam direction cosine / lower seam MAE.
+            full_steps = np.abs(res_full[1:].astype(np.float32) - res_full[:-1].astype(np.float32)).mean(axis=(1, 2, 3))
+            ramp_steps = np.abs(res_ramp[1:].astype(np.float32) - res_ramp[:-1].astype(np.float32)).mean(axis=(1, 2, 3))
+            full_min_ratio = float(full_steps.min() / max(float(np.median(full_steps)), 1e-4))
+            ramp_min_ratio = float(ramp_steps.min() / max(float(np.median(ramp_steps)), 1e-4))
+            res = res_full if (ramp_min_ratio < 0.24 and full_min_ratio > ramp_min_ratio + 0.015) else res_ramp
+            return res, round(float((drift_mask > 0.25).mean()), 4)
+        except SynthesisRejected:
+            return bridged, 0.0
+
     order = ("lead_in", "lead_out") if prefer != "lead_out" else ("lead_out", "lead_in")
     for which in order:
         if which == "lead_in" and lead_in is not None and len(lead_in) >= 2:
@@ -497,9 +553,11 @@ def level4_content_bridge_reconstruct(
                 out[idx] = _bridge_pair_upstream(
                     work[idx], li_tail[j], alpha_t, dom_vx=dom_vx, dom_vy=dom_vy, prot=prot, ref_frame0=work[0]
                 )
+            out, drift_anchored = _anchor_open_loop_drift(out, k_use, bridge_at_tail=True)
             meta["applied"] = True
             meta["bridgeType"] = "lead_in_content_pieces"
             meta["bridgeFrames"] = k_use
+            meta["driftAnchoredFraction"] = drift_anchored
             return out, meta
 
         if which == "lead_out" and lead_out is not None and len(lead_out) >= 2:
@@ -513,9 +571,11 @@ def level4_content_bridge_reconstruct(
                 out[j] = _bridge_pair_upstream(
                     lo_head[j], work[j], alpha_t, dom_vx=dom_vx, dom_vy=dom_vy, prot=prot, ref_frame0=work[0]
                 )
+            out, drift_anchored = _anchor_open_loop_drift(out, k_use, bridge_at_tail=False)
             meta["applied"] = True
             meta["bridgeType"] = "lead_out_content_pieces"
             meta["bridgeFrames"] = k_use
+            meta["driftAnchoredFraction"] = drift_anchored
             return out, meta
 
     comp, comp_meta = level3_motion_compensated_seam(work, protected_mask=protected_mask)
@@ -822,9 +882,17 @@ def reconstruct_best(
     prot_eval = _align_protected_dxt1(protected_mask) if protected_mask is not None else None
     eval_fn = evaluate_post_dds if verify_dds else evaluate_loop
 
-    # Level 1: Evaluate baseline first — never unnecessarily reconstruct a clean natural loop!
+    # Level 1: Evaluate baseline first — only skip ladder when seam is already near-perfect globally and locally!
     base_eval = eval_fn(src, wait, protected_mask=prot_eval)
-    if base_eval["passed"] and not region_specs and transient_mask is None and not stabilize_camera:
+    base_vs = (base_eval.get("metrics") or {}).get("visualSimilarity") or {}
+    if (
+        base_eval["passed"]
+        and float(base_vs.get("seamRatio", 1.0)) <= 1.04
+        and float(base_vs.get("localSeamExcess", 0.0)) <= 0.35
+        and not region_specs
+        and transient_mask is None
+        and not stabilize_camera
+    ):
         return {
             "version": DELUXE_VERSION,
             "selectedStrategy": "level1_natural_cut",
@@ -876,13 +944,13 @@ def reconstruct_best(
         if l4_out_meta.get("applied"):
             candidates.append(("level4_content_bridge_lead_out", l4_out, l4_out_meta))
 
-    # Level 5: Anti-ghosting dynamic texture synthesis (dual-phase Eulerian advection at true 1.0x velocity)
+    # Level 5: Anti-ghosting dynamic texture synthesis (dual-phase Eulerian advection with bounded travel <= 7.5)
     try:
         flow_f, f_stats = estimate_2d_flow_field(src, protected_mask=protected_mask)
         if f_stats["p90SpeedPx"] >= 0.25 and f_stats["temporalCoherence"] >= 0.38:
             h_s, w_s = src.shape[1:3]
             max_safe_span = (0.44 * min(h_s, w_s)) / max(float(f_stats["p90SpeedPx"]), 1.0)
-            cyc = float(np.clip(float(n), 4.0, min(28.0, max(4.0, max_safe_span))))
+            cyc = float(np.clip(float(n), 4.0, min(7.5, max(4.0, max_safe_span))))
             l5 = synthesize_periodic_2d(
                 src[0], flow_f, n, base_frame_b=src[n // 2] if n >= 3 else None, protected_mask=protected_mask, cycle_steps=cyc, align_dxt1_blocks=True
             )
