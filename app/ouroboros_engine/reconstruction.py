@@ -879,7 +879,7 @@ def reconstruct_best(
     # Level 5: Anti-ghosting dynamic texture synthesis (dual-phase Eulerian advection at true 1.0x velocity)
     try:
         flow_f, f_stats = estimate_2d_flow_field(src, protected_mask=protected_mask)
-        if f_stats["p90SpeedPx"] >= 0.30 and f_stats["temporalCoherence"] >= 0.45:
+        if f_stats["p90SpeedPx"] >= 0.25 and f_stats["temporalCoherence"] >= 0.38:
             h_s, w_s = src.shape[1:3]
             max_safe_span = (0.44 * min(h_s, w_s)) / max(float(f_stats["p90SpeedPx"]), 1.0)
             cyc = float(np.clip(float(n), 4.0, min(28.0, max(4.0, max_safe_span))))

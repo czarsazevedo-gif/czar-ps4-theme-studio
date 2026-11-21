@@ -160,6 +160,9 @@ def compute_multicriteria_cost(
     dir_ok_natural = (not fc["directionMeasured"]) or (
         fc["seamDirectionCosine"] >= 0.45 and fc["seamOppositeFraction"] <= 0.25
     )
+    dir_ok_correctable = (not fc["directionMeasured"]) or (
+        fc["seamDirectionCosine"] >= 0.35 and fc["seamOppositeFraction"] <= 0.42
+    )
     has_hard_defect = bool(
         is_static
         or rv["detected"]
@@ -180,7 +183,7 @@ def compute_multicriteria_cost(
         and not gh["detected"]
     ):
         take_class = CLASS_NATURAL
-    elif not is_static and not ct["detected"] and not rv["detected"] and total < 5.2:
+    elif not has_hard_defect and dir_ok_correctable and total < 5.2:
         take_class = CLASS_CORRECTABLE
     elif not is_static and not ct["detected"] and not rv["detected"]:
         take_class = CLASS_SYNTHESIS
@@ -704,7 +707,7 @@ def search_supreme(
             if e_i - s_i >= 16:
                 windows.append((dense_buf[s_i:e_i], s_i * dense_step, dense_step))
 
-    turn_secs = [e["second"] for e in sentinela_report["levelD"]["turnEvents"]]
+    turn_secs = [e["second"] for e in sentinela_report["levelD"]["turnEvents"] if e.get("mirrored", True)]
     cut_secs = sentinela_report["levelA"]["cutSeconds"]
 
     groups = []

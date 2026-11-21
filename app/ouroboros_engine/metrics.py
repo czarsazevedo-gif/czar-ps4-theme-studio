@@ -111,9 +111,9 @@ def _laplacian_sharpness(gray: np.ndarray) -> float:
 def _banding_index(rgb: np.ndarray) -> float:
     """Estimate false-contour banding in smooth gradient areas.
 
-    In smooth regions (low coarse gradient), true smooth gradients have tiny uniform
-    pixel steps while quantized/DXT1a-banded regions exhibit flat 4x4 plateaus broken
-    by sudden micro-steps (2–14 gray levels) along block or contour edges.
+    In smooth regions (low coarse gradient and low high-frequency texture residual),
+    true smooth gradients have tiny uniform macroscopic steps while quantized/DXT1a-banded
+    regions exhibit flat 4x4 plateaus broken by sudden contour steps along block boundaries.
     """
     gray = to_gray_u8(rgb).astype(np.float32)
     smooth = cv2.GaussianBlur(gray, (9, 9), 2.0)
@@ -121,23 +121,25 @@ def _banding_index(rgb: np.ndarray) -> float:
     gy_s = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3) / 8.0
     coarse_grad = np.hypot(gx_s, gy_s)
 
-    # Smooth-gradient mask: gentle tone ramp (not flat solid color, not busy texture)
-    gradient_zone = (coarse_grad >= 0.18) & (coarse_grad <= 4.5)
+    # Smooth-gradient mask: gentle tone ramp AND low high-frequency texture (excludes hair/line-art halos)
+    hf_res = cv2.boxFilter(np.abs(gray - smooth), -1, (5, 5))
+    gradient_zone = (coarse_grad >= 0.18) & (coarse_grad <= 3.8) & (hf_res <= 3.2)
     if int(gradient_zone.sum()) < 64:
         return 0.0
 
-    # Local pixel differences inside smooth gradient zones
-    dx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
-    dy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+    # Macroscopic 2x2-smoothed pixel differences (ignores 1-LSB blue-noise dither while preserving 4x4 block steps)
+    macro = cv2.boxFilter(gray, -1, (2, 2))
+    dx = np.abs(np.diff(macro, axis=1, prepend=macro[:, :1]))
+    dy = np.abs(np.diff(macro, axis=0, prepend=macro[:1, :]))
     step = np.maximum(dx, dy)
 
     z_steps = step[gradient_zone]
     z_coarse = coarse_grad[gradient_zone]
-    # Plateau fraction (zero local step despite non-zero coarse gradient)
-    plateau_frac = float((z_steps < 0.5).mean())
-    # Excess jump ratio: where step jumps > 2.2x the underlying smooth slope (false contour edge)
-    false_contour_frac = float((z_steps > np.maximum(2.0, 2.2 * z_coarse)).mean())
-    # Block-boundary energy ratio (4x4 DXT1 grid emphasis)
+    # Plateau fraction (near-zero macroscopic step despite non-zero coarse gradient)
+    plateau_frac = float((z_steps < 0.35).mean())
+    # Excess jump ratio: where macroscopic step jumps > 2.5x the underlying smooth slope (false contour edge)
+    false_contour_frac = float((z_steps > np.maximum(2.4, 2.5 * z_coarse)).mean())
+    # Block-boundary energy ratio (4x4 DXT1 grid emphasis inside smooth gradient zones)
     bx = dx[:, 4::4]
     by = dy[4::4, :]
     in_x = dx[:, 2::4]
@@ -146,12 +148,15 @@ def _banding_index(rgb: np.ndarray) -> float:
     n = min(by.shape[0], in_y.shape[0])
     block_ratio = 0.0
     if m > 0 and n > 0:
-        b_edge = 0.5 * (float(bx[:, :m].mean()) + float(by[:n, :].mean()))
-        b_inner = 0.5 * (float(in_x[:, :m].mean()) + float(in_y[:n, :].mean()))
-        block_ratio = max(0.0, (b_edge - b_inner) / max(b_inner + 0.5, 0.5))
+        m_x = gradient_zone[:, 4::4][:, :m] & gradient_zone[:, 2::4][:, :m]
+        m_y = gradient_zone[4::4, :][:n, :] & gradient_zone[2::4, :][:n, :]
+        if int(m_x.sum()) >= 16 and int(m_y.sum()) >= 16:
+            b_edge = 0.5 * (float(bx[:, :m][m_x].mean()) + float(by[:n, :][m_y].mean()))
+            b_inner = 0.5 * (float(in_x[:, :m][m_x].mean()) + float(in_y[:n, :][m_y].mean()))
+            block_ratio = max(0.0, (b_edge - b_inner) / max(b_inner + 0.5, 0.5))
 
     # Scale into an interpretable [0, 1+] banding score
-    score = plateau_frac * false_contour_frac * 6.0 + 0.35 * block_ratio
+    score = plateau_frac * false_contour_frac * 6.5 + 0.30 * block_ratio
     return float(max(0.0, score))
 
 

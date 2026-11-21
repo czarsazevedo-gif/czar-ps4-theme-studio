@@ -59,31 +59,43 @@ def _score_candidate_for_profile(
     slideshow_pen = 0.0
     if wait > 0.22:
         slideshow_pen = ((wait - 0.22) / 0.10) ** 1.4 * 1.35
+        if dir_cos >= 0.55 and seam_ratio <= 1.15:
+            slideshow_pen *= 0.42
     # Penalize severe frame-to-frame fragmentation (e.g. 3.3 FPS on fast motion -> low internal SSIM)
     frag_pen = max(0.0, 0.85 - int_ssim) * 3.2
     accel_pen = max(0.0, accel_ratio - 1.5) * 0.45
+    dir_pen = max(0.0, 0.40 - dir_cos) * 3.8
 
-    # Cross-pool caution: if a candidate was evaluated at many more frames (e.g. 24f in 540p -> 13f in 720p),
-    # its cached smoothness metrics overestimate quality at the sparser frame rate.
+    # Cross-pool caution:
+    # - If frames < orig_n (e.g. 24f -> 13f), cached smoothness overestimates quality at sparser rate.
+    # - If frames > orig_n (e.g. 10f -> 20f), cached seamRatio & totalCost were measured with larger
+    #   per-frame internalMedianMae (1/orig_n step), understating seamRatio/totalCost at 1/frames step!
     cross_pen = 0.0
     if cand.get("_crossPool"):
         orig_n = int(cand.get("_origFrames", frames))
         if frames < orig_n:
             cross_pen = 0.35 + max(0.0, (orig_n - frames) / max(orig_n, 1)) * 1.40
+        elif frames > orig_n:
+            scale_up = (frames - orig_n) / float(max(orig_n, 1))
+            seam_ratio = seam_ratio * (1.0 + 0.65 * scale_up)
+            total_cost = total_cost * (1.0 + 0.55 * scale_up)
+            cross_pen = 0.25 + 0.35 * scale_up
         else:
-            cross_pen = 0.12
+            cross_pen = 0.15
 
-    # Intervention 03: mild diversity nudge when another profile already took the exact same window & frame count
+    # Intervention 03: diversity penalty when another profile already claimed an overlapping window
     dup_pen = 0.0
     if used_intervals:
         a, b = float(cand.get("start", 0.0)), float(cand.get("end", dur))
         for ua, ub, ucnt in used_intervals:
-            if abs(a - ua) < 0.18 and abs(b - ub) < 0.18:
-                dup_pen = max(dup_pen, 0.55 if abs(frames - ucnt) <= 2 else 0.20)
+            if abs(a - ua) < 0.22 and abs(b - ub) < 0.22:
+                base_dup = 1.65 if cand.get("_crossPool") else (0.95 if abs(frames - ucnt) <= 2 else 0.55)
+                dup_pen = max(dup_pen, base_dup)
 
     if profile_id == "quality":
         # Proposta 1 (720p, <=13..16 frames): prioritize visual fidelity + clean motion at >= 6 FPS (1.0-2.2s sweet spot)
-        sweet_dur = min(dur, 2.2) * 0.65 - max(0.0, dur - 2.6) * 0.45
+        over_dur_pen = 0.15 if (dir_cos >= 0.55 and seam_ratio <= 1.15) else 0.45
+        sweet_dur = min(dur, 2.4) * 0.65 - max(0.0, dur - 2.6) * over_dur_pen
         return (
             seam_ssim * 2.6
             + int_ssim * 1.35
@@ -96,6 +108,7 @@ def _score_candidate_for_profile(
             - total_cost * 0.48
             - vel_jump * 0.75
             - accel_pen
+            - dir_pen
             - micro_pen
             - frantic_pen
             - slideshow_pen * 1.2
@@ -118,6 +131,7 @@ def _score_candidate_for_profile(
             - total_cost * 0.42
             - vel_jump * 0.90
             - accel_pen
+            - dir_pen
             - micro_pen
             - frantic_pen * 0.7
             - slideshow_pen
@@ -139,6 +153,7 @@ def _score_candidate_for_profile(
         - total_cost * 0.50
         - vel_jump * 0.85
         - accel_pen
+        - dir_pen
         - micro_pen
         - frantic_pen
         - slideshow_pen
@@ -207,16 +222,23 @@ def _select_profile_plan(
     freezes_in_survey = len((sent.get("levelD") or {}).get("freezeIndices") or [])
     survey_n = max(1, int((sent.get("levelA") or {}).get("frames") or 1))
     dup_frac = freezes_in_survey / float(survey_n)
-    eff_motion_fps = min(max(source_fps, 8.0), 14.0 if dup_frac > 0.08 else 18.0)
+    grp_cands = [c for g in (analysis.get("groups") or []) for c in (g.get("candidates") or [])]
+    grp_freezes = sum(
+        1
+        for c in grp_cands
+        if (((c.get("evaluation") or {}).get("metrics") or {}).get("freezes") or {}).get("detected")
+    )
+    grp_freeze_frac = grp_freezes / float(max(1, len(grp_cands)))
+    eff_motion_fps = min(max(source_fps, 8.0), 12.8 if (dup_frac > 0.08 or grp_freeze_frac >= 0.25) else 18.0)
 
-    # Collect native candidates AND cross-resolution pool candidates (Intervention 01)
+    # Collect native candidates AND clean cross-resolution pool candidates (Intervention 01)
     cands: list[dict[str, Any]] = []
     for grp in analysis.get("groups") or []:
         g_size = tuple(grp.get("size") or ())
         for c in grp.get("candidates") or []:
             if g_size == size:
                 cands.append(c)
-            elif not (c.get("costs") or {}).get("isStatic"):
+            elif not (c.get("costs") or {}).get("isStatic") and not (c.get("costs") or {}).get("hasHardDefect"):
                 adapted = _adapt_candidate_to_profile(c, size, source_duration, eff_motion_fps, distinct_gif, has_var_gif)
                 if adapted is not None:
                     cands.append(adapted)

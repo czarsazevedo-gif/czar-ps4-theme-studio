@@ -116,10 +116,15 @@ def estimate_2d_flow_field(
     p90_speed = float(np.percentile(mags, 90))
     coherence = float(np.hypot(u_s.sum(), v_s.sum()) / max(float(mags.sum()), 1e-6))
 
-    # Check temporal consistency across pairs (reject ping-pong or chaotic jumps as steady flow!)
+    # Check temporal consistency across pairs (on moving pixels so stationary backgrounds don't dilute coherence!)
+    raw_mag_med = np.hypot(med_flow[..., 0], med_flow[..., 1])
+    mov_thresh = max(0.04, float(np.percentile(raw_mag_med, 75)))
+    mov_sel = raw_mag_med >= mov_thresh
+    if int(mov_sel.sum()) < 16:
+        mov_sel = np.ones_like(raw_mag_med, dtype=bool)
     pair_vecs = np.array(
         [
-            [float(f[..., 0].mean()), float(f[..., 1].mean())]
+            [float(f[..., 0][mov_sel].mean()), float(f[..., 1][mov_sel].mean())]
             for f in flow_stack
         ],
         dtype=np.float32,

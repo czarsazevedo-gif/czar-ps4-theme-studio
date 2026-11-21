@@ -193,6 +193,27 @@ class OuroborosEngine:
             frames = int(raw_frames.shape[0])
         else:
             raw_frames = np.array(io_media.extract(source_path, start_c, end_c, frames, size, out_folder, check))
+            if eff_mode == "reconstruct_auto" and len(raw_frames) >= 8:
+                step_maes = np.abs(raw_frames[1:].astype(np.float32) - raw_frames[:-1].astype(np.float32)).mean(
+                    axis=(1, 2, 3)
+                )
+                med_step = float(np.median(step_maes))
+                if med_step > 0.6:
+                    stall_thresh = max(0.15, 0.14 * med_step)
+                    keep_idx = [0] + [i + 1 for i, m in enumerate(step_maes) if float(m) >= stall_thresh]
+                    # Also check circular wrap duplicate between last kept frame and frame 0
+                    if len(keep_idx) > 6 and float(np.abs(raw_frames[keep_idx[-1]].astype(np.float32) - raw_frames[0].astype(np.float32)).mean()) < stall_thresh:
+                        keep_idx.pop()
+                    if 6 <= len(keep_idx) < len(raw_frames) and len(keep_idx) >= int(len(raw_frames) * 0.60):
+                        from .calibrator import WAIT_GRID_SEC, optimize_wait_scipy
+
+                        raw_frames = raw_frames[keep_idx]
+                        frames = int(raw_frames.shape[0])
+                        opt_w = optimize_wait_scipy(end_c - start_c, frames, grid_sec=WAIT_GRID_SEC)
+                        if 0.78 <= opt_w["speedRatioAtSnapped"] <= 1.25:
+                            wait = float(min(MAX_WAIT_SECONDS, max(MIN_WAIT_SECONDS, opt_w["snappedWaitSec"])))
+                        else:
+                            wait = float(min(MAX_WAIT_SECONDS, max(MIN_WAIT_SECONDS, (end_c - start_c) / float(frames))))
         h, w = raw_frames.shape[1:3]
         Image.fromarray(raw_frames[0]).save(out_folder / "source.png")
 

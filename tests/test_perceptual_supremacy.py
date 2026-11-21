@@ -596,3 +596,45 @@ def test_pilar_vii_proposal_titles_and_pilar_viii_fixes_001_003_005_009_010_011(
     assert "ouroboros-region-preset" in html
     assert "_clearAppliedProposalBadge" in js
     assert "syncOuroborosCurrentState" in js
+
+
+def test_checkpoint_g_banding_macro_turn_filter_and_cel_dedup():
+    """Checkpoint G: macroscopic texture-masked banding index, active-quartile flow coherence & cross-pool scaling."""
+    from app.ouroboros_engine.metrics import _banding_index
+    from app.ouroboros_engine.proposals import _score_candidate_for_profile
+    from app.ouroboros_engine.synthesis import estimate_2d_flow_field
+
+    # 1. Clean smooth ramp must score near 0 while truly posterized ramp scores high
+    x = np.linspace(20, 220, 256, dtype=np.float32)[None, :, None]
+    clean_ramp = np.broadcast_to(x, (160, 256, 3)).astype(np.uint8)
+    banded_ramp = ((clean_ramp // 14) * 14).astype(np.uint8)
+    assert _banding_index(clean_ramp) < 0.05
+    assert _banding_index(banded_ramp) > 0.50
+
+    # 2. Active-quartile temporalCoherence works even when 80% of the frame is stationary night sky
+    frames = []
+    yy, xx = np.mgrid[0:160, 0:240].astype(np.float32)
+    for t in range(8):
+        img = np.full((160, 240, 3), 14, dtype=np.uint8)
+        # Moving cloud band in bottom 22% of frame
+        cloud = 90.0 + 45.0 * np.sin(2.0 * np.pi * (xx - t * 3.0) / 48.0)
+        img[124:, :, :] = np.clip(cloud[124:, :, None], 0, 255).astype(np.uint8)
+        frames.append(img)
+    _, stats = estimate_2d_flow_field(np.stack(frames))
+    assert stats["temporalCoherence"] >= 0.65, stats
+
+    # 3. Cross-pool upscaling from sparse 10f to 24f cannot unfairly beat native 24f on identical seamRatio
+    base_costs = {
+        "totalCost": 4.0,
+        "seamRatio": 1.05,
+        "seamSsim": 0.90,
+        "internalMedianSsim": 0.92,
+        "seamDirectionCosine": 0.85,
+        "velocityJump": 0.1,
+        "accelRatio": 1.1,
+        "hasHardDefect": False,
+    }
+    native_cand = {"start": 1.0, "end": 3.0, "frames": 24, "wait": 0.083, "duration": 2.0, "costs": base_costs}
+    cross_cand = dict(native_cand, _crossPool=True, _origFrames=10)
+    assert _score_candidate_for_profile(native_cand, "balance") > _score_candidate_for_profile(cross_cand, "balance")
+
