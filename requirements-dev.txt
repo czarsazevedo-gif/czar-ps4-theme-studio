@@ -3,3 +3,5 @@ httpx>=0.27,<1
 pytest>=8,<10
 pytest-asyncio>=0.23,<2
 playwright>=1.45,<2
+gdown>=5.2,<6
+

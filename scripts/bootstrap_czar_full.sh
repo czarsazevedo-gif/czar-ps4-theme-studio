@@ -189,7 +189,7 @@ ensure_python_env() {
     # Verifica se tudo já está instalado e sem conflitos de OpenCV
     if "${py_bin}" - <<'PY' >/dev/null 2>&1
 import importlib
-for mod in ("fastapi", "uvicorn", "multipart", "numpy", "pydantic", "PIL", "cv2", "scipy", "skimage", "av", "imageio", "httpx", "pytest", "pytest_asyncio", "playwright"):
+for mod in ("fastapi", "uvicorn", "multipart", "numpy", "pydantic", "PIL", "cv2", "scipy", "skimage", "av", "imageio", "httpx", "pytest", "pytest_asyncio", "playwright", "gdown"):
     importlib.import_module(mod)
 import importlib.metadata as md
 dists = {d.metadata["Name"].lower() for d in md.distributions() if d.metadata.get("Name")}
@@ -475,18 +475,43 @@ ensure_vmaf() {
     echo "[OK] Netflix VMAF ${VMAF_VERSION} instalado em ${target}."
 }
 
+ensure_blue_noise_textures() {
+    local asset_png="${ROOT_DIR}/app/ouroboros_engine/assets/blue_noise_64.png"
+    local repo_dir="${TOOLS_DIR}/assets/blue_noise"
+    if [[ -f "${asset_png}" ]]; then
+        echo "[OK] Textura CC0 Blue-Noise 64×64 já presente em ${asset_png}."
+    fi
+    if [[ -f "${repo_dir}/64_64/HDR_L_0.png" ]]; then
+        return 0
+    fi
+    [[ "${MODE}" == "check" ]] && return 0
+    mkdir -p "$(dirname "${repo_dir}")"
+    rm -rf "${repo_dir}.tmp"
+    if git clone --depth 1 "${BLUENOISE_REPO}" "${repo_dir}.tmp" >/dev/null 2>&1; then
+        git -C "${repo_dir}.tmp" fetch --depth 1 origin "${BLUENOISE_COMMIT}" >/dev/null 2>&1 || true
+        git -C "${repo_dir}.tmp" checkout --force "${BLUENOISE_COMMIT}" >/dev/null 2>&1 || true
+        rm -rf "${repo_dir}"
+        mv "${repo_dir}.tmp" "${repo_dir}"
+        if [[ ! -f "${asset_png}" && -f "${repo_dir}/64_64/HDR_L_0.png" ]]; then
+            mkdir -p "$(dirname "${asset_png}")"
+            cp -f "${repo_dir}/64_64/HDR_L_0.png" "${asset_png}"
+        fi
+        echo "[OK] Acervo CC0 free-blue-noise-textures preparado em ${repo_dir}."
+    fi
+}
+
 ensure_profiling_python_extras() {
     local py_bin; py_bin="$(resolve_venv_python)"
     [[ -z "${py_bin}" ]] && return 0
-    if "${py_bin}" -c "import pybind11, numba, memray" >/dev/null 2>&1; then
-        echo "[OK] Extras Python de otimização/profiling (pybind11, numba, memray) já presentes."
+    if "${py_bin}" -c "import pybind11, numba, memray, gdown" >/dev/null 2>&1; then
+        echo "[OK] Extras Python de otimização/profiling/corpus (pybind11, numba, memray, gdown) já presentes."
         return 0
     fi
-    [[ "${MODE}" == "check" ]] && { echo "[AVISO] Extras Python (pybind11/numba/memray/py-spy) ausentes."; return 0; }
+    [[ "${MODE}" == "check" ]] && { echo "[AVISO] Extras Python (pybind11/numba/memray/py-spy/gdown) ausentes."; return 0; }
     if command -v uv >/dev/null 2>&1; then
-        uv pip install --python "${py_bin}" pybind11 numba py-spy memray || true
+        uv pip install --python "${py_bin}" pybind11 numba py-spy memray gdown || true
     else
-        "${py_bin}" -m pip install -q pybind11 numba py-spy memray || true
+        "${py_bin}" -m pip install -q pybind11 numba py-spy memray gdown || true
     fi
 }
 
@@ -503,8 +528,10 @@ ensure_tabler_icons
 ensure_czar_bc1
 ensure_compressonator
 ensure_vmaf
+ensure_blue_noise_textures
 ensure_profiling_python_extras
 
 echo ""
 echo "[INFO] Executando verificação funcional integral (doctor_czar_full.sh)..."
 bash "${ROOT_DIR}/scripts/doctor_czar_full.sh"
+
