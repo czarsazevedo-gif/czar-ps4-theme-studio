@@ -154,12 +154,19 @@ ensure_system_prereqs() {
         fi
         if (( ${#pkgs[@]} > 0 )); then
             echo "[INFO] Instalando pacotes Debian/Ubuntu sem desativar GPG: ${pkgs[*]}"
+            if ! sudo -n apt-get update -qq 2>/dev/null; then
+                # Em imagens padrão do GitHub Codespaces, /etc/apt/sources.list.d/yarn.list vem com chave GPG expirada/ausente
+                # (dl.yarnpkg.com NO_PUBKEY 62D54FD4003F6525). Como o Studio não usa o repositório apt do Yarn,
+                # desativamos apenas a fonte quebrada do Yarn mantendo 100% da verificação GPG oficial Debian/Ubuntu ativa!
+                if [[ -f /etc/apt/sources.list.d/yarn.list ]]; then
+                    echo "[INFO] Removendo fonte apt legada do Yarn com chave GPG expirada no Codespaces (/etc/apt/sources.list.d/yarn.list)..."
+                    sudo -n rm -f /etc/apt/sources.list.d/yarn.list
+                fi
+            fi
             if sudo -n apt-get update -qq; then
                 sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
             else
-                echo "[ERRO] 'apt-get update' falhou (nunca desativamos verificação GPG automaticamente)." >&2
-                echo "       Se estiver no GitHub Codespaces com chave expirada do Yarn, remova o arquivo" >&2
-                echo "       /etc/apt/sources.list.d/yarn.list manualmente e execute este script novamente." >&2
+                echo "[ERRO] 'apt-get update' falhou nos repositórios do sistema." >&2
                 return 1
             fi
         fi
