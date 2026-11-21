@@ -27,39 +27,53 @@ COMPRESSONATOR_CLI = (
 
 DEFAULT_OUROBOROS_BC1_BACKEND = "rgbcx_temporal"
 
+import threading
+
 _LIB_HANDLE: ctypes.CDLL | None = None
 _LIB_LOAD_ATTEMPTED = False
+_LIB_LOCK = threading.Lock()
 
 
 def _load_bc1_lib() -> ctypes.CDLL | None:
     global _LIB_HANDLE, _LIB_LOAD_ATTEMPTED
     if _LIB_LOAD_ATTEMPTED:
         return _LIB_HANDLE
-    _LIB_LOAD_ATTEMPTED = True
-    if not LIB_CZAR_BC1.is_file():
-        return None
-    try:
-        lib = ctypes.CDLL(str(LIB_CZAR_BC1))
-        lib.encode_frame_bc1_ex.argtypes = [
-            ctypes.c_void_p,  # rgba
-            ctypes.c_int,     # width
-            ctypes.c_int,     # height
-            ctypes.c_int,     # backend (0=rgbcx, 1=icbc)
-            ctypes.c_int,     # quality
-            ctypes.c_int,     # perceptual_weights
-            ctypes.c_void_p,  # prev_rgba
-            ctypes.c_void_p,  # prev_blocks
-            ctypes.c_int,     # temporal_mode (0=off, 1=ModeA, 2=ModeA+B)
-            ctypes.c_float,   # static_mae_thresh
-            ctypes.c_float,   # beta_flicker
-            ctypes.c_void_p,  # out_blocks
-            ctypes.c_void_p,  # reused_blocks_out
-        ]
-        lib.encode_frame_bc1_ex.restype = None
-        _LIB_HANDLE = lib
-    except OSError:
-        _LIB_HANDLE = None
-    return _LIB_HANDLE
+    with _LIB_LOCK:
+        if _LIB_LOAD_ATTEMPTED:
+            return _LIB_HANDLE
+        _LIB_LOAD_ATTEMPTED = True
+        if not LIB_CZAR_BC1.is_file():
+            return None
+        try:
+            lib = ctypes.CDLL(str(LIB_CZAR_BC1))
+            lib.encode_frame_bc1_ex.argtypes = [
+                ctypes.c_void_p,  # rgba
+                ctypes.c_int,     # width
+                ctypes.c_int,     # height
+                ctypes.c_int,     # backend (0=rgbcx, 1=icbc)
+                ctypes.c_int,     # quality
+                ctypes.c_int,     # perceptual_weights
+                ctypes.c_void_p,  # prev_rgba
+                ctypes.c_void_p,  # prev_blocks
+                ctypes.c_int,     # temporal_mode (0=off, 1=ModeA, 2=ModeA+B)
+                ctypes.c_float,   # static_mae_thresh
+                ctypes.c_float,   # beta_flicker
+                ctypes.c_void_p,  # out_blocks
+                ctypes.c_void_p,  # reused_blocks_out
+            ]
+            lib.encode_frame_bc1_ex.restype = None
+            # Single-threaded warmup so static RGBCX/ICBC lookup tables are initialized before concurrent calls
+            dummy_rgba = np.full((4, 4, 4), 255, dtype=np.uint8)
+            dummy_out = (ctypes.c_uint8 * 8)()
+            reused = ctypes.c_int(0)
+            lib.encode_frame_bc1_ex(
+                dummy_rgba.ctypes.data, 4, 4, 0, 1, 1, 0, 0, 0,
+                ctypes.c_float(0.0), ctypes.c_float(0.0), ctypes.addressof(dummy_out), ctypes.byref(reused),
+            )
+            _LIB_HANDLE = lib
+        except OSError:
+            _LIB_HANDLE = None
+        return _LIB_HANDLE
 
 
 def available_ouroboros_bc1_backends() -> list[str]:

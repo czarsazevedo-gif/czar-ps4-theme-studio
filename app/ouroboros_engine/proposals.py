@@ -299,6 +299,7 @@ def _compact_metrics_summary(render_report: dict[str, Any]) -> dict[str, Any]:
     gh = m.get("ghosting") or {}
     fl = m.get("flicker") or {}
     dds_d = m.get("ddsDelta") or {}
+    ctq = dds_d.get("compressedTemporalQuality") or {}
     ten = render_report.get("tenCycleAudit") or {}
     return {
         "passed": bool(ev.get("passed", False)),
@@ -310,6 +311,9 @@ def _compact_metrics_summary(render_report: dict[str, Any]) -> dict[str, Any]:
         "ghostingScore": round(float(gh.get("score", 0.0)), 4),
         "flickerScore": round(float(fl.get("score", 0.0)), 4),
         "ddsMeanPsnr": dds_d.get("meanPsnr"),
+        "ddsMeanLabDeltaE": dds_d.get("meanLabDeltaE"),
+        "staticBlockShimmerMad": ctq.get("staticBlockShimmerMad"),
+        "bc1Backend": dds_d.get("backend"),
         "distinctFrames": dds_d.get("distinctFrames"),
         "withinBudget": bool(dds_d.get("withinBudget", True)),
         "tenCyclePass": bool(ten.get("continuousTenCyclePass", False)),
@@ -512,6 +516,11 @@ def generate_three_proposals(
             "recipe": rend["recipe"],
         }
         proposals.append(proposal_card)
+        import gc as _gc
+        from .flow import clear_flow_cache as _clear_flow_cache
+
+        _clear_flow_cache()
+        _gc.collect()
 
     # Pick recommended proposal honestly (best verdict first, then balance preference & lower seam ratio)
     def _rec_sort(p: dict[str, Any]) -> tuple[int, int, float, float]:

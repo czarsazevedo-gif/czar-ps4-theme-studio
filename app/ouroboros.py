@@ -315,8 +315,13 @@ def cancel(ident: str):
 
 
 @router.get("/result/{key}")
-def report(key: AssetId):
-    return record(workspace(), key)[1]
+def report(key: AssetId, full: bool = False):
+    data = record(workspace(), key)[1]
+    if not full and isinstance(data, dict) and "profileReports" in data:
+        slim = dict(data)
+        slim.pop("profileReports", None)
+        return slim
+    return data
 
 
 @router.get("/artifact/{key}/{profile}/{name}")

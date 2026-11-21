@@ -279,7 +279,10 @@ class OuroborosEngine:
             candidate_frames = rec_res["frames"]
             strategy_used = rec_res["selectedStrategy"]
             strategy_meta = {"attempts": rec_res["attempts"], "improved": rec_res["improved"]}
+            del auto_sent, rec_res
 
+        lead_in = None
+        lead_out = None
         progress("Validando sequência DXT1a real e aplicando acabamento pós-DDS", 68)
         check()
         same_as_raw = candidate_frames is raw_frames
@@ -304,6 +307,7 @@ class OuroborosEngine:
                 "rejectedSteps": fin["rejectedSteps"],
                 "beforeAfterFinish": fin["comparison"],
             }
+            del fin
         elif same_as_raw:
             final_frames = candidate_frames
             dds_blobs = raw_full["blobs"]
@@ -319,6 +323,7 @@ class OuroborosEngine:
             decoded_frames = ev_res["decoded"]
             final_post_dds = ev_res["report"]
             finish_meta = {"enabled": False, "appliedSteps": [], "rejectedSteps": []}
+            del ev_res
 
         overall_cmp = compare_before_after(raw_post_dds, final_post_dds)
         ten_cycle = evaluate_ten_cycles(final_post_dds)
@@ -348,15 +353,16 @@ class OuroborosEngine:
         dds_hashes: dict[str, str] = {}
         for i in range(frames):
             check()
-            Image.fromarray(final_frames[i]).save(frames_dir / f"{i:02d}.png", "PNG")
+            Image.fromarray(final_frames[i]).save(frames_dir / f"{i:02d}.png", "PNG", compress_level=1)
             d_name = theme.frame_name(i)
             (dds_dir / d_name).write_bytes(dds_blobs[i])
             dds_hashes[d_name] = sha256_bytes(dds_blobs[i])
             Image.fromarray(decoded_frames[i]).save(out_folder / f"{i:02d}.webp", "WEBP", lossless=True, method=0)
 
         diff_info = compute_diff_stats(raw_frames, decoded_frames)
-        Image.fromarray(diff_info["heatmap"]).save(out_folder / "diff.png", "PNG")
+        Image.fromarray(diff_info["heatmap"]).save(out_folder / "diff.png", "PNG", compress_level=1)
         total_dds_bytes, _ = assemble_canonical_raf(dds_blobs, wait, out_folder / "background.raf.zip")
+        del raw_frames, candidate_frames, final_frames, decoded_frames, dds_blobs, raw_full
 
         strat_code = _strategy_code_for(strategy_used)
         return {

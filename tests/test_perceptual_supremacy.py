@@ -451,3 +451,38 @@ def test_i07_i08_selective_blue_noise_dither_and_strictly_monotonic_finish():
     # Strictly monotonic finish gate (Intervention 07 / CZAR-ABS-AUD-004): never increases issue count!
     fin = apply_deluxe_finish(arr, 0.1)
     assert len(fin["finalPostDds"]["issues"]) <= len(fin["baselinePostDds"]["issues"])
+
+
+# ==================== CHECKPOINT E: EFFICIENCY & LEAN PAYLOAD ====================
+
+
+def test_checkpoint_e_lean_http_payload_vs_full_opt_in(tmp_path, monkeypatch):
+    """Checkpoint E: GET /api/ouroboros/result/{key} omits heavy profileReports by default and includes them on ?full=1."""
+    import json
+    from fastapi.testclient import TestClient
+    from app import main, projects
+    from app.ouroboros_engine import OUROBOROS_VERSION
+
+    monkeypatch.setattr(projects, "ROOT", tmp_path / "projects")
+    client = TestClient(main.app)
+    assert client.get("/api/projects").status_code == 200
+    pid = client.post("/api/projects", json={"name": "Slim Payload"}).json()["id"]
+    key = "a" * 64
+    proj_dir = next((tmp_path / "projects").rglob(pid))
+    res_dir = proj_dir / "ouroboros-v1" / key
+    res_dir.mkdir(parents=True)
+    dummy = {
+        "type": "ouroboros_proposals",
+        "version": OUROBOROS_VERSION,
+        "key": key,
+        "proposals": [{"profileId": "quality"}, {"profileId": "balance"}, {"profileId": "flexibility"}],
+        "profileReports": {"quality": {"blob": "x" * 20000}, "balance": {"blob": "y" * 20000}},
+    }
+    (res_dir / "report.json").write_text(json.dumps(dummy), encoding="utf-8")
+
+    r_slim = client.get(f"/api/ouroboros/result/{key}?project={pid}")
+    r_full = client.get(f"/api/ouroboros/result/{key}?project={pid}&full=1")
+    assert r_slim.status_code == 200 and r_full.status_code == 200
+    assert "profileReports" not in r_slim.json()
+    assert "profileReports" in r_full.json()
+    assert len(r_slim.content) < len(r_full.content) * 0.2
