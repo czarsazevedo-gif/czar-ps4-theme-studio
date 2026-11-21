@@ -271,12 +271,16 @@ def _evaluate_kinematic_trajectories(
 
     cell_vecs = np.zeros((n, gh, gw, 2), dtype=np.float32)
     cell_mags = np.zeros((n, gh, gw), dtype=np.float32)
+    cell_mad = np.zeros((n, gh, gw), dtype=np.float32)
     for i in range(n):
+        j = (i + 1) % n
         fw = flows_fwd[i] * float(flow_scale)
         cf = confs[i]
+        d_img = cv2.absdiff(small_grays[j], small_grays[i])
         for r in range(gh):
             for c in range(gw):
                 ys, xs = slice(r * ch, min(hs, (r + 1) * ch)), slice(c * cw, min(ws, (c + 1) * cw))
+                cell_mad[i, r, c] = float(d_img[ys, xs].mean())
                 w_c = cf[ys, xs]
                 u_c = fw[ys, xs, 0]
                 v_c = fw[ys, xs, 1]
@@ -289,12 +293,27 @@ def _evaluate_kinematic_trajectories(
                     cell_mags[i, r, c] = float(math.hypot(vx, vy))
 
     # 1. O-KTCS Trajectory Closure & Regional Pose Snap-Back
+    # Distinguish stationary flowing texture (where wrap MAD <= 1.05x internal MAD and wrap velocity aligns with internal flow)
+    # from unclosed rigid structural displacement (where wrap exhibits visual excess or directional drop/reversal).
     net_disp = cell_vecs[:-1].sum(axis=0)
     net_dist = np.hypot(net_disp[..., 0], net_disp[..., 1])
     total_path = cell_mags[:-1].sum(axis=0)
     mov_cells = total_path > 1.8
-    prog_unclosed = np.where(mov_cells, net_dist / np.maximum(total_path, 1e-4), 0.0)
-    max_unclosed_px = float(net_dist[mov_cells].max()) if mov_cells.any() else 0.0
+
+    med_cell_mad = np.median(cell_mad[:-1], axis=0)
+    mad_ratio_cell = cell_mad[-1] / np.maximum(med_cell_mad, 0.8)
+    v_med = np.median(cell_vecs[:-1], axis=0)
+    v_seam = cell_vecs[-1]
+    v_med_mag = np.hypot(v_med[..., 0], v_med[..., 1])
+    v_seam_mag = np.hypot(v_seam[..., 0], v_seam[..., 1])
+    cos_cell = (v_med[..., 0] * v_seam[..., 0] + v_med[..., 1] * v_seam[..., 1]) / (v_med_mag * v_seam_mag + 1e-5)
+    vis_excess = np.clip((mad_ratio_cell - 1.02) / 0.55, 0.0, 1.0)
+    dir_drop = np.clip((0.75 - cos_cell) / 0.75, 0.0, 1.0)
+    struct_weight = np.maximum(vis_excess, dir_drop)
+
+    eff_net_dist = net_dist * struct_weight
+    prog_unclosed = np.where(mov_cells, (net_dist / np.maximum(total_path, 1e-4)) * struct_weight, 0.0)
+    max_unclosed_px = float(eff_net_dist[mov_cells].max()) if mov_cells.any() else 0.0
     p90_unclosed_ratio = float(np.percentile(prog_unclosed[mov_cells], 90)) if mov_cells.any() else 0.0
 
     frame_mad_max_min = float(np.max(mae_all) / max(float(np.min(mae_all)), 0.15))
@@ -344,14 +363,20 @@ def _evaluate_kinematic_trajectories(
             net_err = np.hypot(tr_a[-2, :, 0] - tr_a[0, :, 0], tr_a[-2, :, 1] - tr_a[0, :, 1])
             mov_p = path_len > 1.2
             if mov_p.any():
-                klt_unclosed_ratio = float(np.percentile(net_err[mov_p] / np.maximum(path_len[mov_p], 1e-4), 85))
-                klt_unclosed_px = float(np.percentile(net_err[mov_p], 90))
+                # Map each particle's starting coordinate to its (r, c) cell struct_weight
+                p_xs = np.clip((tr_a[0, :, 0] // cw).astype(int), 0, gw - 1)
+                p_ys = np.clip((tr_a[0, :, 1] // ch).astype(int), 0, gh - 1)
+                p_sw = struct_weight[p_ys, p_xs]
+                eff_p_err = net_err * p_sw
+                klt_unclosed_ratio = float(np.percentile((eff_p_err[mov_p]) / np.maximum(path_len[mov_p], 1e-4), 85))
+                klt_unclosed_px = float(np.percentile(eff_p_err[mov_p], 90))
 
     klt_step_p95: list[float] = []
     pc_peaks: list[float] = []
+    small_f32 = [g.astype(np.float32) for g in small_grays]
     for i in range(n):
         j = (i + 1) % n
-        pa = cv2.goodFeaturesToTrack(small_grays[i], maxCorners=150, qualityLevel=0.01, minDistance=max(4, min(hs, ws) // 32))
+        pa = cv2.goodFeaturesToTrack(small_grays[i], maxCorners=140, qualityLevel=0.01, minDistance=max(4, min(hs, ws) // 32))
         if pa is not None and len(pa) >= 4:
             pb, st1, _ = cv2.calcOpticalFlowPyrLK(small_grays[i], small_grays[j], pa, None)
             good = st1.ravel() == 1
@@ -359,7 +384,7 @@ def _evaluate_kinematic_trajectories(
             klt_step_p95.append(float(np.percentile(d, 95)))
         else:
             klt_step_p95.append(0.0)
-        (_, _), resp = cv2.phaseCorrelate(small_grays[i].astype(np.float32), small_grays[j].astype(np.float32))
+        (_, _), resp = cv2.phaseCorrelate(small_f32[i], small_f32[j])
         pc_peaks.append(float(resp))
 
     med_klt_p95 = float(np.median(klt_step_p95[:-1])) if len(klt_step_p95) > 1 else 0.25
@@ -369,13 +394,13 @@ def _evaluate_kinematic_trajectories(
 
     fps = 1.0 / max(float(wait), 1e-4)
     psnr_val = float(mean_psnr) if mean_psnr is not None else 38.0
-    s_closure = 10.0 - min(7.5, max(0.0, p90_unclosed_ratio - 0.25) * 6.5 + max(0.0, max_unclosed_px - 8.0) * 0.045)
+    s_closure = 10.0 - min(7.5, max(0.0, p90_unclosed_ratio - 0.20) * 6.5 + max(0.0, max_unclosed_px - 6.0) * 0.055)
     s_kinematic = 10.0 - min(7.5, max_tail_rev * 0.65 + max(0.0, frame_mad_max_min - 1.45) * 1.85)
     s_seam_cad = min(10.0, 5.5 * float(seam_ssim) + 4.5 * min(fps / 12.0, 1.0))
     s_dds = min(10.0, max(0.0, (psnr_val - 28.0) / 1.4))
     ouroboros_score = round(0.35 * s_closure + 0.35 * s_kinematic + 0.15 * s_seam_cad + 0.15 * s_dds, 2)
 
-    ind_closure = 10.0 - min(7.5, max(0.0, klt_unclosed_ratio - 0.25) * 6.5 + max(0.0, klt_unclosed_px - 6.0) * 0.08)
+    ind_closure = 10.0 - min(7.5, max(0.0, klt_unclosed_ratio - 0.20) * 6.5 + max(0.0, klt_unclosed_px - 6.0) * 0.08)
     ind_burst = 10.0 - min(7.5, max(0.0, klt_burst - 1.35) * 1.45 + pc_drop * 12.0 + (1.0 - surv_rate) * 4.5)
     ind_cad_dds = 0.5 * s_seam_cad + 0.5 * s_dds
     independent_score = round(0.40 * ind_closure + 0.40 * ind_burst + 0.20 * ind_cad_dds, 2)
@@ -425,15 +450,22 @@ def evaluate_loop(
     evaluate_dds: bool = False,
     backend: str = "native",
 ) -> dict:
-    """Compute the full 16-metric scientific circular evaluation on a frame sequence."""
+    """Compute the full 16-metric scientific circular evaluation on a frame sequence (optimized streaming memory)."""
     t_start = time.perf_counter()
     rgb = _as_rgb_stack(frames)
     n, h, w, _ = rgb.shape
     grays = np.stack([to_gray_u8(f) for f in rgb])
-    labs = np.stack([cv2.cvtColor(f, cv2.COLOR_RGB2LAB).astype(np.float32) for f in rgb])
-    # OpenCV uint8 Lab maps L* [0..100] -> [0..255], a*/b* -> +128
-    L_chan = labs[..., 0] * (100.0 / 255.0)
-    ab_chan = labs[..., 1:3] - 128.0
+
+    # Fast 4x4 regional L* and global a*/b* statistics without allocating a full (N, H, W, 3) float32 Lab stack!
+    reg_L = np.empty((n, 4, 4), dtype=np.float32)
+    ab_means = np.empty((n, 2), dtype=np.float32)
+    for i in range(n):
+        small_f = cv2.resize(rgb[i], (64, 36), interpolation=cv2.INTER_AREA)
+        lab_s = cv2.cvtColor(small_f, cv2.COLOR_RGB2LAB)
+        L_s = lab_s[..., 0].astype(np.float32) * (100.0 / 255.0)
+        reg_L[i] = L_s.reshape(4, 9, 4, 16).mean(axis=(1, 3))
+        ab_means[i] = lab_s[..., 1:3].mean(axis=(0, 1)).astype(np.float32) - 128.0
+    L_means = reg_L.mean(axis=(1, 2))
 
     # --- 1. Visual similarity (internal vs circular seam) ---
     mae_all = np.empty(n, dtype=np.float32)
@@ -446,17 +478,30 @@ def evaluate_loop(
 
     edges = np.stack([_edge_map(g) for g in grays])
     sharpness_all = np.array([_laplacian_sharpness(g) for g in grays], dtype=np.float32)
+    gh_b, gw_b = min(8, max(2, h // 8)), min(8, max(2, w // 8))
+    bh_b, bw_b = h // gh_b, w // gw_b
+    hc_b, wc_b = gh_b * bh_b, gw_b * bw_b
+    blk_mae = np.empty((n, gh_b, gw_b), dtype=np.float32)
+    blk_edg = np.empty((n, gh_b, gw_b), dtype=np.float32)
 
+    px_count_3 = float(h * w * 3)
     for i in range(n):
         j = (i + 1) % n
-        mae_all[i] = float(np.abs(rgb[i].astype(np.float32) - rgb[j].astype(np.float32)).mean())
-        psnr_all[i] = _psnr(rgb[i], rgb[j])
+        d_u8 = cv2.absdiff(rgb[i], rgb[j])
+        m_c = cv2.mean(d_u8)
+        mae_all[i] = float((m_c[0] + m_c[1] + m_c[2]) / 3.0)
+        n2 = float(cv2.norm(d_u8, cv2.NORM_L2))
+        mse = (n2 * n2) / px_count_3
+        psnr_all[i] = 99.0 if mse <= 1e-9 else float(10.0 * math.log10((255.0 * 255.0) / mse))
         ssim_all[i], ms_ssim_all[i] = _ssim_and_ms_ssim_gray(grays[i], grays[j])
-        edge_diff_all[i] = float(np.abs(edges[i] - edges[j]).mean())
-        lum_step_all[i] = float(L_chan[j].mean() - L_chan[i].mean())
-        ab_i = ab_chan[i].mean(axis=(0, 1))
-        ab_j = ab_chan[j].mean(axis=(0, 1))
+        de = np.abs(edges[i] - edges[j])
+        edge_diff_all[i] = float(de.mean())
+        lum_step_all[i] = float(L_means[j] - L_means[i])
+        ab_i = ab_means[i]
+        ab_j = ab_means[j]
         chroma_step_all[i] = float(np.hypot(ab_j[0] - ab_i[0], ab_j[1] - ab_i[1]))
+        blk_mae[i] = cv2.resize(d_u8[:hc_b, :wc_b], (gw_b, gh_b), interpolation=cv2.INTER_AREA).mean(axis=-1)
+        blk_edg[i] = cv2.resize(de[:hc_b, :wc_b], (gw_b, gh_b), interpolation=cv2.INTER_AREA)
 
     int_mae = mae_all[:-1]
     seam_mae = float(mae_all[-1])
@@ -569,25 +614,12 @@ def evaluate_loop(
     edge_ratio = float(seam_edge / max(float(np.median(int_edge)), 0.8))
     edge_z = _robust_z(seam_edge, int_edge, floor=0.8)
 
-    gh_b, gw_b = min(8, max(2, h // 8)), min(8, max(2, w // 8))
-    bh_b, bw_b = h // gh_b, w // gw_b
-    rgb_crop = rgb[:, : gh_b * bh_b, : gw_b * bw_b].astype(np.float32)
-    edge_crop = edges[:, : gh_b * bh_b, : gw_b * bw_b]
-    blk_mae = np.empty((n, gh_b, gw_b), dtype=np.float32)
-    blk_edg = np.empty((n, gh_b, gw_b), dtype=np.float32)
-    for i in range(n):
-        j = (i + 1) % n
-        dm = np.abs(rgb_crop[j] - rgb_crop[i]).mean(axis=-1)
-        de = np.abs(edge_crop[j] - edge_crop[i])
-        blk_mae[i] = dm.reshape(gh_b, bh_b, gw_b, bw_b).mean(axis=(1, 3))
-        blk_edg[i] = de.reshape(gh_b, bh_b, gw_b, bw_b).mean(axis=(1, 3))
     base_blk_mae = np.quantile(blk_mae[:-1], 0.85, axis=0)
     base_blk_edg = np.quantile(blk_edg[:-1], 0.85, axis=0)
     local_seam_excess = float(np.max((blk_mae[-1] - base_blk_mae) / (base_blk_mae + 4.5)))
     local_edge_excess = float(np.max((blk_edg[-1] - base_blk_edg) / (base_blk_edg + 8.0)))
 
     # --- 8. Flicker (distinguishes smooth natural lighting waves from high-freq artificial flicker) ---
-    L_means = L_chan.mean(axis=(1, 2))
     dL_circ = np.array([L_means[(i + 1) % n] - L_means[i] for i in range(n)], dtype=np.float32)
     d2L_circ = np.array([dL_circ[(i + 1) % n] - dL_circ[i] for i in range(n)], dtype=np.float32)
     sign_flips = np.array(
@@ -596,14 +628,11 @@ def evaluate_loop(
     alternation_rate = float(sign_flips.mean())
     hf_lum_energy = float(np.abs(d2L_circ[sign_flips]).mean()) if sign_flips.any() else 0.0
     flicker_score = float(alternation_rate * hf_lum_energy)
-    gL = L_chan.reshape(n, 4, h // 4 if h % 4 == 0 else h // 4, -1) if (h % 4 == 0 and w % 4 == 0) else None
-    if gL is not None:
-        reg_L = L_chan.reshape(n, 4, h // 4, 4, w // 4).mean(axis=(2, 4))
-        reg_dL = np.roll(reg_L, -1, axis=0) - reg_L
-        reg_d2L = np.roll(reg_dL, -1, axis=0) - reg_dL
-        reg_flip = (reg_dL * np.roll(reg_dL, 1, axis=0)) < -0.09
-        reg_flicker = float(np.abs(reg_d2L[reg_flip]).mean() * reg_flip.mean()) if reg_flip.any() else 0.0
-        flicker_score = max(flicker_score, reg_flicker)
+    reg_dL = np.roll(reg_L, -1, axis=0) - reg_L
+    reg_d2L = np.roll(reg_dL, -1, axis=0) - reg_dL
+    reg_flip = (reg_dL * np.roll(reg_dL, 1, axis=0)) < -0.09
+    reg_flicker = float(np.abs(reg_d2L[reg_flip]).mean() * reg_flip.mean()) if reg_flip.any() else 0.0
+    flicker_score = max(flicker_score, reg_flicker)
 
     # --- 9. Ghosting detector (Intervention 06 / CZAR-ABS-AUD-007: moving-region Laplacian dip + midpoint blend) ---
     sharp_ref = max(float(np.percentile(sharpness_all, 85)), 1.0)
@@ -703,8 +732,14 @@ def evaluate_loop(
     banding_pre = float(np.mean([_banding_index(rgb[i]) for i in np.linspace(0, n - 1, min(n, 6), dtype=int)]))
 
     # --- Spatial per-region metrics (Intervention 17) ---
-    temp_std_map = rgb.astype(np.float32).std(axis=0).mean(axis=-1)
-    seam_abs_map = np.abs(rgb[-1].astype(np.float32) - rgb[0].astype(np.float32)).mean(axis=-1)
+    acc_f = np.zeros((h, w, 3), dtype=np.float32)
+    acc_sq = np.zeros((h, w, 3), dtype=np.float32)
+    for i in range(n):
+        cv2.accumulate(rgb[i], acc_f)
+        cv2.accumulateSquare(rgb[i], acc_sq)
+    mean_f = acc_f / float(n)
+    temp_std_map = np.sqrt(np.maximum(0.0, acc_sq / float(n) - mean_f * mean_f)).mean(axis=-1)
+    seam_abs_map = cv2.absdiff(rgb[-1], rgb[0]).mean(axis=-1)
     static_reg_mask = temp_std_map <= 2.0
     moving_reg_mask = ~static_reg_mask
     static_reg_seam_mae = float(seam_abs_map[static_reg_mask].mean()) if static_reg_mask.any() else 0.0
@@ -994,9 +1029,17 @@ def _measure_dds_roundtrip(rgb: np.ndarray, *, backend: str = DEFAULT_OUROBOROS_
         and ((w, h) not in ANIMATED_SIZES or n <= max_frames_for((w, h)))
     )
 
-    psnrs = [_psnr(rgb[i], decoded_rgb[i]) for i in range(n)]
+    px_count_3 = float(h * w * 3)
+    psnrs: list[float] = []
+    maes: list[float] = []
+    for i in range(n):
+        d_u8 = cv2.absdiff(rgb[i], decoded_rgb[i])
+        m_c = cv2.mean(d_u8)
+        maes.append(float((m_c[0] + m_c[1] + m_c[2]) / 3.0))
+        n2 = float(cv2.norm(d_u8, cv2.NORM_L2))
+        mse = (n2 * n2) / px_count_3
+        psnrs.append(99.0 if mse <= 1e-9 else float(10.0 * math.log10((255.0 * 255.0) / mse)))
     ssims = [_ssim_gray(to_gray_u8(rgb[i]), to_gray_u8(decoded_rgb[i])) for i in range(n)]
-    maes = [float(np.abs(rgb[i].astype(np.float32) - decoded_rgb[i].astype(np.float32)).mean()) for i in range(n)]
 
     sample_idx = np.linspace(0, n - 1, min(n, 6), dtype=int)
     band_pre = float(np.mean([_banding_index(rgb[i]) for i in sample_idx]))
@@ -1043,7 +1086,13 @@ def _measure_dds_roundtrip(rgb: np.ndarray, *, backend: str = DEFAULT_OUROBOROS_
         hi_err_list.append(float(np.abs(rgb_diff[hi_mask]).mean()) if int(hi_mask.sum()) >= 32 else maes[i])
 
     # Intervention 21: Temporal stability of the FULL decoded DDS loop (static shimmer, endpoint churn, chroma osc, wrap)
-    src_tstd = rgb.astype(np.float32).std(axis=0).mean(axis=-1)
+    acc_s = np.zeros((h, w, 3), dtype=np.float32)
+    acc_s2 = np.zeros((h, w, 3), dtype=np.float32)
+    for i in range(n):
+        cv2.accumulate(rgb[i], acc_s)
+        cv2.accumulateSquare(rgb[i], acc_s2)
+    m_s = acc_s / float(n)
+    src_tstd = np.sqrt(np.maximum(0.0, acc_s2 / float(n) - m_s * m_s)).mean(axis=-1)
     static_px = src_tstd < 1.5
     shimmer_steps = []
     chroma_osc_steps = []
@@ -1052,7 +1101,8 @@ def _measure_dds_roundtrip(rgb: np.ndarray, *, backend: str = DEFAULT_OUROBOROS_
     if int(static_px.sum()) >= 32:
         for i in range(n):
             j = (i + 1) % n
-            step_d = float(np.abs(decoded_rgb[j][static_px].astype(np.float32) - decoded_rgb[i][static_px].astype(np.float32)).mean())
+            d_st = cv2.absdiff(decoded_rgb[j], decoded_rgb[i])
+            step_d = float(d_st[static_px].mean())
             shimmer_steps.append(step_d)
             if i == n - 1:
                 wrap_shimmer = step_d

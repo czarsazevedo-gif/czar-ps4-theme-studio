@@ -143,7 +143,13 @@ def apply_selective_blue_noise_dither(
     bn = np.tile(tile, ((h + th - 1) // th, (w + tw - 1) // tw))[:h, :w]
 
     prot = None if protected_mask is None else _align_protected_dxt1(protected_mask)
-    t_std = frames.astype(np.float32).std(axis=0).mean(axis=-1)
+    acc_f = np.zeros((h, w, 3), dtype=np.float32)
+    acc_sq = np.zeros((h, w, 3), dtype=np.float32)
+    for i in range(n):
+        cv2.accumulate(frames[i], acc_f)
+        cv2.accumulateSquare(frames[i], acc_sq)
+    m_f = acc_f / float(n)
+    t_std = np.sqrt(np.maximum(0.0, acc_sq / float(n) - m_f * m_f)).mean(axis=-1)
     static_zone = (t_std < 3.5).astype(np.float32)
 
     chan_amp = np.array([amplitude_rb, amplitude_g, amplitude_rb], dtype=np.float32)[None, None, :]

@@ -693,4 +693,60 @@ def test_checkpoint_h_kinematic_trajectory_closure_and_dual_engine_score():
     assert post_seam < pre_seam * 0.65, f"Expected drift anchoring to reduce open-loop seam ({pre_seam:.2f} -> {post_seam:.2f})"
 
 
+def test_checkpoint_i_helmholtz_se2_wavelet_and_variable_wait_raf(tmp_path):
+    """Checkpoint I: Helmholtz C2 projection, SE(2) contour closure, Wavelet phase advection, and Variable-Wait RAF XML."""
+    from app import dxt1
+    from app.ouroboros_engine.applier import assemble_canonical_raf, compute_variable_wait_schedule
+    from app.ouroboros_engine.reconstruction import (
+        apply_contour_se2_closure,
+        apply_helmholtz_c2_projection,
+        apply_wavelet_phase_advection,
+    )
+
+    n, h, w = 10, 128, 192
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    frames = []
+    for i in range(n):
+        # Accelerating pattern with a micro-offset at the last frame
+        shift = (i * 1.4) + (2.5 if i == n - 1 else 0.0)
+        pat = 128.0 + 65.0 * np.sin((xx - shift) * 0.16) * np.cos(yy * 0.14)
+        rgb = np.clip(np.stack([pat, pat * 0.92, pat * 1.04], axis=-1), 0, 255).astype(np.uint8)
+        frames.append(rgb)
+    arr = np.stack(frames, axis=0)
+
+    # 1. Helmholtz C2 projection
+    h_frames, h_meta = apply_helmholtz_c2_projection(arr)
+    assert h_frames.shape == arr.shape
+    assert "applied" in h_meta
+
+    # 2. SE(2) contour closure
+    s_frames, s_meta = apply_contour_se2_closure(arr)
+    assert s_frames.shape == arr.shape
+    assert "applied" in s_meta
+
+    # 3. Oriented wavelet phase advection
+    w_frames, w_meta = apply_wavelet_phase_advection(arr)
+    assert w_frames.shape == arr.shape
+    assert w_meta["applied"] is True
+    pre_seam = float(np.abs(arr[-1].astype(np.float32) - arr[0].astype(np.float32)).mean())
+    post_seam = float(np.abs(w_frames[-1].astype(np.float32) - w_frames[0].astype(np.float32)).mean())
+    assert post_seam < pre_seam, f"Expected wavelet phase advection to reduce micro-seam ({pre_seam:.3f} -> {post_seam:.3f})"
+
+    # 4. Variable-wait arc-length cadence schedule & RAF XML assembly
+    waits = compute_variable_wait_schedule(arr, 0.08)
+    assert len(waits) == n
+    assert abs(sum(waits) - n * 0.08) < 0.01
+    assert len(set(waits)) >= 2, f"Expected non-uniform wait allocation on non-uniform motion, got {waits}"
+
+    blobs = [
+        dxt1.encode_dds(np.concatenate([arr[i], np.full((h, w, 1), 255, dtype=np.uint8)], axis=-1))
+        for i in range(n)
+    ]
+    raf_zip = tmp_path / "var_wait.raf.zip"
+    _, xml = assemble_canonical_raf(blobs, 0.08, raf_zip, wait_list=waits)
+    assert f'<case wait="{waits[0]:g}">' in xml
+    assert f'<case wait="{waits[-1]:g}">' in xml
+
+
+
 

@@ -382,7 +382,12 @@ class OuroborosEngine:
 
         diff_info = compute_diff_stats(raw_frames, decoded_frames)
         Image.fromarray(diff_info["heatmap"]).save(out_folder / "diff.png", "PNG", compress_level=1)
-        total_dds_bytes, _ = assemble_canonical_raf(dds_blobs, wait, out_folder / "background.raf.zip")
+        from .applier import compute_variable_wait_schedule
+
+        wait_schedule = compute_variable_wait_schedule(decoded_frames, wait)
+        total_dds_bytes, _ = assemble_canonical_raf(
+            dds_blobs, wait, out_folder / "background.raf.zip", wait_list=wait_schedule
+        )
         del raw_frames, candidate_frames, final_frames, decoded_frames, dds_blobs, raw_full
 
         strat_code = _strategy_code_for(strategy_used)
@@ -393,6 +398,7 @@ class OuroborosEngine:
             "frames": frames,
             "wait": float(wait),
             "waitMs": round(float(wait) * 1000.0, 3),
+            "waitSchedule": wait_schedule,
             "fps": round(1.0 / float(wait), 4),
             "duration": round(frames * float(wait), 4),
             "size": list(size),

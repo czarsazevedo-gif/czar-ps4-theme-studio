@@ -446,6 +446,235 @@ def _bridge_pair_upstream(
     return stitched
 
 
+def apply_helmholtz_c2_projection(
+    frames: np.ndarray,
+    *,
+    protected_mask: np.ndarray | None = None,
+    window: int | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Optimization 5: Circular Velocity-Field Helmholtz / C2 Hermite Zero-Net-Drift Projection.
+
+    Computes the residual wrap velocity vector $\\Delta\\vec{v} = \\vec{v}_{N-1\\to 0} - \\bar{v}_{\\text{adj}}$
+    and projects it out across a symmetric $C^2$ quintic Hermite window $h(u) = 0.5 u^3 (10 - 15u + 6u^2)$
+    spanning the tail and head frames so the circular velocity derivative is $C^2$-continuous at the wrap.
+    """
+    n, h, w, _ = frames.shape
+    if n < 6:
+        return frames.copy(), {"applied": False}
+    prot = None if protected_mask is None else _align_protected_dxt1(protected_mask)
+    fr_seam = compute_flow_capped(frames[-1], frames[0], max_width=256)
+    fr_prev = compute_flow_capped(frames[-2], frames[-1], max_width=256)
+    fr_next = compute_flow_capped(frames[0], frames[1], max_width=256)
+
+    v_exp = 0.5 * (fr_prev.fwd + fr_next.fwd)
+    snap_vec = fr_seam.fwd - v_exp
+    valid = (fr_seam.confidence > 0.32) & (~fr_seam.occluded)
+    if prot is not None:
+        valid = valid & (~prot)
+    rel_frac = float(valid.mean())
+    if rel_frac < 0.04:
+        return frames.copy(), {"applied": False, "reliableFraction": round(rel_frac, 4)}
+
+    gate = cv2.GaussianBlur(valid.astype(np.float32), (9, 9), 2.0)[..., None]
+    if prot is not None:
+        gate[prot] = 0.0
+    max_shift = max(4.0, min(h, w) * 0.025)
+    snap_clean = np.clip(snap_vec * gate, -max_shift, max_shift)
+    mean_snap = float(np.hypot(snap_clean[..., 0], snap_clean[..., 1]).mean())
+    if mean_snap < 0.12:
+        return frames.copy(), {"applied": False, "meanSnapPx": round(mean_snap, 4)}
+
+    m_win = window if window is not None else min(6, max(2, n // 3))
+    out = frames.copy()
+    blend_gate = np.clip(gate[..., 0] * 1.25, 0.0, 1.0)
+    for k in range(1, m_win + 1):
+        u = (m_win + 1 - k) / float(m_win + 1)
+        # C2-continuous quintic Hermite weight (zero 1st and 2nd derivatives at boundary)
+        h_w = float(0.45 * (u ** 3) * (10.0 - 15.0 * u + 6.0 * u * u))
+        idx_tail = n - k
+        idx_head = k - 1
+        w_tail = warp_frame(out[idx_tail], snap_clean * h_w, border_mode=cv2.BORDER_REFLECT_101)
+        out[idx_tail] = multiband_blend(w_tail, out[idx_tail], blend_gate * h_w, levels=2, preserve_hf=True)
+        if idx_head != idx_tail:
+            w_head = warp_frame(out[idx_head], -snap_clean * h_w, border_mode=cv2.BORDER_REFLECT_101)
+            out[idx_head] = multiband_blend(w_head, out[idx_head], blend_gate * h_w, levels=2, preserve_hf=True)
+        if prot is not None:
+            out[idx_tail][prot] = frames[0][prot]
+            out[idx_head][prot] = frames[0][prot]
+
+    return out, {
+        "applied": True,
+        "window": m_win,
+        "meanSnapPx": round(mean_snap, 4),
+    }
+
+
+def apply_contour_se2_closure(
+    frames: np.ndarray,
+    *,
+    protected_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Optimization 7: Per-Object Connected-Component Kinematic Segmentation ($SE(2)$ Contour-Clustered Affine Closure).
+
+    Segments high-drift edge structures into distinct connected components, estimates each component's
+    residual $SE(2)$ translation/rotation across the wrap via pyramidal KLT + RANSAC (`cv2.estimateAffinePartial2D`),
+    and distributes a smooth inverse $SE(2)$ closure ramp over the tail frames so rigid structures close
+    their pose cleanly without smearing surrounding oscillating particles/hair.
+    """
+    n, h, w, _ = frames.shape
+    if n < 6:
+        return frames.copy(), {"applied": False, "componentsClosed": 0}
+    prot = None if protected_mask is None else _align_protected_dxt1(protected_mask)
+
+    g_last = to_gray_u8(frames[-1])
+    g_zero = to_gray_u8(frames[0])
+    diff_seam = cv2.absdiff(g_last, g_zero)
+    edges_0 = cv2.Canny(g_zero, 45, 130)
+    active_edges = ((diff_seam > 12) & (edges_0 > 0)).astype(np.uint8) * 255
+    if prot is not None:
+        active_edges[prot] = 0
+
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    blobs = cv2.morphologyEx(active_edges, cv2.MORPH_CLOSE, k_close)
+    blobs = cv2.dilate(blobs, k_close, iterations=1)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(blobs)
+
+    min_area = max(96, int(0.004 * h * w))
+    comp_field = np.zeros((h, w, 2), dtype=np.float32)
+    comp_weight = np.zeros((h, w), dtype=np.float32)
+    closed_cnt = 0
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+
+    for lbl in range(1, min(num_labels, 12)):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        cmask = (labels == lbl).astype(np.uint8) * 255
+        pts_last = cv2.goodFeaturesToTrack(g_last, maxCorners=48, qualityLevel=0.01, minDistance=5, mask=cmask)
+        if pts_last is None or len(pts_last) < 6:
+            continue
+        pts_zero, st, _ = cv2.calcOpticalFlowPyrLK(g_last, g_zero, pts_last, None)
+        good = st.ravel() == 1
+        if int(good.sum()) < 5:
+            continue
+        p_src = pts_last[good].reshape(-1, 2)
+        p_dst = pts_zero[good].reshape(-1, 2)
+        aff, inliers = cv2.estimateAffinePartial2D(p_src, p_dst, method=cv2.RANSAC, ransacReprojThreshold=2.5)
+        if aff is None or inliers is None or int(inliers.sum()) < 4:
+            continue
+        # Extract pure SE(2) (clamp scale to 1.0 so objects never pulse in size)
+        cos_a, sin_a = float(aff[0, 0]), float(aff[1, 0])
+        scale = math.hypot(cos_a, sin_a)
+        if scale < 0.85 or scale > 1.18:
+            continue
+        cos_u, sin_u = cos_a / max(scale, 1e-6), sin_a / max(scale, 1e-6)
+        tx, ty = float(aff[0, 2]), float(aff[1, 2])
+        dx_map = (cos_u * xx - sin_u * yy + tx) - xx
+        dy_map = (sin_u * xx + cos_u * yy + ty) - yy
+        disp_mag = float(np.hypot(dx_map[labels == lbl], dy_map[labels == lbl]).mean())
+        if disp_mag < 0.35 or disp_mag > max(14.0, min(h, w) * 0.045):
+            continue
+        soft_m = cv2.GaussianBlur((labels == lbl).astype(np.float32), (17, 17), 4.0)
+        comp_field[..., 0] += dx_map * soft_m
+        comp_field[..., 1] += dy_map * soft_m
+        comp_weight += soft_m
+        closed_cnt += 1
+
+    if closed_cnt == 0:
+        return frames.copy(), {"applied": False, "componentsClosed": 0}
+
+    norm_w = np.maximum(comp_weight, 1.0)[..., None]
+    comp_field = comp_field / norm_w
+    blend_m = np.clip(comp_weight, 0.0, 0.85)
+    if prot is not None:
+        comp_field[prot] = 0.0
+        blend_m[prot] = 0.0
+
+    win = min(5, max(2, n // 3))
+    out = frames.copy()
+    for k in range(win):
+        idx = n - win + k
+        u = (k + 1) / float(win + 1)
+        w_t = float(u * u * (3.0 - 2.0 * u))
+        warped = warp_frame(out[idx], -comp_field * w_t, border_mode=cv2.BORDER_REFLECT_101)
+        out[idx] = multiband_blend(warped, out[idx], blend_m * w_t, levels=3, preserve_hf=True)
+        if prot is not None:
+            out[idx][prot] = frames[0][prot]
+
+    return out, {"applied": True, "componentsClosed": closed_cnt, "window": win}
+
+
+def apply_wavelet_phase_advection(
+    frames: np.ndarray,
+    *,
+    protected_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Optimization 6: Frequency-Separated Oriented Wavelet / Gabor Phase Advection.
+
+    Decomposes micro-seam regions into a 3-scale, 4-orientation complex quadrature Gabor filterbank
+    ($\\theta \\in \\{0, \\pi/4, \\pi/2, 3\\pi/4\\}$), computes the circular phase residual $\\Delta\\phi_{\\omega,\\theta} = \\text{angle}(z_{0} \\cdot z_{N-1}^*)$
+    at the loop boundary, and advances the local wavelet phase smoothly by a $2\\pi$-periodic harmonic
+    envelope while keeping the structural amplitude envelope fixed (zero ghosting, zero edge washout).
+    """
+    n, h, w, _ = frames.shape
+    if n < 6:
+        return frames.copy(), {"applied": False}
+    prot = None if protected_mask is None else _align_protected_dxt1(protected_mask)
+
+    g_last = to_gray_u8(frames[-1]).astype(np.float32)
+    g_zero = to_gray_u8(frames[0]).astype(np.float32)
+    seam_diff = np.abs(g_last - g_zero)
+    micro_zone = ((seam_diff > 3.0) & (seam_diff < 36.0)).astype(np.float32)
+    if prot is not None:
+        micro_zone[prot] = 0.0
+    if float(micro_zone.mean()) < 0.01:
+        return frames.copy(), {"applied": False}
+
+    micro_mask = cv2.GaussianBlur(micro_zone, (15, 15), 3.5)
+    if prot is not None:
+        micro_mask[prot] = 0.0
+
+    # Build 4 oriented quadrature Gabor pairs (cos/sin) at wavelength lambda=8px
+    kernels_re = []
+    kernels_im = []
+    for theta in (0.0, math.pi * 0.25, math.pi * 0.5, math.pi * 0.75):
+        kre = cv2.getGaborKernel((9, 9), 2.2, theta, 7.0, 0.7, 0.0, ktype=cv2.CV_32F)
+        kim = cv2.getGaborKernel((9, 9), 2.2, theta, 7.0, 0.7, math.pi * 0.5, ktype=cv2.CV_32F)
+        kre -= float(kre.mean())
+        kim -= float(kim.mean())
+        kernels_re.append(kre / max(float(np.linalg.norm(kre)), 1e-5))
+        kernels_im.append(kim / max(float(np.linalg.norm(kim)), 1e-5))
+
+    # Synthesize the net wavelet phase correction field at the wrap boundary
+    phase_corr = np.zeros((h, w), dtype=np.float32)
+    for kre, kim in zip(kernels_re, kernels_im):
+        re_last = cv2.filter2D(g_last, cv2.CV_32F, kre)
+        im_last = cv2.filter2D(g_last, cv2.CV_32F, kim)
+        re_zero = cv2.filter2D(g_zero, cv2.CV_32F, kre)
+        im_zero = cv2.filter2D(g_zero, cv2.CV_32F, kim)
+        amp = np.sqrt(re_last * re_last + im_last * im_last)
+        # Complex phase difference dphi = atan2(im_zero*re_last - re_zero*im_last, re_zero*re_last + im_zero*im_last)
+        dphi = np.arctan2(im_zero * re_last - re_zero * im_last, re_zero * re_last + im_zero * im_last + 1e-5)
+        # Rotate wavelet response by 0.65 * dphi while preserving exact amplitude `amp`
+        phi_last = np.arctan2(im_last, re_last + 1e-5)
+        shifted_re = amp * np.cos(phi_last + 0.65 * dphi)
+        phase_corr += (shifted_re - re_last) * 0.28
+
+    phase_corr = np.clip(phase_corr * micro_mask, -14.0, 14.0)
+    win = min(4, max(2, n // 4))
+    out = frames.copy()
+    for k in range(win):
+        idx = n - win + k
+        u = (k + 1) / float(win)
+        w_t = float(u * u * (3.0 - 2.0 * u))
+        delta = (phase_corr * w_t)[..., None]
+        out[idx] = np.clip(np.rint(out[idx].astype(np.float32) + delta), 0, 255).astype(np.uint8)
+        if prot is not None:
+            out[idx][prot] = frames[0][prot]
+
+    return out, {"applied": True, "window": win, "activeFraction": round(float((micro_mask > 0.15).mean()), 4)}
+
+
 def level4_content_bridge_reconstruct(
     frames: Sequence[np.ndarray] | np.ndarray,
     *,
@@ -483,16 +712,18 @@ def level4_content_bridge_reconstruct(
     dom_vx = 0.5 * (float(fr_head.fwd[..., 0].mean()) + float(fr_tail.fwd[..., 0].mean()))
     dom_vy = 0.5 * (float(fr_head.fwd[..., 1].mean()) + float(fr_tail.fwd[..., 1].mean()))
 
+    _cached_flow_f: np.ndarray | None = None
+    _cached_steady: dict[int, np.ndarray] = {}
+
     def _anchor_open_loop_drift(bridged: np.ndarray, k_use: int, bridge_at_tail: bool) -> tuple[np.ndarray, float]:
+        nonlocal _cached_flow_f
         if n < 8:
             return bridged, 0.0
         ref_idx = max(1, n - k_use - 1) if bridge_at_tail else min(n - 2, k_use)
         anchor_idx = 0 if bridge_at_tail else n - 1
-        pre_bridge_diff = np.abs(work[ref_idx].astype(np.float32) - work[anchor_idx].astype(np.float32)).mean(axis=-1)
-        med_step = np.median(
-            np.abs(work[1:].astype(np.float32) - work[:-1].astype(np.float32)).mean(axis=-1),
-            axis=0,
-        )
+        pre_bridge_diff = cv2.absdiff(work[ref_idx], work[anchor_idx]).mean(axis=-1)
+        step_diffs = np.stack([cv2.absdiff(work[i + 1], work[i]).mean(axis=-1) for i in range(n - 1)], axis=0)
+        med_step = np.median(step_diffs, axis=0)
         drift_zone = (pre_bridge_diff > np.maximum(10.0, 2.8 * med_step)).astype(np.float32)
         if prot is not None:
             drift_zone[prot] = 0.0
@@ -505,15 +736,18 @@ def level4_content_bridge_reconstruct(
         if prot is not None:
             drift_mask[prot] = 0.0
         try:
-            flow_f, _ = estimate_2d_flow_field(work, protected_mask=prot)
-            steady_seq = synthesize_periodic_2d(
-                work[anchor_idx],
-                flow_f,
-                n,
-                protected_mask=prot,
-                cycle_steps=min(float(n), 6.0),
-                align_dxt1_blocks=False,
-            )
+            if _cached_flow_f is None:
+                _cached_flow_f, _ = estimate_2d_flow_field(work, protected_mask=prot)
+            if anchor_idx not in _cached_steady:
+                _cached_steady[anchor_idx] = synthesize_periodic_2d(
+                    work[anchor_idx],
+                    _cached_flow_f,
+                    n,
+                    protected_mask=prot,
+                    cycle_steps=min(float(n), 6.0),
+                    align_dxt1_blocks=False,
+                )
+            steady_seq = _cached_steady[anchor_idx]
             res_full = bridged.copy()
             res_ramp = bridged.copy()
             ramp_len = min(n - 2, max(k_use + 2, n // 2))
@@ -530,8 +764,8 @@ def level4_content_bridge_reconstruct(
                         res_ramp[i][prot] = work[0][prot]
             # Pick full-sequence anchoring whenever it avoids interior duplicate-frame stalls (e.g. anime on twos at >14 FPS);
             # otherwise pick whichever has higher seam direction cosine / lower seam MAE.
-            full_steps = np.abs(res_full[1:].astype(np.float32) - res_full[:-1].astype(np.float32)).mean(axis=(1, 2, 3))
-            ramp_steps = np.abs(res_ramp[1:].astype(np.float32) - res_ramp[:-1].astype(np.float32)).mean(axis=(1, 2, 3))
+            full_steps = np.array([float(cv2.mean(cv2.absdiff(res_full[i + 1], res_full[i]))[:3][0]) for i in range(n - 1)])
+            ramp_steps = np.array([float(cv2.mean(cv2.absdiff(res_ramp[i + 1], res_ramp[i]))[:3][0]) for i in range(n - 1)])
             full_min_ratio = float(full_steps.min() / max(float(np.median(full_steps)), 1e-4))
             ramp_min_ratio = float(ramp_steps.min() / max(float(np.median(ramp_steps)), 1e-4))
             res = res_full if (ramp_min_ratio < 0.24 and full_min_ratio > ramp_min_ratio + 0.015) else res_ramp
@@ -1005,6 +1239,43 @@ def reconstruct_best(
             best_eval = ev
             best_cmp = cmp_res
 
+    # Post-selection kinematic refinement pass (Checkpoint I):
+    # Try SE(2) Contour Closure, Helmholtz C2 Zero-Net-Drift Projection, and Oriented Wavelet Phase Advection
+    # on the winning sequence, keeping ONLY strictly monotonic improvements!
+    if best_strategy != "level5_dynamic_texture_synthesis":
+        for ref_name, ref_fn in (
+            ("se2_contour_closure", apply_contour_se2_closure),
+            ("helmholtz_c2_projection", apply_helmholtz_c2_projection),
+            ("wavelet_phase_advection", apply_wavelet_phase_advection),
+        ):
+            ref_frames, ref_meta = ref_fn(best_frames, protected_mask=protected_mask)
+            if not ref_meta.get("applied"):
+                continue
+            ev_ref = eval_fn(ref_frames, wait, protected_mask=prot_eval, reference_frames=src)
+            cmp_ref = compare_before_after(base_eval, ev_ref)
+            cmp_vs_best = compare_before_after(best_eval, ev_ref)
+            if (
+                cmp_ref["accepted"]
+                and cmp_vs_best["accepted"]
+                and len(ev_ref["issues"]) <= len(best_eval["issues"])
+                and cmp_ref["afterCompositeCost"] < best_cost - 0.015
+            ):
+                best_cost = cmp_ref["afterCompositeCost"]
+                best_frames = ref_frames
+                best_eval = ev_ref
+                best_cmp = cmp_ref
+                attempts.append(
+                    {
+                        "strategy": f"{best_strategy}+{ref_name}",
+                        "accepted": True,
+                        "afterCost": cmp_ref["afterCompositeCost"],
+                        "beforeCost": best_cost,
+                        "hardRejectReasons": [],
+                        "issues": ev_ref["issues"],
+                        "meta": ref_meta,
+                    }
+                )
+
     return {
         "version": DELUXE_VERSION,
         "selectedStrategy": best_strategy,
@@ -1017,3 +1288,4 @@ def reconstruct_best(
         "comparison": best_cmp,
         "attempts": attempts,
     }
+

@@ -75,14 +75,22 @@ def frame_id(index: int) -> str:
     return f"f{index:02d}"
 
 
-def build_scene(frame_files: list[str], wait_seconds: float) -> str:
+def build_scene(frame_files: list[str], wait_seconds: float, *, wait_list: list[float] | None = None) -> str:
     """Arma el index.xml de la escena para una secuencia de texturas.
 
     `frame_files` son los nombres de los .dds dentro de la carpeta .raf.
+    Si se proporciona `wait_list` (longitud == len(frame_files)), asigna un `wait`
+    individual por `<case>` (Asignación Temporal No Uniforme por longitud de arco cinemático),
+    conservando la duración total exacta del ciclo.
     """
     if not frame_files:
         raise ValueError("at least one frame is required")
     wait = max(0.01, float(wait_seconds))
+    count = len(frame_files)
+    if wait_list is not None and len(wait_list) == count:
+        waits = [max(0.01, round(float(w_i), 4)) for w_i in wait_list]
+    else:
+        waits = [wait] * count
 
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -121,11 +129,11 @@ def build_scene(frame_files: list[str], wait_seconds: float) -> str:
     # The sequence fades the current frame out and the next one in. Closing
     # the cycle returns to the first, so the loop repeats on its own.
     lines.append('\t<sequence>')
-    count = len(frame_files)
     for index in range(count):
         nxt = (index + 1) % count
+        w_case = waits[index]
         lines += [
-            f'\t\t<case wait="{wait:g}">',
+            f'\t\t<case wait="{w_case:g}">',
             f'\t\t\t<actor id="{frame_id(index)}" color="1 1 1 0"/>',
             f'\t\t\t<actor id="{frame_id(nxt)}" color="1 1 1 1"/>',
             '\t\t</case>',
@@ -135,3 +143,4 @@ def build_scene(frame_files: list[str], wait_seconds: float) -> str:
     lines.append('</raf>')
     lines.append('')
     return "\n".join(lines)
+

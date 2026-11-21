@@ -57,7 +57,50 @@ def write_lossless_mp4(path: Path, frames: np.ndarray, fps: float) -> None:
     )
 
 
-def assemble_canonical_raf(dds_blobs: list[bytes], wait: float, dest_zip: Path) -> tuple[int, str]:
+def compute_variable_wait_schedule(
+    frames: np.ndarray,
+    mean_wait: float,
+    *,
+    max_deviation: float = 0.22,
+) -> list[float]:
+    """Allocate per-frame `<case wait="...">` proportional to visual motion arc-length.
+
+    Preserves exact total cycle duration (`sum(waits) == N * mean_wait`) while giving larger
+    inter-frame steps slightly more display time and smaller turnaround steps slightly less,
+    equalizing perceived angular/linear velocity on screen within the fixed PS4 RAF frame budget.
+    """
+    n = int(frames.shape[0])
+    w_mean = max(0.02, float(mean_wait))
+    if n < 4:
+        return [round(w_mean, 4)] * n
+    # Fast strided step energy
+    small = frames[:, ::4, ::4].astype(np.float32)
+    step_e = np.array(
+        [float(np.abs(small[(i + 1) % n] - small[i]).mean()) for i in range(n)],
+        dtype=np.float64,
+    )
+    med_e = float(np.median(step_e))
+    if med_e < 0.35 or float(np.std(step_e) / max(med_e, 1e-4)) < 0.04:
+        return [round(w_mean, 4)] * n
+    # Smooth 3-tap circular filter on step energy so cadence modulates organically
+    sm_e = 0.20 * np.roll(step_e, 1) + 0.60 * step_e + 0.20 * np.roll(step_e, -1)
+    rel = np.clip(sm_e / max(float(np.mean(sm_e)), 1e-4), 1.0 - max_deviation, 1.0 + max_deviation)
+    # Damp modulation exponent (0.55) so cadence feels natural and never jittery
+    weights = np.power(rel, 0.55)
+    weights = weights / max(float(np.mean(weights)), 1e-6)
+    waits = np.clip(weights * w_mean, 0.02, 5.0)
+    # Enforce exact total duration == n * w_mean
+    waits = waits * (n * w_mean / max(float(np.sum(waits)), 1e-6))
+    return [round(float(x), 4) for x in waits]
+
+
+def assemble_canonical_raf(
+    dds_blobs: list[bytes],
+    wait: float,
+    dest_zip: Path,
+    *,
+    wait_list: list[float] | None = None,
+) -> tuple[int, str]:
     """Build canonical scene/background.raf/ ZIP (DXT1a DDS + plane.mdx + index.xml)."""
     count = len(dds_blobs)
     total_dds = sum(len(b) for b in dds_blobs)
@@ -76,10 +119,11 @@ def assemble_canonical_raf(dds_blobs: list[bytes], wait: float, dest_zip: Path) 
         (tree / raf.MODEL_REAL_FILE).write_bytes(
             mdx.quad_model(node_name=raf.MODEL_ID, half_w=half_w, half_h=half_h)
         )
-        index_xml = raf.build_scene(names, wait)
+        index_xml = raf.build_scene(names, wait, wait_list=wait_list)
         theme.write_index_xml(tree / "index.xml", index_xml)
         theme.zip_raf_folder(tree, dest_zip)
     return total_dds, index_xml
+
 
 
 def _default_editor_state() -> projects.Editor:
