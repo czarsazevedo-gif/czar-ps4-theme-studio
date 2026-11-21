@@ -43,6 +43,7 @@ class UnifiedRunRequest(Model):
     stabilizeCamera: bool = False
     recipeId: str | None = None
     recipe: RegionalRecipe | None = None
+    forceNew: bool = False
 
 
 class UnifiedApplyRequest(Model):
@@ -115,7 +116,7 @@ def record(root: Path, key: str) -> tuple[Path, dict]:
         raise HTTPException(404, "Resultado indisponível neste projeto.") from exc
 
 
-def submit(root: Path, signature: str, calculate, *, preempt: bool = True) -> dict:
+def submit(root: Path, signature: str, calculate, *, preempt: bool = True, force_new: bool = False) -> dict:
     with lock:
         for ident, t in list(tasks.items()):
             if t.finished and time.monotonic() - t.finished > 600:
@@ -124,7 +125,7 @@ def submit(root: Path, signature: str, calculate, *, preempt: bool = True) -> di
         active_other = 0
         for task in running:
             if task.root == root:
-                if task.signature == signature and not task.stop.is_set():
+                if not force_new and task.signature == signature and not task.stop.is_set():
                     return task.public()
                 if preempt:
                     task.stop.set()
@@ -252,9 +253,47 @@ def task_for(ident: str) -> Task:
 
 @router.get("/current")
 def current():
-    state = projects.read(workspace()).state
+    root = workspace()
+    state = projects.read(root).state
     job = jobs.load("animated", state.anim.jobId) if state and state.anim and state.anim.jobId else None
-    return {"id": job.id, "name": job.original_name} if job else None
+
+    active_task = None
+    with lock:
+        for t in tasks.values():
+            if t.root == root and t.state == "working" and not t.stop.is_set():
+                active_task = t.public()
+                break
+
+    cached_key = None
+    cache_dir = root / "ouroboros-v1"
+    if cache_dir.is_dir():
+        candidates = sorted(
+            (p for p in cache_dir.iterdir() if p.is_dir() and re.fullmatch(r"[a-f0-9]{64}", p.name) and (p / "report.json").is_file()),
+            key=lambda p: (p / "report.json").stat().st_mtime,
+            reverse=True,
+        )
+        for cand in candidates:
+            try:
+                rep = json.loads((cand / "report.json").read_bytes())
+                if rep.get("type") == "ouroboros_proposals" and rep.get("version") == OUROBOROS_VERSION:
+                    cached_key = cand.name
+                    if job and (rep.get("source") or {}).get("id") == job.id:
+                        break
+            except Exception:
+                continue
+
+    if not job and not active_task and not cached_key:
+        return None
+
+    deluxe_meta = (job.meta.get("deluxe") if job and isinstance(job.meta, dict) else None) or {}
+    return {
+        "id": job.id if job else None,
+        "name": job.original_name if job else None,
+        "activeTask": active_task,
+        "cachedResultKey": cached_key,
+        "appliedRenderKey": deluxe_meta.get("renderKey") or deluxe_meta.get("resultKey"),
+        "appliedProfileId": deluxe_meta.get("profileId"),
+    }
 
 
 @router.post("/run", status_code=202)
@@ -269,6 +308,14 @@ def unified_run(request: Request, item: UnifiedRunRequest):
             resolved_recipe = load_recipe(root, item.recipeId)
         except (FileNotFoundError, ValueError) as exc:
             raise HTTPException(404, "Receita regional não encontrada neste projeto.") from exc
+
+    sig_obj = {
+        "kind": item.kind,
+        "id": item.id,
+        "stabilizeCamera": item.stabilizeCamera,
+        "recipeId": item.recipeId,
+        "recipe": resolved_recipe.model_dump() if resolved_recipe else None,
+    }
 
     def prepare(task: Task):
         sha = engine_media.digest(path, task.check)
@@ -297,7 +344,13 @@ def unified_run(request: Request, item: UnifiedRunRequest):
 
         return key, calculate
 
-    return submit(root, "ouroboros-run:" + item.model_dump_json(), prepare, preempt=True)
+    return submit(
+        root,
+        "ouroboros-run:" + json.dumps(sig_obj, sort_keys=True),
+        prepare,
+        preempt=True,
+        force_new=item.forceNew,
+    )
 
 
 @router.get("/jobs/{ident}")

@@ -381,6 +381,17 @@
             <p id="ouroboros-status" class="ouroboros-status">Importe um vídeo ou GIF para gerar automaticamente as 3 propostas otimizadas (720p, 540p e 360p).</p>
           </div>
           <div class="ouroboros-actions">
+            <label class="ouroboros-region-ctl" for="ouroboros-region-preset">
+              <span class="sr-only">Proteção regional</span>
+              <select id="ouroboros-region-preset" class="select" aria-label="Proteção regional Ouroboros">
+                <option value="none">Regiões: Automático</option>
+                <option value="center_face">Proteger centro / rosto</option>
+                <option value="top_sky">Proteger topo / lua</option>
+                <option value="bottom_hud">Proteger base / HUD</option>
+                <option value="left_side">Proteger lateral esquerda</option>
+                <option value="right_side">Proteger lateral direita</option>
+              </select>
+            </label>
             <label class="ouroboros-check">
               <input id="ouroboros-stabilize" type="checkbox">
               <span>Estabilizar câmera</span>

@@ -125,6 +125,7 @@ def apply_loop_to_project(
     size = tuple(report["size"])
     wait = float(report["wait"])
     dds_hashes: dict[str, str] = report.get("ddsHashes") or {}
+    file_hashes: dict[str, str] = report.get("files") or {}
 
     if size not in ANIMATED_SIZES or not 4 <= frames <= max_frames_for(size):
         raise ValueError("Orçamento ou resolução incompatível com o projeto PS4.")
@@ -138,18 +139,25 @@ def apply_loop_to_project(
     if not (dds_src.is_dir() and png_src.is_dir() and raf_src.is_file()):
         raise ValueError("Artefatos renderizados incompletos para aplicação.")
 
+    if file_hashes.get("background.raf.zip"):
+        if sha256_bytes(raf_src.read_bytes()) != file_hashes["background.raf.zip"]:
+            raise ValueError("Integridade SHA-256 falhou para background.raf.zip.")
+
     loaded_frames = []
     total_bytes = 0
     for i in range(frames):
         d_name = theme.frame_name(i)
+        w_name = f"{i:02d}.webp"
         d_path = dds_src / d_name
         p_path = png_src / f"{i:02d}.png"
-        w_path = result_folder / f"{i:02d}.webp"
+        w_path = result_folder / w_name
         if not (d_path.is_file() and p_path.is_file() and w_path.is_file()):
             raise ValueError(f"Quadro {i:02d} ausente nos derivados renderizados.")
         blob = d_path.read_bytes()
         if dds_hashes.get(d_name) and sha256_bytes(blob) != dds_hashes[d_name]:
             raise ValueError(f"Integridade SHA-256 falhou para {d_name}.")
+        if file_hashes.get(w_name) and sha256_bytes(w_path.read_bytes()) != file_hashes[w_name]:
+            raise ValueError(f"Integridade SHA-256 falhou para {w_name}.")
         if blob[:4] != b"DDS " or blob[84:88] != b"DXT1":
             raise ValueError(f"Cabeçalho DDS inválido em {d_name}.")
         total_bytes += len(blob)

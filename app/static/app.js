@@ -512,6 +512,24 @@ function _markAppliedProposalCard(profileId, renderKey) {
   });
 }
 
+function _clearAppliedProposalBadge() {
+  if (!animDiag.appliedProfileId && !animDiag.appliedRenderKey) return;
+  animDiag.appliedProfileId = null;
+  animDiag.appliedRenderKey = null;
+  document.querySelectorAll("#ouroboros-proposals .ob-card").forEach((card) => {
+    card.classList.remove("is-applied");
+    const pill = card.querySelector(".ob-applied-pill");
+    if (pill) pill.hidden = true;
+    const btn = card.querySelector(".ob-btn-apply");
+    if (btn) btn.textContent = "APLICAR ESTE LOOP AO MEU TEMA";
+  });
+  const obStatus = $("ouroboros-status");
+  if (obStatus && animDiag.report) {
+    obStatus.textContent =
+      "Parâmetros alterados manualmente. Toque em 'APLICAR ESTE LOOP AO MEU TEMA' para restaurar uma proposta verificada.";
+  }
+}
+
 async function applyOuroborosProposal(profileId, expectedRenderKey) {
   if (!animDiag.report?.key || !Projects.id) {
     toast("Abra um projeto e gere as propostas Ouroboros antes de aplicar.");
@@ -694,7 +712,9 @@ async function renderOuroborosProposals(report, seq) {
   const ordered = [...report.proposals].sort((a, b) => (a.order || 0) - (b.order || 0));
   for (const prop of ordered) {
     const isRec = report.recommendedProfileId === prop.profileId;
-    const isApplied = animDiag.appliedRenderKey && animDiag.appliedRenderKey === prop.renderKey;
+    const isApplied =
+      (animDiag.appliedRenderKey && animDiag.appliedRenderKey === prop.renderKey) ||
+      (!animDiag.appliedRenderKey && animDiag.appliedProfileId === prop.profileId);
 
     const card = document.createElement("article");
     card.className = `ob-card${isRec ? " is-recommended" : ""}${isApplied ? " is-applied" : ""}`;
@@ -702,6 +722,12 @@ async function renderOuroborosProposals(report, seq) {
     card.dataset.renderKey = prop.renderKey;
 
     const m = prop.metrics || {};
+    const advs = Array.isArray(prop.advantages) && prop.advantages.length
+      ? prop.advantages.join(" · ")
+      : prop.priority;
+    const lims = Array.isArray(prop.limitations) && prop.limitations.length
+      ? prop.limitations.join(" · ")
+      : "Limitado ao teto de 6 MiB e compressão DXT1a do PS4";
     const diffUrl = Projects.mediaUrl(
       `/api/ouroboros/artifact/${encodeURIComponent(report.key)}/${encodeURIComponent(prop.profileId)}/diff.png`
     );
@@ -738,6 +764,10 @@ async function renderOuroborosProposals(report, seq) {
         <div class="ob-metric"><dt>SSIM / Costura</dt><dd>${Number(m.seamSsim ?? 0).toFixed(3)} · ratio ${Number(m.seamRatio ?? 0).toFixed(2)}</dd></div>
         <div class="ob-metric"><dt>Direção / DXT1a</dt><dd>cos ${Number(m.seamDirectionCosine ?? 0).toFixed(2)} · ${m.ddsMeanPsnr != null ? `${m.ddsMeanPsnr} dB` : "ok"}</dd></div>
       </dl>
+      <div class="ob-tradeoffs">
+        <p class="ob-trade-row is-adv"><strong>Vantagens:</strong> ${advs}</p>
+        <p class="ob-trade-row is-lim"><strong>Limitações:</strong> ${lims}</p>
+      </div>
       <p class="ob-verdict-note">${prop.verdictSummary || ""}</p>
       <button type="button" class="btn btn-primary btn-block ob-btn-apply" data-profile="${prop.profileId}" data-render-key="${prop.renderKey}">
         ${isApplied ? "APLICADO AO TEMA (RE-APLICAR)" : "APLICAR ESTE LOOP AO MEU TEMA"}
@@ -876,11 +906,15 @@ async function cancelAnimDiagnostic({ quiet = false } = {}) {
   animDiag.taskId = null;
   setAnimDiagRunning(false);
   if (activeTask && Projects.id) {
-    api(`/api/ouroboros/jobs/${encodeURIComponent(activeTask)}/cancel`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
-    }).catch(() => { /* best effort cancel */ });
+    try {
+      await api(`/api/ouroboros/jobs/${encodeURIComponent(activeTask)}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+    } catch {
+      /* best effort cancel */
+    }
   }
   if (!quiet) {
     if ($("ouroboros-status")) {
@@ -892,6 +926,57 @@ async function cancelAnimDiagnostic({ quiet = false } = {}) {
         "Diagnóstico cancelado. O vídeo importado permanece disponível para edição e exportação.";
     }
   }
+}
+
+function _buildSelectedRegionalRecipe() {
+  const preset = $("ouroboros-region-preset")?.value || "none";
+  const presets = {
+    center_face: {
+      id: "preset_center_face",
+      name: "Proteger centro / rosto",
+      bounds: [0.26, 0.16, 0.74, 0.84],
+    },
+    top_sky: {
+      id: "preset_top_sky",
+      name: "Proteger topo / lua",
+      bounds: [0.0, 0.0, 1.0, 0.42],
+    },
+    bottom_hud: {
+      id: "preset_bottom_hud",
+      name: "Proteger base / HUD",
+      bounds: [0.0, 0.72, 1.0, 1.0],
+    },
+    left_side: {
+      id: "preset_left_side",
+      name: "Proteger lateral esquerda",
+      bounds: [0.0, 0.0, 0.35, 1.0],
+    },
+    right_side: {
+      id: "preset_right_side",
+      name: "Proteger lateral direita",
+      bounds: [0.65, 0.0, 1.0, 1.0],
+    },
+  };
+  const cfg = presets[preset];
+  if (!cfg) return null;
+  return {
+    id: cfg.id,
+    recipe: {
+      version: 1,
+      name: cfg.name,
+      regions: [
+        {
+          id: cfg.id,
+          name: cfg.name,
+          strategy: "protect",
+          shapes: [{ kind: "rect", mode: "add", bounds: cfg.bounds }],
+          featherPx: 8,
+          speedScale: 1.0,
+          enabled: true,
+        },
+      ],
+    },
+  };
 }
 
 function resetAnimDiagnostic() {
@@ -917,6 +1002,103 @@ function resetAnimDiagnostic() {
   if ($("anim-diag-progress")) $("anim-diag-progress").value = 0;
 }
 
+async function _hydrateOuroborosReport(key, seq) {
+  const obStatus = $("ouroboros-status");
+  const statusEl = $("anim-diag-status");
+  const report = await api(`/api/ouroboros/result/${encodeURIComponent(key)}`);
+  if (seq !== animDiag.runSeq) return;
+  await renderOuroborosProposals(report, seq);
+  if (obStatus) {
+    const rec = (report.proposals || []).find((p) => p.profileId === report.recommendedProfileId);
+    obStatus.textContent = rec
+      ? `3 propostas prontas em ${(Number(report.elapsedMs || 0) / 1000).toFixed(1)}s · Recomendada: ${rec.shortTitle} (${rec.resolutionLabel}, ${rec.verdict}). Compare abaixo e toque em APLICAR.`
+      : "3 propostas Ouroboros prontas para comparação e aplicação.";
+  }
+  if (report?.mediaDiagnostic) {
+    renderAnimDiagnostic(report.mediaDiagnostic);
+    if (statusEl) {
+      statusEl.textContent =
+        `Diagnóstico concluído (${report.mediaDiagnostic.aptidao}) · motor unificado OUROBOROS.`;
+    }
+  } else if (statusEl) {
+    statusEl.textContent = "Diagnóstico concluído sem relatório detalhado.";
+  }
+}
+
+function _attachOuroborosPoll(taskId, seq) {
+  const obStatus = $("ouroboros-status");
+  const obProg = $("ouroboros-progress");
+  const statusEl = $("anim-diag-status");
+  const progEl = $("anim-diag-progress");
+  animDiag.taskId = taskId;
+  setAnimDiagRunning(true);
+
+  const poll = async () => {
+    if (seq !== animDiag.runSeq || !animDiag.taskId) return;
+    try {
+      const st = await api(`/api/ouroboros/jobs/${encodeURIComponent(animDiag.taskId)}`);
+      if (seq !== animDiag.runSeq) return;
+      if (st.state === "working") {
+        const msg = st.stage || "Otimizando as 3 propostas Ouroboros…";
+        const pct = Number(st.percent || 10);
+        if (obStatus) obStatus.textContent = msg;
+        if (obProg) obProg.value = pct;
+        if (statusEl) statusEl.textContent = msg;
+        if (progEl) progEl.value = pct;
+        animDiag.pollTimer = setTimeout(poll, 450);
+        return;
+      }
+      animDiag.taskId = null;
+      setAnimDiagRunning(false);
+      if (st.state === "cancelled") {
+        if (obStatus) obStatus.textContent = "Geração Ouroboros cancelada.";
+        if (statusEl) {
+          statusEl.textContent =
+            "Diagnóstico cancelado. O vídeo importado permanece disponível para edição e exportação.";
+        }
+        return;
+      }
+      if (st.state !== "ready" || !st.key) {
+        const failMsg = st.stage || "falha na análise";
+        if (obStatus) obStatus.textContent = `Ouroboros indisponível: ${failMsg}.`;
+        if (statusEl) statusEl.textContent = `Diagnóstico indisponível: ${failMsg}.`;
+        return;
+      }
+      await _hydrateOuroborosReport(st.key, seq);
+    } catch (err) {
+      if (seq !== animDiag.runSeq) return;
+      animDiag.taskId = null;
+      setAnimDiagRunning(false);
+      if (obStatus) obStatus.textContent = `Erro ao carregar propostas Ouroboros (${err.message}).`;
+      if (statusEl) {
+        statusEl.textContent = `Não foi possível concluir o diagnóstico (${err.message}). O vídeo continua pronto para uso.`;
+      }
+    }
+  };
+
+  poll();
+}
+
+async function syncOuroborosCurrentState(jobId) {
+  if (!Projects.id || !jobId) return;
+  const seq = ++animDiag.runSeq;
+  try {
+    const cur = await api("/api/ouroboros/current");
+    if (seq !== animDiag.runSeq || !cur) return;
+    if (cur.appliedRenderKey) animDiag.appliedRenderKey = cur.appliedRenderKey;
+    if (cur.appliedProfileId) animDiag.appliedProfileId = cur.appliedProfileId;
+    if (cur.activeTask?.id && cur.activeTask.state === "working") {
+      _attachOuroborosPoll(cur.activeTask.id, seq);
+      return;
+    }
+    if (cur.cachedResultKey) {
+      await _hydrateOuroborosReport(cur.cachedResultKey, seq);
+    }
+  } catch {
+    /* keep manual fallback ready */
+  }
+}
+
 function prepareAnimDiagnosticPanel(jobId, { autoRun = false } = {}) {
   const obSec = $("ouroboros-panel");
   const sec = $("anim-diagnostic");
@@ -939,7 +1121,7 @@ function prepareAnimDiagnosticPanel(jobId, { autoRun = false } = {}) {
     return;
   }
   if (autoRun) {
-    startAnimDiagnostic(jobId);
+    startAnimDiagnostic(jobId, { forceNew: false });
   } else {
     setAnimDiagRunning(false);
     if ($("ouroboros-status")) {
@@ -950,10 +1132,11 @@ function prepareAnimDiagnosticPanel(jobId, { autoRun = false } = {}) {
       $("anim-diag-status").textContent =
         "Vídeo carregado no projeto. Toque em 'Reanalisar vídeo' para consultar ou gerar o diagnóstico completo.";
     }
+    syncOuroborosCurrentState(jobId);
   }
 }
 
-async function startAnimDiagnostic(jobId = anim.jobId) {
+async function startAnimDiagnostic(jobId = anim.jobId, { forceNew = true } = {}) {
   if (!jobId || !Projects.id) {
     prepareAnimDiagnosticPanel(jobId, { autoRun: false });
     return;
@@ -981,78 +1164,30 @@ async function startAnimDiagnostic(jobId = anim.jobId) {
   setAnimDiagRunning(true);
 
   const stabilizeCamera = Boolean($("ouroboros-stabilize")?.checked);
+  const regCfg = _buildSelectedRegionalRecipe();
 
   try {
+    if (regCfg && Projects.id) {
+      await api(`/api/ouroboros/recipes/${encodeURIComponent(regCfg.id)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(regCfg.recipe),
+      }).catch(() => {});
+    }
+    const payload = {
+      kind: "animated",
+      id: jobId,
+      stabilizeCamera,
+      forceNew: Boolean(forceNew),
+    };
+    if (regCfg) payload.recipe = regCfg.recipe;
     const ticket = await api("/api/ouroboros/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kind: "animated", id: jobId, stabilizeCamera }),
+      body: JSON.stringify(payload),
     });
     if (seq !== animDiag.runSeq) return;
-    animDiag.taskId = ticket.id;
-
-    const poll = async () => {
-      if (seq !== animDiag.runSeq || !animDiag.taskId) return;
-      try {
-        const st = await api(`/api/ouroboros/jobs/${encodeURIComponent(animDiag.taskId)}`);
-        if (seq !== animDiag.runSeq) return;
-        if (st.state === "working") {
-          const msg = st.stage || "Otimizando as 3 propostas Ouroboros…";
-          const pct = Number(st.percent || 10);
-          if (obStatus) obStatus.textContent = msg;
-          if (obProg) obProg.value = pct;
-          if (statusEl) statusEl.textContent = msg;
-          if (progEl) progEl.value = pct;
-          animDiag.pollTimer = setTimeout(poll, 450);
-          return;
-        }
-        animDiag.taskId = null;
-        setAnimDiagRunning(false);
-        if (st.state === "cancelled") {
-          if (obStatus) obStatus.textContent = "Geração Ouroboros cancelada.";
-          if (statusEl) {
-            statusEl.textContent =
-              "Diagnóstico cancelado. O vídeo importado permanece disponível para edição e exportação.";
-          }
-          return;
-        }
-        if (st.state !== "ready" || !st.key) {
-          const failMsg = st.stage || "falha na análise";
-          if (obStatus) obStatus.textContent = `Ouroboros indisponível: ${failMsg}.`;
-          if (statusEl) statusEl.textContent = `Diagnóstico indisponível: ${failMsg}.`;
-          return;
-        }
-        const report = await api(`/api/ouroboros/result/${encodeURIComponent(st.key)}`);
-        if (seq !== animDiag.runSeq) return;
-
-        await renderOuroborosProposals(report, seq);
-        if (obStatus) {
-          const rec = (report.proposals || []).find((p) => p.profileId === report.recommendedProfileId);
-          obStatus.textContent = rec
-            ? `3 propostas prontas em ${(Number(report.elapsedMs || 0) / 1000).toFixed(1)}s · Recomendada: ${rec.shortTitle} (${rec.resolutionLabel}, ${rec.verdict}). Compare abaixo e toque em APLICAR.`
-            : "3 propostas Ouroboros prontas para comparação e aplicação.";
-        }
-        if (report?.mediaDiagnostic) {
-          renderAnimDiagnostic(report.mediaDiagnostic);
-          if (statusEl) {
-            statusEl.textContent =
-              `Diagnóstico concluído (${report.mediaDiagnostic.aptidao}) · motor unificado OUROBOROS.`;
-          }
-        } else if (statusEl) {
-          statusEl.textContent = "Diagnóstico concluído sem relatório detalhado.";
-        }
-      } catch (err) {
-        if (seq !== animDiag.runSeq) return;
-        animDiag.taskId = null;
-        setAnimDiagRunning(false);
-        if (obStatus) obStatus.textContent = `Erro ao carregar propostas Ouroboros (${err.message}).`;
-        if (statusEl) {
-          statusEl.textContent = `Não foi possível concluir o diagnóstico (${err.message}). O vídeo continua pronto para uso.`;
-        }
-      }
-    };
-
-    poll();
+    _attachOuroborosPoll(ticket.id, seq);
   } catch (err) {
     if (seq !== animDiag.runSeq) return;
     animDiag.taskId = null;
@@ -3127,6 +3262,7 @@ async function boot() {
       t("bg.size.opt", { label: x.label, max: x.max_frames })}</option>`)
     .join("");
   sizeSel.addEventListener("change", () => {
+    _clearAppliedProposalBadge();
     syncSizeUi();
     if (anim.jobId) animatedReframe();
     else guardarSesion();
@@ -3185,12 +3321,14 @@ wireDropzone("anim-drop", "anim-file", animatedUpload);
 // While dragging only the numbers update; the frames are requested on release,
 // so a slider pixel does not trigger an extraction.
 $("anim-frames").addEventListener("input", (e) => {
+  _clearAppliedProposalBadge();
   anim.frameCount = Number(e.target.value);
   pintarFrames();
   updateBudget();
   updateTiming();
 });
 $("anim-frames").addEventListener("change", () => {
+  _clearAppliedProposalBadge();
   if (anim.jobId) animatedReframe();
   else guardarSesion();
 });
@@ -3219,6 +3357,7 @@ if ($("forge-bgm-apply")) {
 
 // wait does not change the frames, only the timing and the xml: applied live.
 $("anim-wait").addEventListener("input", (e) => {
+  _clearAppliedProposalBadge();
   anim.wait = Number(e.target.value);
   $("anim-wait-out").textContent = anim.wait.toFixed(2);
   updateTiming();

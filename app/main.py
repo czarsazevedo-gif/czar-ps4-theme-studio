@@ -82,9 +82,23 @@ app.include_router(forge_pkg.router)
 #: theme.check_* remains as a last net, but should never fire now.
 
 
+def _sanitize_media_error(raw_msg: str) -> str:
+    import re as _re
+
+    msg = str(raw_msg or "").strip()
+    if not msg:
+        return "Não foi possível processar o arquivo de mídia enviado."
+    # Strip internal filesystem paths (/home/..., /tmp/..., /studio-projects-v1/...) and raw memory addresses
+    if any(tok in msg for tok in ("/studio-projects-v1/", "/home/", "/tmp/", "0x7f", "Invalid data found when processing input", "moov atom not found")):
+        return "Arquivo de mídia inválido, corrompido ou incompatível com o decodificador FFmpeg."
+    cleaned = _re.sub(r"/(?:home|tmp|var|opt|usr)[^\s'\"]*", "[arquivo]", msg)
+    cleaned = _re.sub(r"0x[0-9a-fA-F]{6,16}", "", cleaned)
+    return cleaned.strip() or "Não foi possível processar o arquivo de mídia enviado."
+
+
 @app.exception_handler(MediaError)
 async def _media_error_handler(_request, exc: MediaError):
-    return JSONResponse(status_code=422, content={"detail": str(exc)})
+    return JSONResponse(status_code=422, content={"detail": _sanitize_media_error(str(exc))})
 
 
 async def _read_upload(file: UploadFile, allowed: set[str]) -> bytes:

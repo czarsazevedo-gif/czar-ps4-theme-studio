@@ -486,3 +486,113 @@ def test_checkpoint_e_lean_http_payload_vs_full_opt_in(tmp_path, monkeypatch):
     assert "profileReports" not in r_slim.json()
     assert "profileReports" in r_full.json()
     assert len(r_slim.content) < len(r_full.content) * 0.2
+
+
+# ==================== CHECKPOINT F: PILAR VII UI & PILAR VIII 7 ROBUSTNESS FIXES ====================
+
+
+def test_pilar_vii_proposal_titles_and_pilar_viii_fixes_001_003_005_009_010_011(tmp_path, monkeypatch):
+    """Verify Pilar VII proposal titles and Pilar VIII fixes CZAR-ABS-AUD-001, 002, 003, 005, 009, 010, 011."""
+    import json
+    from pathlib import Path
+    import pytest
+    from PIL import Image
+    from fastapi.testclient import TestClient
+    from app import dxt1, main, ouroboros, projects
+    from app.ouroboros_engine import OUROBOROS_VERSION, PROPOSAL_PROFILES
+    from app.ouroboros_engine.applier import apply_loop_to_project, assemble_canonical_raf, sha256_bytes
+
+    # Pilar VII exact proposal titles
+    titles = [p["title"] for p in PROPOSAL_PROFILES]
+    assert titles == [
+        "PROPOSTA 1 — FIDELIDADE MÁXIMA — 720p",
+        "PROPOSTA 2 — MOVIMENTO NATURAL — 540p",
+        "PROPOSTA 3 — CONTINUIDADE TEMPORAL — 360p",
+    ]
+
+    # CZAR-ABS-AUD-001: tampered 00.webp or background.raf.zip must be rejected before mutating project
+    res_folder = tmp_path / "render_res"
+    (res_folder / "deluxe_dds").mkdir(parents=True)
+    (res_folder / "deluxe_frames").mkdir(parents=True)
+    dds_hashes = {}
+    file_hashes = {}
+    blobs = []
+    for i in range(4):
+        rgb = np.full((360, 640, 3), 40 + i * 20, dtype=np.uint8)
+        rgba = np.concatenate([rgb, np.full((360, 640, 1), 255, dtype=np.uint8)], axis=-1)
+        blob = dxt1.encode_dds(rgba)
+        blobs.append(blob)
+        dname = f"{i:02d}.dds"
+        wname = f"{i:02d}.webp"
+        (res_folder / "deluxe_dds" / dname).write_bytes(blob)
+        dds_hashes[dname] = sha256_bytes(blob)
+        Image.fromarray(rgb).save(res_folder / "deluxe_frames" / f"{i:02d}.png", "PNG")
+        Image.fromarray(rgb).save(res_folder / wname, "WEBP", lossless=True)
+        file_hashes[wname] = sha256_bytes((res_folder / wname).read_bytes())
+
+    raf_zip = res_folder / "background.raf.zip"
+    assemble_canonical_raf(blobs, 0.1, raf_zip)
+    file_hashes["background.raf.zip"] = sha256_bytes(raf_zip.read_bytes())
+
+    rep = {
+        "frames": 4,
+        "size": [640, 360],
+        "wait": 0.1,
+        "ddsHashes": dds_hashes,
+        "files": file_hashes,
+        "renderKey": "b" * 64,
+    }
+    monkeypatch.setattr(projects, "ROOT", tmp_path / "projects")
+    client = TestClient(main.app)
+    assert client.get("/api/projects").status_code == 200
+    pid = client.post("/api/projects", json={"name": "Reload & Cancel"}).json()["id"]
+    pdir = next((tmp_path / "projects").rglob(pid))
+
+    # Tamper 00.webp -> must raise ValueError!
+    orig_webp = (res_folder / "00.webp").read_bytes()
+    (res_folder / "00.webp").write_bytes(orig_webp + b"corrupt")
+    with pytest.raises(ValueError, match="00.webp"):
+        apply_loop_to_project(pdir, res_folder, rep, acquire_lock=False)
+    (res_folder / "00.webp").write_bytes(orig_webp)
+
+    # Tamper background.raf.zip -> must raise ValueError!
+    orig_raf = raf_zip.read_bytes()
+    raf_zip.write_bytes(orig_raf + b"corrupt")
+    with pytest.raises(ValueError, match="background.raf.zip"):
+        apply_loop_to_project(pdir, res_folder, rep, acquire_lock=False)
+    raf_zip.write_bytes(orig_raf)
+
+    # Clean apply succeeds
+    ap_ok = apply_loop_to_project(pdir, res_folder, rep, acquire_lock=False)
+    assert ap_ok["applied"] is True
+
+    # CZAR-ABS-AUD-010: _sanitize_media_error strips internal paths and memory pointers
+    s_err = main._sanitize_media_error(
+        "/home/antigravity/.gemini/studio-projects-v1/abc/media/source.mp4: Invalid data found when processing input at 0x7ff01234abcd"
+    )
+    assert "/studio-projects-v1/" not in s_err
+    assert "/home/" not in s_err
+    assert "0x7ff" not in s_err
+
+    # CZAR-ABS-AUD-003 & 009: /api/ouroboros/current returns cachedResultKey & appliedRenderKey
+    ckey = "c" * 64
+    cdir = pdir / "ouroboros-v1" / ckey
+    cdir.mkdir(parents=True)
+    (cdir / "report.json").write_text(
+        json.dumps({"type": "ouroboros_proposals", "version": OUROBOROS_VERSION, "key": ckey, "proposals": []}),
+        encoding="utf-8",
+    )
+    cur_r = client.get(f"/api/ouroboros/current?project={pid}")
+    assert cur_r.status_code == 200
+    assert cur_r.json()["cachedResultKey"] == ckey
+    assert cur_r.json()["appliedRenderKey"] == "b" * 64
+
+    # CZAR-ABS-AUD-002, 005, 011: UI static checks
+    repo = Path(__file__).resolve().parents[1]
+    css = (repo / "app" / "static" / "style.css").read_text(encoding="utf-8")
+    html = (repo / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    js = (repo / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "min-height: 44px" in css
+    assert "ouroboros-region-preset" in html
+    assert "_clearAppliedProposalBadge" in js
+    assert "syncOuroborosCurrentState" in js

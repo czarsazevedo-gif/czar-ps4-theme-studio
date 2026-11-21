@@ -12,8 +12,8 @@ PROPOSAL_PROFILES = (
     {
         "id": "quality",
         "order": 1,
-        "title": "Proposta 1 — Máxima Qualidade Visual",
-        "shortTitle": "Máxima Qualidade",
+        "title": "PROPOSTA 1 — FIDELIDADE MÁXIMA — 720p",
+        "shortTitle": "Fidelidade Máxima",
         "size": (1280, 720),
         "resolutionIdx": 2,
         "priority": "Definição, nitidez, preservação de detalhes e fidelidade visual",
@@ -21,8 +21,8 @@ PROPOSAL_PROFILES = (
     {
         "id": "balance",
         "order": 2,
-        "title": "Proposta 2 — Melhor Equilíbrio",
-        "shortTitle": "Melhor Equilíbrio",
+        "title": "PROPOSTA 2 — MOVIMENTO NATURAL — 540p",
+        "shortTitle": "Movimento Natural",
         "size": (960, 540),
         "resolutionIdx": 1,
         "priority": "Continuidade, definição, duração, cadência e naturalidade",
@@ -30,8 +30,8 @@ PROPOSAL_PROFILES = (
     {
         "id": "flexibility",
         "order": 3,
-        "title": "Proposta 3 — Maior Flexibilidade Temporal",
-        "shortTitle": "Flexibilidade Temporal",
+        "title": "PROPOSTA 3 — CONTINUIDADE TEMPORAL — 360p",
+        "shortTitle": "Continuidade Temporal",
         "size": (640, 360),
         "resolutionIdx": 0,
         "priority": "Quantidade útil de quadros, regularidade temporal e movimento contínuo",
