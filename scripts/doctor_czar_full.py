@@ -532,6 +532,32 @@ def main() -> int:
 
     magick_bin = media.find_magick()
     tabler_ok = (REPO / "tools" / "icons" / "tabler" / "icons" / "outline" / "settings.svg").is_file()
+    bc1_lib_path = REPO / "tools" / "lib" / "libczar_bc1.so"
+    bc1_lib_ok = False
+    if bc1_lib_path.is_file():
+        try:
+            import ctypes
+            _lib = ctypes.CDLL(str(bc1_lib_path))
+            bc1_lib_ok = hasattr(_lib, "encode_frame_bc1_ex")
+        except Exception:
+            bc1_lib_ok = False
+    cmp_cli = REPO / "tools" / "bin" / "compressonator" / "compressonatorcli-4.5.52-Linux" / "compressonatorcli"
+    cmp_ok = cmp_cli.is_file() and _run(["bash", str(cmp_cli), "-version"], timeout=10.0).returncode == 0
+    vmaf_cli = REPO / "tools" / "bin" / "vmaf"
+    vmaf_cli_ok = vmaf_cli.is_file() and _run([str(vmaf_cli), "--version"], timeout=10.0).returncode == 0
+    bn_asset = REPO / "app" / "ouroboros_engine" / "assets" / "blue_noise_64.png"
+    bn_ok = bn_asset.is_file()
+    prof_extras = []
+    for mod_name in ("pybind11", "numba", "memray"):
+        try:
+            __import__(mod_name)
+            prof_extras.append(mod_name)
+        except Exception:
+            pass
+    if shutil.which("py-spy") or (Path(sys.executable).parent / "py-spy").is_file():
+        prof_extras.append("py-spy")
+    has_gpu = shutil.which("nvidia-smi") is not None
+
     optional = [
         {
             "name": "IMAGEMAGICK",
@@ -546,10 +572,42 @@ def main() -> int:
             "path": str(REPO / "tools" / "icons" / "tabler") if tabler_ok else None,
         },
         {
-            "name": "LIBVMAF",
-            "status": "PRONTO" if has_vmaf else "AUSENTE (OPCIONAL)",
-            "ok": has_vmaf,
-            "detail": "Presente no FFmpeg" if has_vmaf else "Ausente no build Debian padrão; métricas SSIM/MS-SSIM/fluxo ativas",
+            "name": "BC1 ADVANCED (RGBCX + ICBC)",
+            "status": "PRONTO" if bc1_lib_ok else "AUSENTE (OPCIONAL · FALLBACK CANÔNICO ATIVO)",
+            "ok": bc1_lib_ok,
+            "path": str(bc1_lib_path) if bc1_lib_ok else None,
+            "detail": "libczar_bc1.so (RGBCX + ICBC + Modos Temporais A/B)" if bc1_lib_ok else "Fallback automático para app/dxt1.py",
+        },
+        {
+            "name": "AMD COMPRESSONATOR CLI",
+            "status": "PRONTO" if cmp_ok else "AUSENTE (OPCIONAL)",
+            "ok": cmp_ok,
+            "path": str(cmp_cli) if cmp_ok else None,
+        },
+        {
+            "name": "BLUE-NOISE CC0",
+            "status": "PRONTO" if bn_ok else "AUSENTE (OPCIONAL)",
+            "ok": bn_ok,
+            "path": str(bn_asset) if bn_ok else None,
+        },
+        {
+            "name": "VMAF",
+            "status": "PRONTO" if (has_vmaf or vmaf_cli_ok) else "AUSENTE (OPCIONAL)",
+            "ok": bool(has_vmaf or vmaf_cli_ok),
+            "path": str(vmaf_cli) if vmaf_cli_ok else None,
+            "detail": "VMAF CLI v3.0.0 funcional" if vmaf_cli_ok else ("Presente no FFmpeg" if has_vmaf else "SSIM/MS-SSIM/CIELAB ativos"),
+        },
+        {
+            "name": "PROFILING & JIT (PYBIND11/NUMBA/PY-SPY/MEMRAY)",
+            "status": "PRONTO" if len(prof_extras) == 4 else f"PARCIAL ({', '.join(prof_extras)})",
+            "ok": len(prof_extras) == 4,
+            "detail": ", ".join(prof_extras) if prof_extras else "ausentes",
+        },
+        {
+            "name": "GPU NEURAL MODELS (SEA-RAFT/SAM2/RIFE)",
+            "status": "GPU DISPONÍVEL" if has_gpu else "CPU-ONLY (NÃO EXECUTADO EM GPU · DIS+FARNEBACK CPU ATIVOS)",
+            "ok": has_gpu,
+            "detail": "Processamento 100% CPU ativo com OpenCV DIS + Farnebäck",
         },
     ]
 

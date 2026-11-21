@@ -36,6 +36,26 @@ HYPERFINE_X86_64_SHA256="ae2beda2ac99c098427e4f755244552daf20e514422889cca6d4442
 TABLER_REPO="https://github.com/tabler/tabler-icons.git"
 TABLER_COMMIT="0bd42617ab4c3eae2774a548b9d429046c6b197e"
 
+# Perceptual Supremacy (Pilar IV) pinned commits & verified SHA-256 checksums
+BC7ENC_REPO="https://github.com/richgel999/bc7enc.git"
+BC7ENC_COMMIT="f66c2e489b07138f2673a2fb3d27c1aa1d565c48"
+
+ICBC_REPO="https://github.com/castano/icbc.git"
+ICBC_COMMIT="f06e053377feaaa1fe6d433459f625622f8081d9"
+
+BLUENOISE_REPO="https://github.com/Calinou/free-blue-noise-textures.git"
+BLUENOISE_COMMIT="a64e300dcd96b5f8c42494c5e452c1eb409b0efb"
+
+COMPRESSONATOR_VERSION="V4.5.52"
+COMPRESSONATOR_URL="https://github.com/GPUOpen-Tools/compressonator/releases/download/${COMPRESSONATOR_VERSION}/compressonatorcli-4.5.52-Linux.tar.gz"
+COMPRESSONATOR_SHA256="70c9cdb27a19875df03766f349864951a749a44c0f5c001c33903944465f6b97"
+
+VMAF_VERSION="v3.0.0"
+VMAF_URL="https://github.com/Netflix/vmaf/releases/download/${VMAF_VERSION}/vmaf"
+VMAF_SHA256="cf36d5c2abf61d3492aaff585a2af74c9782dd06b6e791b4b979ebf1bd39e329"
+
+LIB_DIR="${TOOLS_DIR}/lib"
+
 MODE="install"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -389,6 +409,87 @@ EOF
     echo "[OK] Tabler Icons preparados em ${ICONS_DIR}."
 }
 
+ensure_czar_bc1() {
+    mkdir -p "${LIB_DIR}"
+    local target="${LIB_DIR}/libczar_bc1.so"
+    if [[ -f "${target}" && "${target}" -nt "${ROOT_DIR}/scripts/src/czar_bc1.cpp" ]]; then
+        echo "[OK] libczar_bc1.so (RGBCX + ICBC) já compilada em ${target}."
+        return 0
+    fi
+    [[ "${MODE}" == "check" ]] && { echo "[AVISO] libczar_bc1.so ainda não compilada em ${target}."; return 0; }
+
+    if [[ ! -f "${SRC_DIR}/bc7enc/rgbcx.h" ]]; then
+        rm -rf "${SRC_DIR}/bc7enc"
+        git clone --depth 1 "${BC7ENC_REPO}" "${SRC_DIR}/bc7enc"
+        git -C "${SRC_DIR}/bc7enc" fetch --depth 1 origin "${BC7ENC_COMMIT}" >/dev/null 2>&1 || true
+        git -C "${SRC_DIR}/bc7enc" checkout --force "${BC7ENC_COMMIT}" >/dev/null 2>&1 || true
+    fi
+    if [[ ! -f "${SRC_DIR}/icbc/icbc.h" ]]; then
+        rm -rf "${SRC_DIR}/icbc"
+        git clone --depth 1 "${ICBC_REPO}" "${SRC_DIR}/icbc"
+        git -C "${SRC_DIR}/icbc" fetch --depth 1 origin "${ICBC_COMMIT}" >/dev/null 2>&1 || true
+        git -C "${SRC_DIR}/icbc" checkout --force "${ICBC_COMMIT}" >/dev/null 2>&1 || true
+    fi
+    echo "[INFO] Compilando libczar_bc1.so (RGBCX + ICBC, -O3 -msse4.1)..."
+    g++ -O3 -msse4.1 -fPIC -shared \
+        -I"${SRC_DIR}/bc7enc" -I"${SRC_DIR}/icbc" \
+        "${ROOT_DIR}/scripts/src/czar_bc1.cpp" -o "${target}.tmp"
+    mv -f "${target}.tmp" "${target}"
+    echo "[OK] libczar_bc1.so compilada com sucesso em ${target}."
+}
+
+ensure_compressonator() {
+    local target="${BIN_DIR}/compressonator/compressonatorcli-4.5.52-Linux/compressonatorcli"
+    if [[ -f "${target}" ]] && bash "${target}" -version 2>/dev/null | grep -qi "4.5.52"; then
+        echo "[OK] AMD Compressonator CLI 4.5.52 já pronto em ${target}."
+        return 0
+    fi
+    [[ "${MODE}" == "check" ]] && { echo "[AVISO] Compressonator CLI 4.5.52 ausente (opcional)."; return 0; }
+    local arch; arch="$(uname -m)"
+    [[ "${arch}" != "x86_64" ]] && { echo "[AVISO] Compressonator CLI pré-compilado suporta apenas x86_64."; return 0; }
+    local tgz="${CACHE_DIR}/compressonatorcli-4.5.52-Linux.tar.gz"
+    if [[ ! -f "${tgz}" ]] || ! echo "${COMPRESSONATOR_SHA256}  ${tgz}" | sha256sum -c - >/dev/null 2>&1; then
+        curl -fsSL "${COMPRESSONATOR_URL}" -o "${tgz}.tmp"
+        echo "${COMPRESSONATOR_SHA256}  ${tgz}.tmp" | sha256sum -c -
+        mv -f "${tgz}.tmp" "${tgz}"
+    fi
+    rm -rf "${BIN_DIR}/compressonator"
+    mkdir -p "${BIN_DIR}/compressonator"
+    tar -xzf "${tgz}" -C "${BIN_DIR}/compressonator"
+    echo "[OK] AMD Compressonator CLI 4.5.52 instalado."
+}
+
+ensure_vmaf() {
+    local target="${BIN_DIR}/vmaf"
+    if [[ -x "${target}" ]] && "${target}" --version >/dev/null 2>&1; then
+        echo "[OK] Netflix VMAF CLI já pronto em ${target}."
+        return 0
+    fi
+    [[ "${MODE}" == "check" ]] && { echo "[AVISO] VMAF CLI ausente (opcional)."; return 0; }
+    local arch; arch="$(uname -m)"
+    [[ "${arch}" != "x86_64" ]] && return 0
+    curl -fsSL "${VMAF_URL}" -o "${target}.tmp"
+    echo "${VMAF_SHA256}  ${target}.tmp" | sha256sum -c -
+    chmod 755 "${target}.tmp"
+    mv -f "${target}.tmp" "${target}"
+    echo "[OK] Netflix VMAF ${VMAF_VERSION} instalado em ${target}."
+}
+
+ensure_profiling_python_extras() {
+    local py_bin; py_bin="$(resolve_venv_python)"
+    [[ -z "${py_bin}" ]] && return 0
+    if "${py_bin}" -c "import pybind11, numba, memray" >/dev/null 2>&1; then
+        echo "[OK] Extras Python de otimização/profiling (pybind11, numba, memray) já presentes."
+        return 0
+    fi
+    [[ "${MODE}" == "check" ]] && { echo "[AVISO] Extras Python (pybind11/numba/memray/py-spy) ausentes."; return 0; }
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install --python "${py_bin}" pybind11 numba py-spy memray || true
+    else
+        "${py_bin}" -m pip install -q pybind11 numba py-spy memray || true
+    fi
+}
+
 detect_system
 ensure_system_prereqs
 ensure_python_env
@@ -399,6 +500,10 @@ ensure_vgmstream
 ensure_hyperfine
 ensure_magick
 ensure_tabler_icons
+ensure_czar_bc1
+ensure_compressonator
+ensure_vmaf
+ensure_profiling_python_extras
 
 echo ""
 echo "[INFO] Executando verificação funcional integral (doctor_czar_full.sh)..."

@@ -32,6 +32,7 @@
 /tools/dotnet-home/
 /tools/cache/
 /tools/icons/
+/tools/lib/
 
 
 # --- Python ---------------------------------------------------------------
