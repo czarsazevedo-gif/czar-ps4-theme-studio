@@ -1,4 +1,14 @@
-"""Permanent regression tests for Stage 4/5 Zenitsu Gold Master bench audit fixes."""
+"""Permanent regression tests for Stage 4/5 Zenitsu Gold Master bench audit fixes.
+
+Covers:
+1. Legacy history without `verification_level` never claims `structure_validated=True`
+   or `PACOTE VALIDADO ESTRUTURALMENTE` (API history + report).
+2. Same-name PKG builds carry distinct `pkg_sha256` and `project_revision` in history & report.
+3. Deterministic order-independent PT-BR/EN/ES icon filename mapper (`app/icon_mapper.py`)
+   + `/api/slots/map-names` & `/api/slots/upload-batch` explicit 409 ambiguity rejection.
+4. Kinematic loop evaluation distinguishes closed circular orbit vs pause, jump, and ping-pong reversal.
+5. Optimized DXT1a encoder preserves opaque alpha (`min_alpha=255`), punchthrough alpha, and PSNR.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +24,7 @@ import numpy as np
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
-from app import icon_mapper, jobs, main, projects
+from app import dxt1, icon_mapper, jobs, main, projects
 from app.forge.pkg_router import _normalize_persisted_pkg_report
 from app.ouroboros_engine.metrics import evaluate_loop
 
@@ -268,4 +278,169 @@ def test_forge_pkg_history_and_report_http_legacy_and_same_name_provenance(tmp_p
     assert pr_leg["structure_validated"] is False
     assert pr_leg["legacy_unverified"] is True
 
+
+def _reference_compress_dxt1a(rgba: np.ndarray) -> bytes:
+    """Unoptimized canonical reference DXT1a implementation (pre-optimization HEAD baseline)."""
+    height, width = rgba.shape[:2]
+    pad_h = (-height) % 4
+    pad_w = (-width) % 4
+    if pad_h or pad_w:
+        rgba = np.pad(rgba, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+        height, width = rgba.shape[:2]
+    bh, bw = height // 4, width // 4
+    blocks = rgba.reshape(bh, 4, bw, 4, 4).transpose(0, 2, 1, 3, 4).reshape(-1, 16, 4)
+    n = blocks.shape[0]
+    colors = blocks[..., :3].astype(np.float32)
+    opaque = blocks[..., 3] >= dxt1.ALPHA_THRESHOLD
+    weights = opaque.astype(np.float32)
+    opaque_count = weights.sum(axis=1)
+    needs_alpha = ~opaque.all(axis=1)
+    all_clear = opaque_count == 0
+    safe_count = np.maximum(opaque_count, 1.0)[:, None]
+    mean = (colors * weights[..., None]).sum(axis=1) / safe_count
+    centered = colors - mean[:, None, :]
+
+    w = centered * weights[..., None]
+    cov = np.einsum("nij,nik->njk", w, w, optimize=True)
+    axis = w.max(axis=1) - w.min(axis=1)
+    norm = np.linalg.norm(axis, axis=1, keepdims=True)
+    axis = np.where(norm > 1e-6, axis / np.maximum(norm, 1e-9), np.array([1.0, 0.0, 0.0], np.float32))
+    for _ in range(dxt1._POWER_ITERATIONS):
+        axis = np.einsum("nij,nj->ni", cov, axis, optimize=True)
+        norm = np.linalg.norm(axis, axis=1, keepdims=True)
+        axis = np.where(norm > 1e-9, axis / np.maximum(norm, 1e-12), np.array([1.0, 0.0, 0.0], np.float32))
+    axis = axis.astype(np.float32)
+
+    proj = np.einsum("nij,nj->ni", centered, axis, optimize=True)
+    big = np.float32(np.inf)
+    t_min = np.where(opaque, proj, big).min(axis=1)
+    t_max = np.where(opaque, proj, -big).max(axis=1)
+    t_min = np.where(all_clear, 0.0, t_min)
+    t_max = np.where(all_clear, 0.0, t_max)
+
+    end_a = mean + t_max[:, None] * axis
+    end_b = mean + t_min[:, None] * axis
+    packed_a, color_a = dxt1._quantize_565(end_a)
+    packed_b, color_b = dxt1._quantize_565(end_b)
+
+    want_greater = ~needs_alpha
+    is_greater = packed_a > packed_b
+    swap = np.where(want_greater, ~is_greater, is_greater)
+    packed0 = np.where(swap, packed_b, packed_a)
+    packed1 = np.where(swap, packed_a, packed_b)
+    color0 = np.where(swap[:, None], color_b, color_a)
+    color1 = np.where(swap[:, None], color_a, color_b)
+    four_color = packed0 > packed1
+
+    palette = np.empty((n, 4, 3), dtype=np.float32)
+    palette[:, 0] = color0
+    palette[:, 1] = color1
+    palette[:, 2] = np.where(four_color[:, None], (2.0 * color0 + color1) / 3.0, (color0 + color1) / 2.0)
+    palette[:, 3] = np.where(four_color[:, None], (color0 + 2.0 * color1) / 3.0, 0.0)
+
+    diff = colors[:, :, None, :] - palette[:, None, :, :]
+    dist = np.einsum("nikc,nikc->nik", diff, diff, optimize=True)
+    dist[:, :, 3] = np.where(four_color[:, None], dist[:, :, 3], np.inf)
+    indices = np.argmin(dist, axis=2).astype(np.uint32)
+    indices = np.where(opaque, indices, np.uint32(3))
+    if all_clear.any():
+        indices[all_clear] = 3
+
+    shifts = (2 * np.arange(16, dtype=np.uint32))[None, :]
+    bits = np.bitwise_or.reduce(indices << shifts, axis=1).astype(np.uint32)
+    out = np.empty((n, 8), dtype=np.uint8)
+    out[:, 0] = packed0 & 0xFF
+    out[:, 1] = (packed0 >> 8) & 0xFF
+    out[:, 2] = packed1 & 0xFF
+    out[:, 3] = (packed1 >> 8) & 0xFF
+    out[:, 4] = bits & 0xFF
+    out[:, 5] = (bits >> 8) & 0xFF
+    out[:, 6] = (bits >> 16) & 0xFF
+    out[:, 7] = (bits >> 24) & 0xFF
+    return out.tobytes()
+
+
+def test_dxt1_optimized_encoder_byte_for_byte_parity_resolutions_alpha_and_layers():
+    """Optimized DXT1a encoder must match canonical reference byte-for-byte across 720p/540p/360p, alpha, odd dims, and compositor layers."""
+    import hashlib
+    from app import compositor
+
+    rng = np.random.default_rng(20261122)
+
+    def _frame(w: int, h: int, alpha_mode: str) -> np.ndarray:
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        r = np.clip((xx / max(w - 1, 1)) * 220 + 25 * np.sin(yy * 0.05), 0, 255)
+        g = np.clip((yy / max(h - 1, 1)) * 210 + 30 * np.cos(xx * 0.04), 0, 255)
+        b = np.clip(128 + 90 * np.sin((xx + yy) * 0.03), 0, 255)
+        noise = rng.integers(-18, 19, size=(h, w, 3), dtype=np.int16)
+        rgb = np.clip(np.stack([r, g, b], axis=-1).astype(np.int16) + noise, 0, 255).astype(np.uint8)
+        rgb[16:48, 16:48] = [120, 120, 120]  # degenerate flat grey
+        rgb[16:48, 64:96] = [0, 0, 0]
+        if alpha_mode == "opaque":
+            a = np.full((h, w, 1), 255, dtype=np.uint8)
+        elif alpha_mode == "all_clear":
+            a = np.zeros((h, w, 1), dtype=np.uint8)
+        else:
+            a = np.full((h, w, 1), 255, dtype=np.uint8)
+            a[48:80, 48:80] = 0
+            a[80:112, 80:112] = rng.choice([0, 64, 127, 128, 200, 255], size=(32, 32, 1)).astype(np.uint8)
+            a[min(h - 1, 120), min(w - 1, 120)] = 10
+        return np.concatenate([rgb, a], axis=-1)
+
+    ov_img = Image.new("RGBA", (400, 240), (0, 0, 0, 0))
+    dr = ImageDraw.Draw(ov_img)
+    dr.rounded_rectangle([10, 10, 390, 230], radius=24, fill=(255, 0, 220, 180), outline=(255, 255, 255, 255), width=6)
+    dr.ellipse([140, 40, 260, 160], fill=(30, 220, 255, 110))
+    h_ov = hashlib.sha256(b"dxt1-layer-parity").hexdigest()
+
+    for w, h in [(1280, 720), (960, 540), (640, 360)]:
+        op = _frame(w, h, "opaque")
+        tr = _frame(w, h, "transparent_mix")
+        layer_spec = compositor.Layer(
+            id="l1", name="overlay", asset=h_ov,
+            x=960.0, y=540.0, width=640.0, height=360.0, angle=14.0, opacity=0.85,
+        )
+        ov_canvas = compositor.layer_pixels(ov_img, layer_spec, compositor.TARGETS["animated"], (w, h))
+        composed_op = next(compositor.compose_frames([op], ov_canvas))
+        composed_tr = next(compositor.compose_frames([tr], ov_canvas))
+
+        for label, sample in [
+            (f"opaque_{w}x{h}", op),
+            (f"transparent_{w}x{h}", tr),
+            (f"layers_opaque_{w}x{h}", composed_op),
+            (f"layers_trans_{w}x{h}", composed_tr),
+            (f"layers_only_{w}x{h}", np.asarray(ov_canvas, dtype=np.uint8)),
+        ]:
+            got = dxt1.encode_dds(sample)
+            ref = dxt1.dds_header(w, h, len(got) - 128) + _reference_compress_dxt1a(sample)
+            assert got == ref, f"Byte-for-byte mismatch on {label}"
+
+    # Odd non-multiple-of-4 dimensions and all-clear alpha frame
+    for label, sample in [
+        ("odd_129x127_alpha", _frame(129, 127, "transparent_mix")),
+        ("all_clear_64x64", _frame(64, 64, "all_clear")),
+    ]:
+        h_s, w_s = sample.shape[:2]
+        got = dxt1.encode_dds(sample)
+        ref = dxt1.dds_header(w_s, h_s, len(got) - 128) + _reference_compress_dxt1a(sample)
+        assert got == ref, f"Byte-for-byte mismatch on {label}"
+
+    # Verify opaque alpha, punchthrough alpha, and smooth-gradient PSNR sanity on decoded DDS
+    x = np.linspace(0, 255, 160, dtype=np.uint8)[None, :]
+    y = np.linspace(0, 255, 96, dtype=np.uint8)[:, None]
+    grad = np.empty((96, 160, 4), dtype=np.uint8)
+    grad[..., 0] = x
+    grad[..., 1] = y
+    grad[..., 2] = ((x.astype(np.uint16) + y.astype(np.uint16)) // 2).astype(np.uint8)
+    grad[..., 3] = 255
+    dec = dxt1.decode_dds(dxt1.encode_dds(grad))
+    assert int(dec[..., 3].min()) == 255
+    mse = float(np.mean((grad[..., :3].astype(np.float32) - dec[..., :3].astype(np.float32)) ** 2))
+    assert 10.0 * math.log10((255.0 ** 2) / max(mse, 1e-9)) > 36.0
+
+    grad_a = grad.copy()
+    grad_a[8:16, 8:16, 3] = 0
+    dec_a = dxt1.decode_dds(dxt1.encode_dds(grad_a))
+    assert int(dec_a[8:16, 8:16, 3].max()) == 0
+    assert int(dec_a[0:8, 0:8, 3].min()) == 255
 

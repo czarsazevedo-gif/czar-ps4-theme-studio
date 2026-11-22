@@ -52,28 +52,29 @@ def _quantize_565(colors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return packed.astype(np.uint32), dequant
 
 
-def _principal_axis(centered: np.ndarray, weights: np.ndarray) -> np.ndarray:
+def _principal_axis(centered: np.ndarray, weights: np.ndarray | None) -> np.ndarray:
     """Axis of greatest variance per block, via power iteration.
 
-    `centered` es (N, 16, 3) ya restada la media; `weights` (N, 16) pone en
-    cero los pixeles transparentes para que no arrastren los extremos.
+    `centered` es (N, 16, 3) ya restada la media; `weights` (N, 16) o None (cuando
+    todo o quadro é opaco) pone en cero los pixeles transparentes.
     """
-    w = centered * weights[..., None]
-    cov = np.einsum("nij,nik->njk", w, w, optimize=True)  # (N, 3, 3)
+    w = centered if weights is None else (centered * weights[..., None])
+    cov = np.matmul(w.transpose(0, 2, 1), w)  # (N, 3, 3)
 
     # Starting from the bounding box diagonal converges in a few rounds and
     # avoids the pathological case of an initial vector orthogonal to the axis.
     axis = w.max(axis=1) - w.min(axis=1)
-    norm = np.linalg.norm(axis, axis=1, keepdims=True)
-    axis = np.where(norm > 1e-6, axis / np.maximum(norm, 1e-9), np.array([1.0, 0.0, 0.0], np.float32))
+    norm = np.sqrt(np.sum(axis * axis, axis=1, keepdims=True))
+    fallback = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    axis = np.where(norm > 1e-6, axis / np.maximum(norm, np.float32(1e-9)), fallback)
 
     for _ in range(_POWER_ITERATIONS):
-        axis = np.einsum("nij,nj->ni", cov, axis, optimize=True)
-        norm = np.linalg.norm(axis, axis=1, keepdims=True)
+        axis = np.matmul(cov, axis[..., None])[..., 0]
+        norm = np.sqrt(np.sum(axis * axis, axis=1, keepdims=True))
         # Flat colour block: covariance is zero and the axis does not matter.
-        axis = np.where(norm > 1e-9, axis / np.maximum(norm, 1e-12), np.array([1.0, 0.0, 0.0], np.float32))
+        axis = np.where(norm > 1e-9, axis / np.maximum(norm, np.float32(1e-12)), fallback)
 
-    return axis.astype(np.float32)
+    return axis.astype(np.float32, copy=False)
 
 
 def compress_dxt1a(rgba: np.ndarray) -> bytes:
@@ -100,30 +101,32 @@ def compress_dxt1a(rgba: np.ndarray) -> bytes:
 
     colors = blocks[..., :3].astype(np.float32)
     opaque = blocks[..., 3] >= ALPHA_THRESHOLD          # (N, 16)
-    weights = opaque.astype(np.float32)
-    opaque_count = weights.sum(axis=1)                   # (N,)
+    has_any_alpha = not bool(opaque.all())
 
-    # A block needs punchthrough mode if any of its pixels is transparent.
-    needs_alpha = ~opaque.all(axis=1)
-    all_clear = opaque_count == 0
-
-    # Media solo sobre pixeles opacos (evita division por cero en bloques vacios).
-    safe_count = np.maximum(opaque_count, 1.0)[:, None]
-    mean = (colors * weights[..., None]).sum(axis=1) / safe_count   # (N, 3)
-
-    centered = colors - mean[:, None, :]
-    axis = _principal_axis(centered, weights)
-
-    # Projection onto the axis; transparent pixels are kept out of the min/max
-    # by neutralising them with the opposite extreme (cheaper than using NaN).
-    proj = np.einsum("nij,nj->ni", centered, axis, optimize=True)    # (N, 16)
-    big = np.float32(np.inf)
-    t_min = np.where(opaque, proj, big).min(axis=1)
-    t_max = np.where(opaque, proj, -big).max(axis=1)
-    # Fully transparent block: there is no colour to fit, so both
-    # extremos colapsan en 0 y eso deja packed0 == packed1 (modo 3 colores).
-    t_min = np.where(all_clear, 0.0, t_min)
-    t_max = np.where(all_clear, 0.0, t_max)
+    if not has_any_alpha:
+        needs_alpha = np.zeros(n, dtype=bool)
+        all_clear = needs_alpha
+        mean = colors.mean(axis=1)
+        centered = colors - mean[:, None, :]
+        axis = _principal_axis(centered, None)
+        proj = np.matmul(centered, axis[..., None])[..., 0]
+        t_min = proj.min(axis=1)
+        t_max = proj.max(axis=1)
+    else:
+        weights = opaque.astype(np.float32)
+        opaque_count = weights.sum(axis=1)                   # (N,)
+        needs_alpha = ~opaque.all(axis=1)
+        all_clear = opaque_count == 0
+        safe_count = np.maximum(opaque_count, 1.0)[:, None]
+        mean = (colors * weights[..., None]).sum(axis=1) / safe_count   # (N, 3)
+        centered = colors - mean[:, None, :]
+        axis = _principal_axis(centered, weights)
+        proj = np.matmul(centered, axis[..., None])[..., 0]    # (N, 16)
+        big = np.float32(np.inf)
+        t_min = np.where(opaque, proj, big).min(axis=1)
+        t_max = np.where(opaque, proj, -big).max(axis=1)
+        t_min = np.where(all_clear, 0.0, t_min)
+        t_max = np.where(all_clear, 0.0, t_max)
 
     end_a = mean + t_max[:, None] * axis
     end_b = mean + t_min[:, None] * axis
@@ -143,46 +146,55 @@ def compress_dxt1a(rgba: np.ndarray) -> bytes:
     color0 = np.where(swap[:, None], color_b, color_a)
     color1 = np.where(swap[:, None], color_a, color_b)
 
-    # A flat colour block lands on packed0 == packed1, i.e. 3-colour mode.
-    # That is fine: all three entries are the same colour and no opaque pixel
-    # picks index 3.
     four_color = packed0 > packed1
 
-    palette = np.empty((n, 4, 3), dtype=np.float32)
-    palette[:, 0] = color0
-    palette[:, 1] = color1
-    palette[:, 2] = np.where(
+    c2 = np.where(
         four_color[:, None],
         (2.0 * color0 + color1) / 3.0,
         (color0 + color1) / 2.0,
-    )
-    palette[:, 3] = np.where(four_color[:, None], (color0 + 2.0 * color1) / 3.0, 0.0)
+    ).astype(np.float32)
+    c3 = np.where(four_color[:, None], (color0 + 2.0 * color1) / 3.0, 0.0).astype(np.float32)
 
-    # Squared distance from each pixel to each palette entry.
-    diff = colors[:, :, None, :] - palette[:, None, :, :]            # (N, 16, 4, 3)
-    dist = np.einsum("nikc,nikc->nik", diff, diff, optimize=True)    # (N, 16, 4)
+    # Squared distance without allocating a huge 4D (N, 16, 4, 3) intermediate buffer.
+    # Uses batched matmul (same inner-product FMA kernel as einsum(..., optimize=True))
+    # so tie-breaking remains 100% byte-for-byte identical to the reference encoder.
+    d0 = colors - color0[:, None, :]
+    best_dist = np.matmul(d0[..., None, :], d0[..., :, None])[..., 0, 0]
+    indices = np.zeros((n, 16), dtype=np.uint32)
 
-    # In 3-colour mode index 3 means "transparent", so an
-    # pixel opaco nunca lo puede elegir.
-    dist[:, :, 3] = np.where(four_color[:, None], dist[:, :, 3], np.inf)
+    d1 = colors - color1[:, None, :]
+    dist1 = np.matmul(d1[..., None, :], d1[..., :, None])[..., 0, 0]
+    m1 = dist1 < best_dist
+    best_dist = np.where(m1, dist1, best_dist)
+    indices = np.where(m1, np.uint32(1), indices)
 
-    indices = np.argmin(dist, axis=2).astype(np.uint32)              # (N, 16)
-    indices = np.where(opaque, indices, np.uint32(3))
-    if all_clear.any():
-        indices[all_clear] = 3
+    d2 = colors - c2[:, None, :]
+    dist2 = np.matmul(d2[..., None, :], d2[..., :, None])[..., 0, 0]
+    m2 = dist2 < best_dist
+    best_dist = np.where(m2, dist2, best_dist)
+    indices = np.where(m2, np.uint32(2), indices)
 
-    shifts = (2 * np.arange(16, dtype=np.uint32))[None, :]
-    bits = np.bitwise_or.reduce(indices << shifts, axis=1).astype(np.uint32)
+    d3 = colors - c3[:, None, :]
+    dist3 = np.matmul(d3[..., None, :], d3[..., :, None])[..., 0, 0]
+    # In 3-colour mode index 3 means "transparent", so an opaque pixel must never pick it.
+    m3 = four_color[:, None] & (dist3 < best_dist)
+    indices = np.where(m3, np.uint32(3), indices)
 
+    if has_any_alpha:
+        indices = np.where(opaque, indices, np.uint32(3))
+        if all_clear.any():
+            indices[all_clear] = 3
+
+    # Pack 16 x 2-bit indices into 4 little-endian bytes directly without (N, 16) shift reduction overhead.
     out = np.empty((n, 8), dtype=np.uint8)
     out[:, 0] = packed0 & 0xFF
     out[:, 1] = (packed0 >> 8) & 0xFF
     out[:, 2] = packed1 & 0xFF
     out[:, 3] = (packed1 >> 8) & 0xFF
-    out[:, 4] = bits & 0xFF
-    out[:, 5] = (bits >> 8) & 0xFF
-    out[:, 6] = (bits >> 16) & 0xFF
-    out[:, 7] = (bits >> 24) & 0xFF
+    out[:, 4] = indices[:, 0] | (indices[:, 1] << 2) | (indices[:, 2] << 4) | (indices[:, 3] << 6)
+    out[:, 5] = indices[:, 4] | (indices[:, 5] << 2) | (indices[:, 6] << 4) | (indices[:, 7] << 6)
+    out[:, 6] = indices[:, 8] | (indices[:, 9] << 2) | (indices[:, 10] << 4) | (indices[:, 11] << 6)
+    out[:, 7] = indices[:, 12] | (indices[:, 13] << 2) | (indices[:, 14] << 4) | (indices[:, 15] << 6)
     return out.tobytes()
 
 
