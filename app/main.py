@@ -674,6 +674,64 @@ async def slot_upload(slot_id: str, file: UploadFile = File(...)) -> dict:
         raise
 
 
+@app.post("/api/slots/map-names")
+async def slots_map_names(payload: dict) -> dict:
+    """Dry-run deterministic PT-BR/EN/ES filename -> PS4 icon slot mapping with ambiguity detection."""
+    from . import icon_mapper
+
+    raw = payload.get("filenames")
+    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+        raise HTTPException(422, "Informe uma lista de nomes em `filenames`.")
+    return icon_mapper.map_icon_filenames(raw)
+
+
+@app.post("/api/slots/upload-batch")
+async def slots_upload_batch(files: list[UploadFile] = File(...)) -> dict:
+    """Deterministically map and upload multiple icon files by PT-BR/EN/ES filename (rejects conflicts with 409)."""
+    from . import icon_mapper
+
+    if not files:
+        raise HTTPException(400, "Nenhum arquivo enviado para importação em lote.")
+    file_entries: list[tuple[str, UploadFile]] = []
+    seen_names: set[str] = set()
+    dup_names: list[str] = []
+    for f in files:
+        fname = (f.filename or "icon.png").replace("\\", "/").split("/")[-1].strip() or "icon.png"
+        if fname in seen_names:
+            dup_names.append(fname)
+        seen_names.add(fname)
+        file_entries.append((fname, f))
+    if dup_names:
+        raise HTTPException(
+            409,
+            f"Arquivos duplicados no lote: {', '.join(sorted(set(dup_names)))}. Remova duplicatas antes de enviar.",
+        )
+
+    mapping = icon_mapper.map_icon_filenames([fn for fn, _ in file_entries])
+    if mapping["conflicts"]:
+        reasons = "; ".join(c["reason"] for c in mapping["conflicts"])
+        raise HTTPException(409, f"Conflito de mapeamento detectado (nenhum slot foi sobrescrito): {reasons}")
+
+    by_name = {fn: uf for fn, uf in file_entries}
+    uploaded: list[dict] = []
+    for slot_id, fname in sorted(mapping["mapped"].items()):
+        spec = IMAGE_SLOTS[slot_id]
+        data = await _read_upload(by_name[fname], IMAGE_EXTS)
+        job = jobs.create("slot", fname, data)
+        try:
+            uploaded.append(_prepare_slot_upload(job, slot_id, spec))
+        except BaseException:
+            shutil.rmtree(job.root, ignore_errors=True)
+            raise
+
+    return {
+        "uploaded": uploaded,
+        "mapped_glow": mapping["mapped_glow"],
+        "unmatched": mapping["unmatched"],
+        "conflicts": [],
+    }
+
+
 def _prepare_slot_upload(job: jobs.Job, slot_id: str, spec: dict) -> dict:
     job.meta["slot"] = slot_id
     job.save()

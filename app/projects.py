@@ -177,7 +177,7 @@ async def scope_jobs(request: Request, call_next):
             )
         return response
     if project is None or not (library_apply or project_tool or path.startswith(
-        ("/api/animated/", "/api/slot/", "/api/audio/", "/api/convert/", "/api/package/", "/api/forge/")
+        ("/api/animated/", "/api/slot/", "/api/slots/", "/api/audio/", "/api/convert/", "/api/package/", "/api/forge/")
     )):
         return await call_next(request)
     try:

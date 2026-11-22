@@ -48,6 +48,7 @@ const I18N = {
     "bg.size.bycount": "limite de quadros",
     "bg.budget.max": "Limite atingido para {label}.",
     "bg.budget.each": "{bytes} por quadro.",
+    "icons.bulkByName": "Importar ícones por nome (PT/EN)",
     "icons.bulkFn": "Usar uma imagem em todos os ícones de função",
     "icons.bulkCt": "Usar uma imagem em todos os ícones de conteúdo",
     "icons.clear": "Limpar todos",
@@ -199,6 +200,7 @@ const I18N = {
     "bg.budget.each": "{bytes} per frame.",
 
     // --- icons ---
+    "icons.bulkByName": "Batch import icons by name (PT/EN)",
     "icons.bulkFn": "Apply one image to every function icon",
     "icons.bulkCt": "Apply one image to every content icon",
     "icons.clear": "Clear all",
@@ -373,6 +375,7 @@ const I18N = {
     "bg.budget.max": "Al máximo a {label}.",
     "bg.budget.each": "{bytes} por frame.",
 
+    "icons.bulkByName": "Importar iconos por nombre (PT/EN)",
     "icons.bulkFn": "Aplicar una imagen a todos los iconos de función",
     "icons.bulkCt": "Aplicar una imagen a todos los iconos de contenido",
     "icons.clear": "Vaciar todos",

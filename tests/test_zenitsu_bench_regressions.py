@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 from pathlib import Path
@@ -9,9 +10,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
-from app import jobs, main, projects
+from app import icon_mapper, jobs, main, projects
 from app.forge.pkg_router import _normalize_persisted_pkg_report
+
+
+def _png_bytes(size: tuple[int, int] = (128, 128), rgba: tuple[int, int, int, int] = (200, 120, 40, 255)) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGBA", size, rgba).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def test_legacy_pkg_history_without_verification_level_never_claims_validated():
@@ -32,6 +40,96 @@ def test_legacy_pkg_history_without_verification_level_never_claims_validated():
     full = _normalize_persisted_pkg_report({"verification_level": "full_bundle_verified", "structure_validated": True})
     assert full["structure_validated"] is True
     assert full["package_status"] == "PACOTE VALIDADO ESTRUTURALMENTE"
+
+
+def test_icon_mapper_order_independence_variants_and_ambiguity_rejection():
+    zenitsu_19 = [
+        "AmigosBrancoOutrefinado.png",
+        "AoVivoDaPlaystation_refinado.png",
+        "BibliotecaBrancoOut_refinado.png",
+        "ComunidadeBrancoOutrefinado.png",
+        "ConfiguraçoesBrancoOutrefinado.png",
+        "DiscoBrancoOut_refinado.png",
+        "EnergiaBrancoOutrefinado.png",
+        "EventoBrancoOutrefinado.png",
+        "GaleriaDeCapturas_refinado.png",
+        "GrupoBrancoOutrefinado.png",
+        "MensagensBrancoOutrefinado.png",
+        "MusicaUSB_refinado.png",
+        "NavegadorBrancoOut_refinado.png",
+        "NotificaçoesBrancoOutrefinado.png",
+        "PastaBrancoOut_refinado.png",
+        "SharePlayBrancoOut_refinado.png",
+        "SobreposicaoDeDiscoBrancoOut_refinado.png",
+        "TVeVideoBrancoOut_refinado.png",
+        "TrofeusBrancoOutrefinado.png",
+    ]
+    fwd = icon_mapper.map_icon_filenames(zenitsu_19)
+    rev = icon_mapper.map_icon_filenames(list(reversed(zenitsu_19)))
+    assert fwd["mapped"] == rev["mapped"]
+    assert len(fwd["mapped"]) == 19
+    assert not fwd["conflicts"]
+    assert not fwd["unmatched"]
+    assert fwd["mapped"]["ct:disc"] == "DiscoBrancoOut_refinado.png"
+    assert fwd["mapped"]["ct:discoverlay"] == "SobreposicaoDeDiscoBrancoOut_refinado.png"
+    assert fwd["mapped"]["ct:browser"] == "NavegadorBrancoOut_refinado.png"
+
+    # Uppercase, accents, and _glow variants
+    var = icon_mapper.map_icon_filenames([
+        "CONFIGURAÇÕES.PNG",
+        "NOTIFICAÇÕES_GLOW.PNG",
+        "TROFÉUS_glow.png",
+        "SOBREPOSIÇÃO_DE_DISCO.png",
+        "DISCO.png",
+    ])
+    assert var["mapped"]["fn:setting"] == "CONFIGURAÇÕES.PNG"
+    assert var["mapped_glow"]["fn:notification"] == "NOTIFICAÇÕES_GLOW.PNG"
+    assert var["mapped_glow"]["fn:trophy"] == "TROFÉUS_glow.png"
+    assert var["mapped"]["ct:discoverlay"] == "SOBREPOSIÇÃO_DE_DISCO.png"
+    assert var["mapped"]["ct:disc"] == "DISCO.png"
+
+    # Ambiguous duplicates must be explicitly rejected, never silently overwritten
+    amb = icon_mapper.map_icon_filenames(["DiscoBrancoOut_refinado.png", "disc_alt.png"])
+    assert len(amb["conflicts"]) == 1
+    assert amb["conflicts"][0]["slot"] == "ct:disc"
+    assert "ct:disc" not in amb["mapped"]
+
+
+def test_slots_upload_batch_endpoint_and_conflict_409(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobs, "WORKSPACE", tmp_path)
+    monkeypatch.setattr(projects, "ROOT", tmp_path / "studio-projects-v1")
+    client = TestClient(main.app)
+    assert client.get("/api/projects").status_code == 200
+    pid = client.post("/api/projects", json={"name": "IconBatch"}).json()["id"]
+
+    # Conflict returns HTTP 409 and writes nothing
+    r_conf = client.post(
+        "/api/slots/upload-batch",
+        params={"project": pid},
+        files=[
+            ("files", ("DiscoBrancoOut_refinado.png", _png_bytes((512, 512), (255, 0, 0, 255)), "image/png")),
+            ("files", ("disc_extra.png", _png_bytes((512, 512), (0, 255, 0, 255)), "image/png")),
+        ],
+    )
+    assert r_conf.status_code == 409
+
+    # Valid distinct files map deterministically into project workspace
+    r_ok = client.post(
+        "/api/slots/upload-batch",
+        params={"project": pid},
+        files=[
+            ("files", ("NavegadorBrancoOut_refinado.png", _png_bytes((512, 512), (0, 120, 255, 255)), "image/png")),
+            ("files", ("DiscoBrancoOut_refinado.png", _png_bytes((512, 512), (255, 180, 0, 255)), "image/png")),
+            ("files", ("SobreposicaoDeDiscoBrancoOut_refinado.png", _png_bytes((512, 512), (200, 0, 200, 255)), "image/png")),
+        ],
+    )
+    assert r_ok.status_code == 200, r_ok.text
+    slots_uploaded = {item["slot"]: item["source"]["name"] for item in r_ok.json()["uploaded"]}
+    assert slots_uploaded == {
+        "ct:browser": "NavegadorBrancoOut_refinado.png",
+        "ct:disc": "DiscoBrancoOut_refinado.png",
+        "ct:discoverlay": "SobreposicaoDeDiscoBrancoOut_refinado.png",
+    }
 
 
 def test_forge_pkg_history_and_report_http_legacy_and_same_name_provenance(tmp_path, monkeypatch):

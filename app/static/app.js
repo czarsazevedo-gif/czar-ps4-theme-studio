@@ -1455,6 +1455,26 @@ async function bulkUpload(group, file) {
   toast(t("misc.appliedTo", { n: ids.length }), "ok");
 }
 
+/** Deterministically maps multiple icon files by PT-BR/EN/ES filename via backend (409 on conflict). */
+async function bulkUploadByName(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f, f.name);
+  try {
+    const res = await api("/api/slots/upload-batch", { method: "POST", body: fd });
+    const uploaded = res.uploaded || [];
+    for (const item of uploaded) applySlotPayload(item);
+    const unm = (res.unmatched || []).length;
+    const msg = unm
+      ? `${uploaded.length} ícone(s) mapeado(s) · ${unm} sem correspondência.`
+      : `${uploaded.length} ícone(s) mapeado(s) com sucesso.`;
+    toast(msg, uploaded.length ? "ok" : "");
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
 /* --- musica del menu ---------------------------------------------------
  * With psgfx-at9 or at9tool present anything is converted; without it, the
  * file has to arrive as .at9 and is only validated. */
@@ -1865,6 +1885,13 @@ async function bootSlots() {
   };
   bulk("bulk-fn", "function_icon");
   bulk("bulk-ct", "content_icon");
+  const bulkByName = $("bulk-by-name");
+  if (bulkByName) {
+    bulkByName.addEventListener("change", () => {
+      if (bulkByName.files?.length) bulkUploadByName(bulkByName.files);
+      bulkByName.value = "";
+    });
+  }
   const bgmInput = $("bgm-file");
   bgmInput.addEventListener("change", () => {
     if (bgmInput.files?.[0]) uploadBgm(bgmInput.files[0]);
