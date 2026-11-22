@@ -6,7 +6,7 @@ por um único orquestrador público (`OuroborosEngine`).
 
 from __future__ import annotations
 
-OUROBOROS_VERSION = "ouroboros-absolute-1"
+OUROBOROS_VERSION = "ouroboros-absolute-2"
 
 PROPOSAL_PROFILES = (
     {

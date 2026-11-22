@@ -158,6 +158,7 @@ class OuroborosEngine:
         stabilize_camera: bool = False,
         speed_scale: float = 1.0,
         source_sha256: str = "",
+        source_motion_profile: dict | None = None,
         preextracted_frames: np.ndarray | None = None,
         progress: Callable[[str, int], None] = lambda *_: None,
         check: Callable[[], None] = lambda: None,
@@ -220,7 +221,7 @@ class OuroborosEngine:
         lead_in = None
         lead_out = None
         step_sec = max(0.01, (end_c - start_c) / float(frames))
-        bridge_k = min(5, max(2, frames // 3))
+        bridge_k = min(10, max(2, frames // 4))
         if preextracted_frames is None and not is_gif_file(source_path) and eff_mode in {"reconstruct_auto", "content_bridge"}:
             if start_c >= bridge_k * step_sec + 0.02:
                 try:
@@ -294,6 +295,7 @@ class OuroborosEngine:
                 lead_out=lead_out,
                 protected_mask=protected_mask,
                 sentinela_report=auto_sent,
+                source_motion_profile=source_motion_profile,
                 stabilize_camera=stabilize_camera,
                 verify_dds=False,
             )
@@ -307,7 +309,13 @@ class OuroborosEngine:
         progress("Validando sequência DXT1a real e aplicando acabamento pós-DDS", 68)
         check()
         same_as_raw = candidate_frames is raw_frames
-        raw_full = evaluate_post_dds(raw_frames, wait, protected_mask=protected_mask, return_blobs=same_as_raw)
+        raw_full = evaluate_post_dds(
+            raw_frames,
+            wait,
+            protected_mask=protected_mask,
+            source_motion_profile=source_motion_profile,
+            return_blobs=same_as_raw,
+        )
         raw_post_dds = raw_full["report"] if same_as_raw else raw_full
 
         if finish_enabled:
@@ -316,6 +324,7 @@ class OuroborosEngine:
                 wait,
                 protected_mask=protected_mask,
                 reference_frames=raw_frames,
+                source_motion_profile=source_motion_profile,
                 precomputed_baseline=raw_full if same_as_raw else None,
             )
             final_frames = fin["frames"]
@@ -337,7 +346,12 @@ class OuroborosEngine:
             finish_meta = {"enabled": False, "appliedSteps": [], "rejectedSteps": []}
         else:
             ev_res = evaluate_post_dds(
-                candidate_frames, wait, protected_mask=protected_mask, reference_frames=raw_frames, return_blobs=True
+                candidate_frames,
+                wait,
+                protected_mask=protected_mask,
+                reference_frames=raw_frames,
+                source_motion_profile=source_motion_profile,
+                return_blobs=True,
             )
             final_frames = candidate_frames
             dds_blobs = ev_res["blobs"]

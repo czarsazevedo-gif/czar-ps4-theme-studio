@@ -132,6 +132,13 @@ def compute_multicriteria_cost(
     dur_pen = duration_penalty(duration_sec, source_duration)
 
     # 9. Artifact penalty (reversal, freeze, ghosting, flicker, empty borders, static scene)
+    tf = m.get("temporalFidelity") or {}
+    mf_score = float(tf.get("motionFidelityScore", 10.0))
+    src_exc_ret = float(tf.get("sourceExcursionRetention", 1.0))
+    src_foc_ret = float(tf.get("sourceFocalRetention", 1.0))
+    src_area_ret = float(tf.get("sourceActiveAreaRetention", 1.0))
+    motion_starved = bool(tf.get("motionStarved", False))
+
     is_static = vs["internalMedianMae"] < 0.25 and vc["internalMedianSpeedPx"] < 0.12 and lc["rangeL"] < 1.2
     artifact = (
         (6.0 if is_static else 0.0)
@@ -144,6 +151,14 @@ def compute_multicriteria_cost(
         + ra["maxFlowFoldover"] * 5.0
     )
 
+    # 10. Source temporal motion fidelity error (penalizes dead-zone windows & motion starvation!)
+    motion_fidelity_err = (
+        max(0.0, 0.85 - src_exc_ret) * 3.8
+        + max(0.0, 0.82 - src_foc_ret) * 2.8
+        + max(0.0, 0.72 - src_area_ret) * 2.2
+        + (2.4 if motion_starved else 0.0)
+    )
+
     total = (
         1.25 * appearance
         + 1.35 * motion
@@ -154,9 +169,10 @@ def compute_multicriteria_cost(
         + 0.80 * cadence
         + 1.10 * dur_pen
         + 1.50 * artifact
+        + 1.45 * motion_fidelity_err
     )
 
-    # Classification for this specific take (strict directional gate prevents opposite-flow takes from CLASS_NATURAL!)
+    # Classification for this specific take (strict directional & motion-fidelity gates)
     dir_ok_natural = (not fc["directionMeasured"]) or (
         fc["seamDirectionCosine"] >= 0.45 and fc["seamOppositeFraction"] <= 0.25
     )
@@ -174,6 +190,7 @@ def compute_multicriteria_cost(
         take_class = CLASS_UNSUITABLE
     elif (
         not has_hard_defect
+        and not motion_starved
         and dir_ok_natural
         and appearance < 0.55
         and motion < 0.65
@@ -203,6 +220,7 @@ def compute_multicriteria_cost(
         "cadenceError": round(cadence, 4),
         "durationPenalty": round(dur_pen, 4),
         "artifactPenalty": round(artifact, 4),
+        "motionFidelityError": round(motion_fidelity_err, 4),
         "totalCost": round(total, 4),
         "classification": take_class,
         "repetitionRisk": repetition_risk,
@@ -215,6 +233,11 @@ def compute_multicriteria_cost(
         "accelRatio": round(float(ac["accelRatio"]), 4),
         "ghostingScore": round(float(gh["score"]), 4),
         "flowConfidence": round(float(fc.get("meanFlowConfidence", 0.5)), 4),
+        "motionFidelityScore": round(mf_score, 2),
+        "sourceExcursionRetention": round(src_exc_ret, 4),
+        "sourceFocalRetention": round(src_foc_ret, 4),
+        "sourceActiveAreaRetention": round(src_area_ret, 4),
+        "motionStarved": motion_starved,
         "hasHardDefect": has_hard_defect or bool(fz["detected"]),
     }
 
@@ -310,12 +333,14 @@ def _generate_seeds(
     size: tuple[int, int],
     source_fps: float,
     source_duration: float,
+    source_motion_profile: dict | None = None,
 ) -> list[tuple[float, float, float, int, float]]:
     """Generate diverse candidate (rough_score, start, end, frame_count, wait) tuples across full span.
 
     Uses Schödl et al. (2000) Video Textures multi-frame temporal neighborhood filtering combined
-    with signed temporal-derivative (motion-phase) matching and SciPy periodicity peaks so
-    opposite-phase seams (e.g. swaying foliage moving left at start and right at end) are rejected.
+    with signed temporal-derivative (motion-phase) matching, activity-normalized seam cost,
+    dead-zone anti-starvation penalties, and SciPy periodicity peaks so neither opposite-phase
+    seams nor low-motion dead zones crowd out genuinely animated intervals.
     """
     cap = max_frames_for(size)
     # 40x22 descriptor for fast vectorized lag bank
@@ -336,7 +361,7 @@ def _generate_seeds(
         }
         | {round(1.0 / max(min(source_fps, 24.0), 6.0), 6)}
     )
-    frame_counts = sorted({c for c in (8, 10, 12, 13, 16, 20, 24, 30, 36, 40, 48, cap) if 4 <= c <= cap})
+    frame_counts = sorted({c for c in (8, 10, 12, 13, 16, 18, 20, 22, 24, 30, 36, 40, 44, 48, cap) if 4 <= c <= cap})
 
     lags_to_check: dict[int, list[tuple[int, float]]] = {}
     for w in waits:
@@ -355,9 +380,14 @@ def _generate_seeds(
             best_w = min(CANONICAL_WAITS, key=lambda w: abs(best_cnt * w - p_dur))
             lags_to_check.setdefault(p_lag, []).append((best_cnt, best_w))
 
-    # Cumulative motion activity to reject dead static windows
+    # Cumulative motion activity to reject dead static windows AND penalize low-activity dead zones!
     step_act = np.abs(vel).mean(axis=(1, 2, 3))
     cum_act = np.r_[0.0, np.cumsum(step_act)]
+    ref_act = float(np.median(step_act)) if len(step_act) else 0.0
+    if source_motion_profile is not None:
+        src_med_mae = float(source_motion_profile.get("medianStepMae") or 0.0)
+        if src_med_mae > 0.0:
+            ref_act = max(ref_act, src_med_mae * 0.72)
 
     # 4-tap Video Textures binomial temporal kernel [0.15, 0.35, 0.35, 0.15]
     vt_kernel = np.array([0.15, 0.35, 0.35, 0.15], dtype=np.float32)
@@ -395,8 +425,21 @@ def _generate_seeds(
             seam_cost = app_cost
 
         act = (cum_act[lag : lag + len(seam_cost)] - cum_act[: len(seam_cost)]) / max(lag, 1)
-        # Penalize static windows heavily
-        adj_cost = seam_cost + np.where(act < 0.35, 90.0, 0.0)
+        # Activity-normalized relative seam cost prevents low-activity dead zones from winning purely
+        # because their absolute RGB differences are smaller than active segments!
+        rel_seam = (seam_cost / np.maximum(act, 0.9)) * max(ref_act, 1.0)
+        low_act_pen = (
+            np.maximum(0.0, 0.85 - act / max(ref_act, 1e-4)) * 16.0
+            if ref_act >= 0.8
+            else np.zeros_like(act)
+        )
+        # Small bonus for richly animated segments above source median activity
+        rich_bonus = (
+            np.minimum(1.2, np.maximum(0.0, act / max(ref_act, 1e-4) - 1.0) * 2.2)
+            if ref_act >= 0.8
+            else np.zeros_like(act)
+        )
+        adj_cost = rel_seam + low_act_pen - rich_bonus + np.where(act < 0.35, 90.0, 0.0)
         seg_count = min(6, len(adj_cost))
         for seg in np.array_split(np.arange(len(adj_cost)), seg_count):
             if not len(seg):
@@ -411,15 +454,17 @@ def _generate_seeds(
                 actual_dur = end - start
                 if actual_dur <= 0.15:
                     break
-                # Pick best matching (count, wait) for this duration
+                # Pick best matching (count, wait) for this duration (prefer utilizing frame budget cleanly!)
+                target_fps_pref = 10.0 if cap <= 13 else (11.5 if cap <= 24 else 13.0)
                 best_cfg = min(
                     configs,
-                    key=lambda cw: abs(cw[0] * cw[1] - actual_dur) + 0.15 * abs(1.0 / cw[1] - min(source_fps, 15.0)) / 10.0,
+                    key=lambda cw: abs(cw[0] * cw[1] - actual_dur)
+                    + 0.15 * abs(1.0 / cw[1] - min(source_fps, target_fps_pref)) / 10.0,
                 )
                 cnt = min(cap, max(4, best_cfg[0]))
                 wait = float(f"{actual_dur / cnt:.6g}")
                 if 0.02 <= wait <= 0.5:
-                    # Rough score already incorporates duration plausibility so micro-clips don't crowd out shortlist!
+                    # Rough score incorporates duration plausibility so micro-clips don't crowd out shortlist!
                     rough = float(adj_cost[idx]) + 8.0 * duration_penalty(actual_dur, source_duration)
                     options.append((rough, start, end, cnt, wait))
                 rem = rem[np.abs(rem - idx) * step >= max(0.25, actual_dur * 0.25)]
@@ -436,17 +481,35 @@ def _generate_seeds(
 def _select_diverse(
     options: list[tuple[float, float, float, int, float]],
     limit: int,
+    *,
+    cap: int = 13,
 ) -> list[tuple[float, float, float, int, float]]:
     chosen: list[tuple[float, float, float, int, float]] = []
-    for opt in sorted(options, key=lambda x: x[0]):
+    sorted_opts = sorted(options, key=lambda x: x[0])
+
+    def _can_add(opt: tuple[float, float, float, int, float]) -> bool:
         _, a, b, cnt, _ = opt
-        if all(
+        return all(
             max(abs(a - x), abs(b - y)) >= max(0.22, min(b - a, y - x) * 0.20) or abs(cnt - oc) >= 6
             for _, x, y, oc, _ in chosen
-        ):
+        )
+
+    # For larger frame budgets (540p cap=24, 360p cap=48), guarantee up to 4 shortlist slots for
+    # rich higher-frame-count / longer-duration takes so short 720p-like clips cannot monopolize the pool!
+    if cap >= 20 and limit >= 6:
+        rich_min_cnt = int(cap * 0.72)
+        rich_quota = min(4, limit // 3)
+        for opt in sorted_opts:
+            if opt[3] >= rich_min_cnt and (opt[2] - opt[1]) >= 1.6 and _can_add(opt):
+                chosen.append(opt)
+                if len(chosen) >= rich_quota:
+                    break
+
+    for opt in sorted_opts:
+        if len(chosen) >= limit:
+            break
+        if _can_add(opt):
             chosen.append(opt)
-            if len(chosen) == limit:
-                break
     return chosen
 
 
@@ -566,6 +629,7 @@ def _pareto_rank_candidates(candidates: list[dict]) -> list[dict]:
                 float(co.get("cadenceError", 1.0)),
                 float(co.get("durationPenalty", 0.5)),
                 float(co.get("artifactPenalty", 0.0)),
+                1.0 - min(1.0, float(co.get("motionFidelityScore", 10.0)) / 10.0),
             )
         )
     dominated_by = [0] * n
@@ -681,6 +745,7 @@ def search_supreme(
     folder.mkdir(parents=True, exist_ok=True)
     sentinela_report, overview = survey_file(path, duration, folder, progress, check)
     info = sentinela_report["source"]
+    source_motion_profile = sentinela_report.get("sourceMotionProfile")
     dur = info["duration"]
     fps = info["sampleFps"] or info["fps"] or 10.0
     step = sentinela_report["levelA"]["stepSec"]
@@ -718,8 +783,18 @@ def search_supreme(
         options = []
         for w_frames, off, w_step in windows:
             check()
-            options.extend(_generate_seeds(w_frames, off, w_step, size, fps, dur))
-        shortlist = _select_diverse(options, shortlist_per_res)
+            options.extend(
+                _generate_seeds(
+                    w_frames,
+                    off,
+                    w_step,
+                    size,
+                    fps,
+                    dur,
+                    source_motion_profile=source_motion_profile,
+                )
+            )
+        shortlist = _select_diverse(options, shortlist_per_res, cap=max_frames_for(size))
 
         group_candidates = []
         for idx, (_, a, b, cnt, wait) in enumerate(shortlist):
@@ -743,7 +818,13 @@ def search_supreme(
                         risks.append("Retorno estrutural observado na fonte.")
                     if any(a < t <= b - wait for t in cut_secs):
                         risks.append("Corte abrupto observado na fonte.")
-                    ev = evaluate_loop(sampled, wait, flow_max_width=160, evaluate_dds=False)
+                    ev = evaluate_loop(
+                        sampled,
+                        wait,
+                        source_motion_profile=source_motion_profile,
+                        flow_max_width=160,
+                        evaluate_dds=False,
+                    )
                     costs = compute_multicriteria_cost(
                         ev,
                         duration_sec=cnt * wait,
@@ -819,7 +900,13 @@ def search_supreme(
                         r_risks.append("Retorno estrutural observado na fonte.")
                     if any(cand["start"] < t <= new_b - new_w for t in cut_secs):
                         r_risks.append("Corte abrupto observado na fonte.")
-                    r_ev = evaluate_loop(ref_sampled, new_w, flow_max_width=160, evaluate_dds=False)
+                    r_ev = evaluate_loop(
+                        ref_sampled,
+                        new_w,
+                        source_motion_profile=source_motion_profile,
+                        flow_max_width=160,
+                        evaluate_dds=False,
+                    )
                     r_costs = compute_multicriteria_cost(
                         r_ev,
                         duration_sec=cand["frames"] * new_w,

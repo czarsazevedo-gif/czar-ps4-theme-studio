@@ -451,6 +451,7 @@ def evaluate_loop(
     *,
     protected_mask: np.ndarray | None = None,
     reference_frames: Sequence[np.ndarray] | np.ndarray | None = None,
+    source_motion_profile: dict | None = None,
     timestamps: Sequence[float] | None = None,
     flow_max_width: int = 240,
     evaluate_dds: bool = False,
@@ -710,6 +711,7 @@ def evaluate_loop(
     med_sharp = float(np.median(sharpness_all))
     sharp_retention = 1.0
     ref_border_empty = 0.0
+    ref_arr: np.ndarray | None = None
     if reference_frames is not None:
         ref_arr = _as_rgb_stack(reference_frames)
         ref_sharp = float(np.median([_laplacian_sharpness(to_gray_u8(f)) for f in ref_arr]))
@@ -731,9 +733,32 @@ def evaluate_loop(
             static_mean_diff = float(diffs.mean())
             static_changed_frac = float((diffs.max(axis=-1) > 0).mean())
 
-    # --- 12. Reconstruction artifacts (CZAR-ABS-AUD-011: differential border check vs reference) ---
+    # --- 12. Reconstruction artifacts (CZAR-ABS-AUD-011: differential border check vs reference, vignette-safe) ---
     border_empty = float(max(_border_empty_fraction(f) for f in rgb))
-    border_empty_delta = max(0.0, border_empty - ref_border_empty) if reference_frames is not None else border_empty
+    if ref_arr is not None:
+        # Only count newly blackened border pixels that were NOT already dark vignette (<14) in reference!
+        b_chk = max(2, min(8, min(h, w) // 20))
+        ref_g0 = to_gray_u8(ref_arr[0])
+        if ref_g0.shape != (h, w):
+            ref_g0 = cv2.resize(ref_g0, (w, h), interpolation=cv2.INTER_AREA)
+        ref_b = np.concatenate([
+            ref_g0[:b_chk, :].ravel(),
+            ref_g0[-b_chk:, :].ravel(),
+            ref_g0[:, :b_chk].ravel(),
+            ref_g0[:, -b_chk:].ravel(),
+        ])
+        new_black_fracs = []
+        for gi in grays:
+            cur_b = np.concatenate([
+                gi[:b_chk, :].ravel(),
+                gi[-b_chk:, :].ravel(),
+                gi[:, :b_chk].ravel(),
+                gi[:, -b_chk:].ravel(),
+            ])
+            new_black_fracs.append(float(((cur_b < 3) & (ref_b >= 14)).mean()))
+        border_empty_delta = max(0.0, float(max(new_black_fracs)) if new_black_fracs else 0.0)
+    else:
+        border_empty_delta = border_empty
     max_foldover = float(max(foldovers)) if foldovers else 0.0
     banding_pre = float(np.mean([_banding_index(rgb[i]) for i in np.linspace(0, n - 1, min(n, 6), dtype=int)]))
 
@@ -810,6 +835,210 @@ def evaluate_loop(
     freeze_indices = sorted(set(exact_dups + near_stalls))
     seam_frozen = (n - 1) in freeze_indices
 
+    # --- 14b. Temporal & Motion Preservation Fidelity (prevents static/over-damped false approvals!) ---
+    cy0, cy1 = int(h * 0.15), max(int(h * 0.15) + 1, int(h * 0.80))
+    cx0, cx1 = int(w * 0.20), max(int(w * 0.20) + 1, int(w * 0.80))
+    seq_t_std = float(temp_std_map.mean())
+    seq_t_std_p90 = float(np.percentile(temp_std_map, 90))
+    seq_focal_std = float(temp_std_map[cy0:cy1, cx0:cx1].mean())
+    seq_active_area = float((temp_std_map > 2.5).mean())
+    seq_focal_active = float((temp_std_map[cy0:cy1, cx0:cx1] > 2.5).mean())
+
+    scale_to_180 = 180.0 / float(max(h, 1))
+    fmag_stack = np.stack([np.hypot(fl[..., 0], fl[..., 1]) for fl in flows_fwd], axis=0)
+    int_fmag = fmag_stack[:-1] if len(fmag_stack) > 1 else fmag_stack
+    seq_flow_p95_180 = float(np.percentile(int_fmag, 95) * scale_to_180)
+    fh_s, fw_s = int_fmag.shape[1:3]
+    fcy0, fcy1 = int(fh_s * 0.15), max(int(fh_s * 0.15) + 1, int(fh_s * 0.80))
+    fcx0, fcx1 = int(fw_s * 0.20), max(int(fw_s * 0.20) + 1, int(fw_s * 0.80))
+    seq_focal_flow_p95_180 = float(np.percentile(int_fmag[:, fcy0:fcy1, fcx0:fcx1], 95) * scale_to_180)
+    seq_flow_active_frac = float(((int_fmag * scale_to_180) > 0.30).mean())
+    sparse_scale = max(moving_area_frac, 0.15) if moving_area_frac < 0.35 else 1.0
+    near_dup_pairs = int(
+        sum(
+            1
+            for mv in mae_all
+            if (med_mae > 0.6 and float(mv) < max(0.30 * sparse_scale, 0.20 * med_mae))
+            or (seq_t_std > 1.5 and float(mv) / sparse_scale < 0.28)
+        )
+    )
+
+    # Compare against raw interval reference frames (catches synthesis/reconstruction motion collapse!)
+    raw_exc_ret = 1.0
+    raw_foc_ret = 1.0
+    raw_subj_ret = 1.0
+    raw_area_ret = 1.0
+    raw_step_ret = 1.0
+    ref_t_std_val = None
+    reconstruction_motion_damped = False
+    reconstruction_severely_damped = False
+    if ref_arr is not None and len(ref_arr) >= 2:
+        rh, rw = ref_arr.shape[1:3]
+        r_acc = np.zeros((rh, rw, 3), dtype=np.float32)
+        r_sq = np.zeros((rh, rw, 3), dtype=np.float32)
+        for rf in ref_arr:
+            cv2.accumulate(rf, r_acc)
+            cv2.accumulateSquare(rf, r_sq)
+        r_m = r_acc / float(len(ref_arr))
+        ref_std_map = np.sqrt(np.maximum(0.0, r_sq / float(len(ref_arr)) - r_m * r_m)).mean(axis=-1)
+        if ref_std_map.shape != (h, w):
+            ref_std_map = cv2.resize(ref_std_map, (w, h), interpolation=cv2.INTER_AREA)
+        ref_t_std_val = float(ref_std_map.mean())
+        ref_foc_std = float(ref_std_map[cy0:cy1, cx0:cx1].mean())
+        ref_act_area = float((ref_std_map > 2.5).mean())
+        ref_p75 = float(np.percentile(ref_std_map, 75))
+        subj_m = ref_std_map >= max(3.0, ref_p75)
+        ref_subj_std = float(ref_std_map[subj_m].mean()) if subj_m.any() else ref_t_std_val
+        seq_subj_std = float(temp_std_map[subj_m].mean()) if subj_m.any() else seq_t_std
+        seq_p75 = float(np.percentile(temp_std_map, 75))
+        out_subj_m = temp_std_map >= max(3.0, seq_p75)
+        seq_own_subj_std = float(temp_std_map[out_subj_m].mean()) if out_subj_m.any() else seq_t_std
+        ref_steps = [float(cv2.absdiff(ref_arr[i], ref_arr[i + 1]).mean()) for i in range(len(ref_arr) - 1)]
+        ref_med_mae = float(np.median(ref_steps)) if ref_steps else 0.0
+
+        raw_exc_ret = float(seq_t_std / max(ref_t_std_val, 1.0)) if ref_t_std_val >= 1.5 else 1.0
+        raw_foc_ret = float(seq_focal_std / max(ref_foc_std, 1.0)) if ref_foc_std >= 1.5 else 1.0
+        if ref_subj_std >= 2.5:
+            raw_subj_fixed_ret = float(seq_subj_std / max(ref_subj_std, 1.0))
+            raw_subj_dist_ret = float(seq_own_subj_std / max(ref_subj_std, 1.0))
+            # Respect genuine spatial advection (drifting clouds/water) when total & focal motion are preserved,
+            # while still vetoing any real motion collapse or frozen focal character.
+            raw_subj_ret = float(max(raw_subj_fixed_ret, min(raw_subj_dist_ret, raw_exc_ret, raw_foc_ret)))
+        else:
+            raw_subj_ret = 1.0
+        raw_area_ret = float(seq_active_area / max(ref_act_area, 0.04)) if ref_act_area >= 0.05 else 1.0
+        raw_step_ret = float(med_mae / max(ref_med_mae, 0.4)) if ref_med_mae >= 0.8 else 1.0
+        reconstruction_motion_damped = bool(
+            ref_t_std_val >= 2.2
+            and (
+                raw_exc_ret < 0.72
+                or raw_subj_ret < 0.68
+                or raw_area_ret < 0.62
+                or raw_step_ret < 0.55
+            )
+        )
+        reconstruction_severely_damped = bool(
+            ref_t_std_val >= 2.2
+            and (
+                raw_exc_ret < 0.60
+                or raw_subj_ret < 0.56
+                or raw_area_ret < 0.48
+                or raw_step_ret < 0.42
+            )
+        )
+
+    # Compare against full-source motion baseline (catches dead-zone interval selection!)
+    src_exc_ret = 1.0
+    src_glob_ret = 1.0
+    src_foc_ret = 1.0
+    src_area_ret = 1.0
+    src_flow_ret = 1.0
+    source_motion_starved = False
+    source_severely_starved = False
+    if source_motion_profile is not None:
+        src_local_std = float(
+            source_motion_profile.get("localWindowStdMedian")
+            or source_motion_profile.get("temporalStdMean")
+            or 0.0
+        )
+        src_global_std = float(source_motion_profile.get("temporalStdMean") or 0.0)
+        src_local_foc = float(
+            source_motion_profile.get("localFocalStdMedian")
+            or source_motion_profile.get("focalTemporalStdMean")
+            or 0.0
+        )
+        src_local_area = float(
+            source_motion_profile.get("localActiveAreaMedian")
+            or source_motion_profile.get("activeAreaFraction")
+            or 0.0
+        )
+        src_flow_p95 = float(source_motion_profile.get("flowP95Norm180") or 0.0)
+
+        src_local_win = float(source_motion_profile.get("localWindowSec") or 2.0)
+        loop_dur_s = max(0.25, float(n) * float(wait))
+        # Excursion over a shorter window (< localWindowSec) naturally spans less drift than a 2s window;
+        # normalize gently (exponent 0.75, floor 0.62) while still catching true dead-zone starvation!
+        dur_norm = min(1.0, max(0.62, (loop_dur_s / max(src_local_win, 0.5)) ** 0.75))
+        eff_src_local_std = src_local_std * dur_norm
+        eff_src_local_foc = src_local_foc * dur_norm
+
+        src_exc_ret = float(seq_t_std / max(eff_src_local_std, 1.0)) if eff_src_local_std >= 1.8 else 1.0
+        src_glob_ret = float(seq_t_std / max(src_global_std, 1.0)) if src_global_std >= 1.8 else 1.0
+        src_foc_ret = float(seq_focal_std / max(eff_src_local_foc, 1.0)) if eff_src_local_foc >= 1.8 else 1.0
+        src_area_ret = float(seq_active_area / max(src_local_area, 0.04)) if src_local_area >= 0.06 else 1.0
+        src_flow_ret = float(seq_flow_p95_180 / max(src_flow_p95, 0.25)) if src_flow_p95 >= 0.35 else 1.0
+
+        source_motion_starved = bool(
+            eff_src_local_std >= 2.0
+            and (
+                src_exc_ret < 0.58
+                or (src_foc_ret < 0.56 and src_exc_ret < 0.72)
+                or src_area_ret < 0.45
+            )
+        )
+        source_severely_starved = bool(
+            eff_src_local_std >= 2.0 and (src_exc_ret < 0.46 or src_area_ret < 0.32)
+        )
+
+    is_practically_static = bool(med_mae < 0.25 and med_speed < 0.12 and float(np.ptp(L_means)) < 1.2)
+    intrinsic_starved = bool(
+        not is_practically_static
+        and seq_t_std < 1.15
+        and seq_active_area < 0.03
+        and seq_flow_p95_180 < 0.25
+        and float(np.ptp(L_means)) < 1.5
+    )
+    motion_starved = bool(is_practically_static or intrinsic_starved or source_motion_starved or reconstruction_motion_damped)
+
+    ret_terms: list[float] = []
+    if ref_arr is not None and (ref_t_std_val or 0.0) >= 1.5:
+        raw_eff = min(min(raw_exc_ret, raw_subj_ret), 0.5 * raw_area_ret + 0.5 * raw_step_ret)
+        ret_terms.append(min(1.0, raw_eff))
+    if source_motion_profile is not None and float(source_motion_profile.get("localWindowStdMedian") or 0.0) >= 1.8:
+        src_eff = min(src_exc_ret, 0.6 * src_foc_ret + 0.4 * src_area_ret)
+        ret_terms.append(min(1.0, src_eff))
+    effective_retention = min(ret_terms) if ret_terms else 1.0
+
+    motion_fidelity_score = float(np.clip(10.0 - max(0.0, 0.90 - effective_retention) * 12.5, 0.5, 10.0))
+    if near_dup_pairs > 0:
+        motion_fidelity_score = max(0.5, motion_fidelity_score - min(3.0, near_dup_pairs * 0.75))
+    if is_practically_static:
+        motion_fidelity_score = min(motion_fidelity_score, 1.5)
+    elif intrinsic_starved:
+        motion_fidelity_score = min(motion_fidelity_score, 3.5)
+
+    temporal_fidelity = {
+        "temporalStdMean": round(seq_t_std, 4),
+        "temporalStdP90": round(seq_t_std_p90, 4),
+        "focalTemporalStdMean": round(seq_focal_std, 4),
+        "activeAreaFraction": round(seq_active_area, 4),
+        "focalActiveAreaFraction": round(seq_focal_active, 4),
+        "flowP95Norm180": round(seq_flow_p95_180, 4),
+        "focalFlowP95Norm180": round(seq_focal_flow_p95_180, 4),
+        "flowActiveAreaFraction": round(seq_flow_active_frac, 4),
+        "nearDuplicatePairs": near_dup_pairs,
+        "rawToOutputExcursionRetention": round(min(raw_exc_ret, 3.0), 4),
+        "rawToOutputFocalRetention": round(min(raw_foc_ret, 3.0), 4),
+        "rawToOutputActiveSubjectRetention": round(min(raw_subj_ret, 3.0), 4),
+        "rawToOutputActiveAreaRetention": round(min(raw_area_ret, 3.0), 4),
+        "rawToOutputStepEnergyRetention": round(min(raw_step_ret, 3.0), 4),
+        "sourceExcursionRetention": round(min(src_exc_ret, 3.0), 4),
+        "sourceGlobalExcursionRatio": round(min(src_glob_ret, 3.0), 4),
+        "sourceFocalRetention": round(min(src_foc_ret, 3.0), 4),
+        "sourceActiveAreaRetention": round(min(src_area_ret, 3.0), 4),
+        "sourceFlowP95Retention": round(min(src_flow_ret, 3.0), 4),
+        "effectiveMotionRetention": round(effective_retention, 4),
+        "motionFidelityScore": round(motion_fidelity_score, 2),
+        "intrinsicMotionStarved": intrinsic_starved,
+        "sourceMotionStarved": source_motion_starved,
+        "sourceSeverelyStarved": source_severely_starved,
+        "reconstructionMotionDamped": reconstruction_motion_damped,
+        "reconstructionSeverelyDamped": reconstruction_severely_damped,
+        "motionStarved": motion_starved,
+        "checkedAgainstSource": source_motion_profile is not None,
+        "checkedAgainstRawInterval": ref_arr is not None,
+    }
+
     # --- 15. Cadence regularity ---
     speed_cv = float(np.std(speeds) / max(float(np.mean(speeds)), 0.15)) if structural_motion else 0.0
     timing_jitter = 0.0
@@ -835,6 +1064,15 @@ def evaluate_loop(
         flow_scale=flow_scale,
         mean_psnr=(dds_info or {}).get("meanPsnr"),
     )
+    traj_kin["subScores"]["motionFidelity"] = round(motion_fidelity_score, 2)
+    if motion_starved:
+        traj_kin["definitiveLoopScore"] = round(
+            min(float(traj_kin["definitiveLoopScore"]), min(5.8, motion_fidelity_score + 0.3)), 2
+        )
+    elif motion_fidelity_score < 8.0:
+        traj_kin["definitiveLoopScore"] = round(
+            min(float(traj_kin["definitiveLoopScore"]), motion_fidelity_score + 0.6), 2
+        )
 
     # --- Hard-cut detection inside sequence (including seam) ---
     cut_thresh = max(16.0, 3.0 * med_mae + 6.0)
@@ -845,8 +1083,20 @@ def evaluate_loop(
 
     # --- Aggregate diagnostic summary (never a blind single number!) ---
     issues: list[str] = []
-    if med_mae < 0.25 and med_speed < 0.12 and float(np.ptp(L_means)) < 1.2:
+    if is_practically_static:
         issues.append("Cena praticamente estática (ausência de movimento não indica bom loop).")
+    elif intrinsic_starved:
+        issues.append("Movimento temporal insuficiente para caracterizar animação contínua perceptível.")
+    if reconstruction_motion_damped:
+        issues.append(
+            f"Perda severa de movimento original durante a reconstrução "
+            f"(excursão {raw_exc_ret * 100:.0f}%, sujeito ativo {raw_subj_ret * 100:.0f}%)."
+        )
+    if source_motion_starved:
+        issues.append(
+            f"Trecho selecionado com atividade temporal muito inferior à fonte original "
+            f"(excursão {src_exc_ret * 100:.0f}%, foco {src_foc_ret * 100:.0f}%)."
+        )
     if has_reversal:
         issues.append("Reversão estrutural / ping-pong detectada.")
         traj_kin["definitiveLoopScore"] = round(min(float(traj_kin["definitiveLoopScore"]), 5.2), 2)
@@ -886,6 +1136,71 @@ def evaluate_loop(
     mean_conf = float(np.mean([c.mean() for c in confs]))
     mean_occ = float(np.mean(occ_fracs))
     conf_score = float(np.clip(mean_conf * (1.0 - 0.5 * mean_occ), 0.0, 1.0))
+
+    # Independent 7-axis audit proof (visual, kinematic, motion preservation, freeze, jump, cadence, 10-cycle merged later)
+    visual_axis_ok = bool(
+        not ((visual_seam_ratio > 1.75 and visual_z > 3.0 and ssim_drop > 0.03) or local_seam_excess > 1.8)
+        and not ghosting_detected
+        and not (flicker_score > 1.8 and alternation_rate > 0.45)
+    )
+    kinematic_axis_ok = bool(
+        not has_reversal
+        and not (direction_measured and (flow_err_ratio > 2.2 and seam_flow_err > 1.0 or seam_dir_cosine < 0.35))
+        and not (structural_motion and vel_jump_rel > 0.55)
+        and not (structural_motion and acc_ratio > 3.0 and seam_acc > 1.2)
+    )
+    motion_axis_ok = bool(not motion_starved and not is_practically_static)
+    freeze_axis_ok = bool(not freeze_indices and near_dup_pairs == 0)
+    jump_axis_ok = bool(not cut_indices and not traj_kin["intraCycleJumpDetected"])
+    cadence_fps = round(1.0 / max(float(wait), 1e-6), 4)
+    cadence_axis_ok = bool(cadence_fps >= 3.0 and timing_jitter <= 0.25 and speed_cv <= 0.95)
+    independent_axes = {
+        "visualContinuity": {
+            "passed": visual_axis_ok,
+            "seamSsim": round(seam_ssim, 4),
+            "seamRatio": round(visual_seam_ratio, 4),
+            "localSeamExcess": round(local_seam_excess, 4),
+        },
+        "kinematicContinuity": {
+            "passed": kinematic_axis_ok,
+            "ouroborosKtcsScore": traj_kin["ouroborosKtcsScore"],
+            "independentKltScore": traj_kin["independentKltScore"],
+            "seamDirectionCosine": round(seam_dir_cosine, 4),
+            "velocityJump": round(vel_jump_rel, 4),
+            "accelRatio": round(acc_ratio, 4),
+        },
+        "motionPreservation": {
+            "passed": motion_axis_ok,
+            "motionFidelityScore": temporal_fidelity["motionFidelityScore"],
+            "temporalStdMean": temporal_fidelity["temporalStdMean"],
+            "focalTemporalStdMean": temporal_fidelity["focalTemporalStdMean"],
+            "activeAreaFraction": temporal_fidelity["activeAreaFraction"],
+            "rawToOutputExcursionRetention": temporal_fidelity["rawToOutputExcursionRetention"],
+            "sourceExcursionRetention": temporal_fidelity["sourceExcursionRetention"],
+            "sourceFocalRetention": temporal_fidelity["sourceFocalRetention"],
+            "motionStarved": motion_starved,
+            "reconstructionMotionDamped": reconstruction_motion_damped,
+        },
+        "freezeIntegrity": {
+            "passed": freeze_axis_ok,
+            "detected": bool(freeze_indices),
+            "freezeIndices": freeze_indices,
+            "nearDuplicatePairs": near_dup_pairs,
+        },
+        "jumpIntegrity": {
+            "passed": jump_axis_ok,
+            "intraCycleJumpDetected": bool(traj_kin["intraCycleJumpDetected"]),
+            "kltMaxStepBurstRatio": traj_kin["kltMaxStepBurstRatio"],
+            "cutDetected": bool(cut_indices),
+        },
+        "cadenceIntegrity": {
+            "passed": cadence_axis_ok,
+            "fps": cadence_fps,
+            "waitSec": float(wait),
+            "speedCV": round(speed_cv, 4),
+            "timingJitter": round(timing_jitter, 4),
+        },
+    }
 
     return {
         "version": DELUXE_VERSION,
@@ -982,6 +1297,8 @@ def evaluate_loop(
                 "bandingIndex": round(banding_pre, 4),
             },
             "spatialRegions": spatial_regions,
+            "temporalFidelity": temporal_fidelity,
+            "independentAxes": independent_axes,
             "trajectoryKinematics": traj_kin,
             "reversals": {
                 "detected": has_reversal,
@@ -994,11 +1311,12 @@ def evaluate_loop(
                 "seamFrozen": seam_frozen,
                 "indices": freeze_indices,
                 "exactDuplicates": exact_dups,
+                "nearDuplicatePairs": near_dup_pairs,
             },
             "cadenceRegularity": {
                 "speedCV": round(speed_cv, 4),
                 "timingJitter": round(timing_jitter, 4),
-                "fps": round(1.0 / max(float(wait), 1e-6), 4),
+                "fps": cadence_fps,
             },
             "cuts": {
                 "detected": bool(cut_indices),
@@ -1200,6 +1518,7 @@ def evaluate_post_dds(
     *,
     protected_mask: np.ndarray | None = None,
     reference_frames: Sequence[np.ndarray] | np.ndarray | None = None,
+    source_motion_profile: dict | None = None,
     timestamps: Sequence[float] | None = None,
     backend: str = DEFAULT_OUROBOROS_BC1_BACKEND,
     return_blobs: bool = False,
@@ -1216,11 +1535,13 @@ def evaluate_post_dds(
         wait,
         protected_mask=protected_mask,
         reference_frames=reference_frames if reference_frames is not None else rgb,
+        source_motion_profile=source_motion_profile,
         timestamps=timestamps,
         evaluate_dds=False,
     )
     post_report["metrics"]["ddsDelta"] = dds_rt
     tk = post_report["metrics"].get("trajectoryKinematics")
+    tf = post_report["metrics"].get("temporalFidelity") or {}
     if tk is not None and dds_rt.get("meanPsnr") is not None:
         s_dds = round(min(10.0, max(0.0, (float(dds_rt["meanPsnr"]) - 28.0) / 1.4)), 2)
         sub = tk["subScores"]
@@ -1252,9 +1573,15 @@ def evaluate_post_dds(
             kin_cap = min(kin_cap, 10.0 - min(4.5, (k_burst - 2.0) * 0.35))
         if has_rev_post:
             kin_cap = min(kin_cap, 5.2)
+        def_sc = min(raw_avg, max(3.5, kin_cap))
+        mf_sc = float(tf.get("motionFidelityScore", 10.0))
+        if tf.get("motionStarved"):
+            def_sc = min(def_sc, min(5.8, mf_sc + 0.3))
+        elif mf_sc < 8.0:
+            def_sc = min(def_sc, mf_sc + 0.6)
         tk["ouroborosKtcsScore"] = o_sc
         tk["independentKltScore"] = i_sc
-        tk["definitiveLoopScore"] = round(min(raw_avg, max(3.5, kin_cap)), 2)
+        tk["definitiveLoopScore"] = round(def_sc, 2)
 
     if not dds_rt["withinBudget"]:
         post_report["issues"].append("Sequência DDS excede o orçamento RAF canônico.")
@@ -1285,6 +1612,7 @@ def evaluate_ten_cycles(eval_report: dict) -> dict:
     fz = m.get("freezes") or {}
     fl = m.get("flicker") or {}
     gh = m.get("ghosting") or {}
+    tf = m.get("temporalFidelity") or {}
 
     sr = m.get("spatialRegions") or {}
     seam_hs = sr.get("seamHotspot") or {}
@@ -1301,16 +1629,28 @@ def evaluate_ten_cycles(eval_report: dict) -> dict:
         or (fc.get("directionMeasured") and not dir_ok)
         or float(vc.get("relativeJump", 0.0)) > 0.55
     )
+    motion_ok = not bool(tf.get("motionStarved", False))
     rep_per_min = round(60.0 / max(cycle_sec, 0.05), 1)
     repetition_risk = "alta" if cycle_sec < 0.9 else ("moderada" if cycle_sec < 1.6 else "baixa")
     continuous_ok = bool(
         eval_report.get("passed")
         and not seam_visible
+        and motion_ok
         and not rv.get("detected")
         and not fz.get("detected")
         and not fl.get("artificialFlicker")
         and not gh.get("detected")
     )
+    ten_axis = {
+        "passed": continuous_ok,
+        "cycles": 10,
+        "tenCycleDurationSec": total_sec,
+        "seamVisibleRisk": seam_visible,
+        "directionalContinuityOk": dir_ok,
+        "motionPreservationOk": motion_ok,
+    }
+    if isinstance(m.get("independentAxes"), dict):
+        m["independentAxes"]["tenCycleIntegrity"] = ten_axis
     return {
         "cycles": 10,
         "framesPerCycle": n,
@@ -1322,6 +1662,7 @@ def evaluate_ten_cycles(eval_report: dict) -> dict:
         "repetitionRisk": repetition_risk,
         "seamVisibleRisk": seam_visible,
         "directionalContinuityOk": dir_ok,
+        "motionPreservationOk": motion_ok,
         "continuousTenCyclePass": continuous_ok,
         "spatialAudit": {
             "wholeFrame": sr.get("wholeFrame"),
@@ -1370,13 +1711,29 @@ def classify_artifact_provenance(
 
 
 def compare_before_after(before: dict, after: dict) -> dict:
-    """Scientific before/after comparison matrix. Rejects refinements that worsen perceptual or directional continuity."""
+    """Scientific before/after comparison matrix. Rejects refinements that worsen perceptual, directional, or motion fidelity."""
     bm = before["metrics"]
     am = after["metrics"]
 
     b_spd = float(bm["velocityContinuity"]["internalMedianSpeedPx"])
     a_spd = float(am["velocityContinuity"]["internalMedianSpeedPx"])
     motion_retention = float(a_spd / max(b_spd, 0.15)) if b_spd >= 0.25 else 1.0
+
+    b_tf = bm.get("temporalFidelity") or {}
+    a_tf = am.get("temporalFidelity") or {}
+    b_tstd = float(b_tf.get("temporalStdMean", 0.0))
+    a_tstd = float(a_tf.get("temporalStdMean", b_tstd))
+    excursion_retention = float(a_tstd / max(b_tstd, 1.0)) if b_tstd >= 2.0 else 1.0
+
+    b_area = float(b_tf.get("activeAreaFraction", 0.0))
+    a_area = float(a_tf.get("activeAreaFraction", b_area))
+    active_area_retention = float(a_area / max(b_area, 0.04)) if b_area >= 0.06 else 1.0
+
+    b_fp95 = float(b_tf.get("flowP95Norm180", 0.0))
+    a_fp95 = float(a_tf.get("flowP95Norm180", b_fp95))
+    flow_p95_retention = float(a_fp95 / max(b_fp95, 0.25)) if b_fp95 >= 0.45 else 1.0
+
+    a_subj_ret = float(a_tf.get("rawToOutputActiveSubjectRetention", 1.0))
 
     b_tk = bm.get("trajectoryKinematics") or {}
     a_tk = am.get("trajectoryKinematics") or {}
@@ -1395,6 +1752,8 @@ def compare_before_after(before: dict, after: dict) -> dict:
         "ghostingScore": (bm["ghosting"]["score"], am["ghosting"]["score"], "lower"),
         "sharpnessRetention": (bm["texturePreservation"]["sharpnessRetention"], am["texturePreservation"]["sharpnessRetention"], "higher"),
         "motionRetention": (1.0, round(min(motion_retention, 2.0), 4), "higher"),
+        "excursionRetention": (1.0, round(min(excursion_retention, 2.0), 4), "higher"),
+        "activeAreaRetention": (1.0, round(min(active_area_retention, 2.0), 4), "higher"),
         "definitiveLoopScore": (
             float(b_tk.get("definitiveLoopScore", 6.0)),
             float(a_tk.get("definitiveLoopScore", 6.0)),
@@ -1422,12 +1781,16 @@ def compare_before_after(before: dict, after: dict) -> dict:
             regressions.append(name)
 
     # Hard rejection triggers: never accept reversals, freezes, ghosting, blur, protected drift,
-    # directional degradation, intra-cycle phase-handoff jumps, or artificial motion dampening!
+    # directional degradation, intra-cycle phase-handoff jumps, or artificial motion/excursion dampening!
     hard_reject = []
     if am["reversals"]["detected"] and not bm["reversals"]["detected"]:
         hard_reject.append("Introduziu reversão artificial.")
     if am["freezes"]["detected"] and not bm["freezes"]["detected"]:
         hard_reject.append("Introduziu congelamento/duplicação.")
+    b_ndup = int(b_tf.get("nearDuplicatePairs", 0))
+    a_ndup = int(a_tf.get("nearDuplicatePairs", 0))
+    if a_ndup > b_ndup and a_ndup >= 1:
+        hard_reject.append(f"Introduziu pares de quadros quase congelados ({b_ndup} -> {a_ndup}).")
     if am["ghosting"]["detected"] and not bm["ghosting"]["detected"]:
         hard_reject.append("Introduziu ghosting perceptível.")
     if a_tk.get("intraCycleJumpDetected") and not b_tk.get("intraCycleJumpDetected"):
@@ -1448,14 +1811,31 @@ def compare_before_after(before: dict, after: dict) -> dict:
         if (a_cos < b_cos - 0.18 and a_cos < 0.50) or (a_opp > b_opp + 0.14 and a_opp > 0.25):
             hard_reject.append("Piorou a continuidade direcional do movimento na junção.")
 
-    # Artificial motion-dampening gate (never shrink genuine movement to artificially improve seam scores!)
+    # Artificial motion-dampening gates (never shrink genuine movement or temporal excursion to fake seam smoothness!)
     if b_spd >= 0.45 and a_spd < b_spd * 0.62 and (bm["visualSimilarity"]["internalMedianMae"] >= 1.2):
         hard_reject.append("Reduziu artificialmente a amplitude de movimento para mascarar a costura.")
+    if b_tstd >= 2.2 and excursion_retention < 0.72:
+        hard_reject.append(
+            f"Reduziu excessivamente a excursão temporal original ({excursion_retention * 100:.0f}% retido)."
+        )
+    if a_tf.get("checkedAgainstRawInterval") and b_tstd >= 2.2 and a_subj_ret < 0.68:
+        hard_reject.append(
+            f"Atenuou o movimento nas áreas ativas do sujeito ({a_subj_ret * 100:.0f}% retido)."
+        )
+    if b_area >= 0.08 and active_area_retention < 0.65:
+        hard_reject.append(
+            f"Encolheu a área visual ativa em movimento ({active_area_retention * 100:.0f}% retida)."
+        )
+    if b_fp95 >= 0.55 and flow_p95_retention < 0.62:
+        hard_reject.append(
+            f"Reduziu a velocidade de pico do fluxo óptico ({flow_p95_retention * 100:.0f}% retida)."
+        )
 
     def _perceptual_cost(rep: dict) -> float:
         rm = rep["metrics"]
         fc = rm["flowContinuity"]
         tk_r = rm.get("trajectoryKinematics") or {}
+        tf_r = rm.get("temporalFidelity") or {}
         dir_pen = (
             (1.0 - max(-1.0, min(1.0, float(fc["seamDirectionCosine"])))) * 1.15
             + float(fc["seamOppositeFraction"]) * 2.10
@@ -1467,11 +1847,13 @@ def compare_before_after(before: dict, after: dict) -> dict:
             + max(0.0, float(tk_r.get("tailPoseReversalSeverity", 0.0)) - 0.8) * 0.22
             + max(0.0, float((rm["visualSimilarity"]).get("localSeamExcess", 0.0)) - 0.35) * 0.45
         )
+        motion_pen = max(0.0, 9.0 - float(tf_r.get("motionFidelityScore", 10.0))) * 0.45
         return (
             float(rm["visualSimilarity"]["seamRatio"])
             + float(fc["flowErrorRatio"]) * 0.60
             + dir_pen
             + traj_pen
+            + motion_pen
             + float(rm["velocityContinuity"]["relativeJump"]) * 0.85
             + max(0.0, float(rm["edgeConsistency"]["edgeRatio"]) - 1.0) * 0.60
             + float(rm["ghosting"]["score"]) * 2.00
@@ -1500,6 +1882,7 @@ def check_prohibited_artifacts(eval_report: dict, *, strategy_used: str | None =
     Prohibited approvals:
       - ping-pong / artificial reversal
       - disguised freeze / duplicate stall / frozen static scene
+      - artificial elimination or severe damping of original motion
       - gross ghosting / destructive crossfade (strategy-aware — Intervention 06)
       - excessive blur / texture loss
       - protected-region deformation
@@ -1515,11 +1898,24 @@ def check_prohibited_artifacts(eval_report: dict, *, strategy_used: str | None =
     rv = m.get("reversals") or {}
     fz = m.get("freezes") or {}
     tk = m.get("trajectoryKinematics") or {}
+    tf = m.get("temporalFidelity") or {}
     issues = list(eval_report.get("issues") or [])
 
     violations: list[str] = []
     if any("praticamente estática" in iss for iss in issues):
         violations.append("Cena congelada / praticamente estática (sem movimento real no ciclo).")
+    if tf.get("intrinsicMotionStarved"):
+        violations.append("Atividade temporal insuficiente (movimento quase imperceptível).")
+    if tf.get("reconstructionSeverelyDamped"):
+        violations.append(
+            f"Reconstrução eliminou severamente o movimento original "
+            f"(excursão retida {float(tf.get('rawToOutputExcursionRetention', 0.0)) * 100:.0f}%)."
+        )
+    if tf.get("sourceSeverelyStarved"):
+        violations.append(
+            f"Trecho sem fidelidade temporal frente à fonte "
+            f"(excursão {float(tf.get('sourceExcursionRetention', 0.0)) * 100:.0f}% da mediana original)."
+        )
     if rv.get("detected"):
         violations.append("Inversão artificial / efeito ping-pong detectado.")
     if fz.get("detected"):
@@ -1562,6 +1958,7 @@ def classify_loop_verdict(
     issues = list(eval_report.get("issues") or [])
     m = eval_report.get("metrics") or {}
     dds_d = m.get("ddsDelta") or {}
+    tf = m.get("temporalFidelity") or {}
     within_budget = bool(dds_d.get("withinBudget", True))
     distinct = int(dds_d.get("distinctFrames", eval_report.get("frames", 0)))
     ten_ok = bool(ten_cycle.get("continuousTenCyclePass", False)) if ten_cycle else bool(eval_report.get("passed"))
@@ -1580,11 +1977,11 @@ def classify_loop_verdict(
             "summary": prohibited["violations"][0],
             "prohibited": prohibited,
         }
-    if eval_report.get("passed") and ten_ok and len(issues) == 0:
+    if eval_report.get("passed") and ten_ok and len(issues) == 0 and not tf.get("motionStarved"):
         return {
             "verdict": "APROVADO",
             "approved": True,
-            "summary": "Loop contínuo aprovado após codificação DXT1a real e auditoria de 10 ciclos.",
+            "summary": "Loop contínuo aprovado após codificação DXT1a real, fidelidade temporal e auditoria de 10 ciclos.",
             "prohibited": prohibited,
         }
     return {
@@ -1592,7 +1989,7 @@ def classify_loop_verdict(
         "approved": False,
         "summary": (
             f"Resultado condicional pós-DDS ({len(issues)} alerta(s)): "
-            + (issues[0] if issues else "inspecione a junção antes de aplicar.")
+            + (issues[0] if issues else "inspecione a junção e a fidelidade temporal antes de aplicar.")
         ),
         "prohibited": prohibited,
     }

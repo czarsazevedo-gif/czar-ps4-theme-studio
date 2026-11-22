@@ -844,6 +844,68 @@ def analyze_levels(
             }
         )
 
+    # ==================== SOURCE MOTION PROFILE (TEMPORAL FIDELITY BASELINE) ====================
+    rgb_f32 = rgb.astype(np.float32)
+    t_std_map = rgb_f32.std(axis=0).mean(axis=-1)  # (h, w)
+    cy0, cy1 = int(h * 0.15), max(int(h * 0.15) + 1, int(h * 0.80))
+    cx0, cx1 = int(w * 0.20), max(int(w * 0.20) + 1, int(w * 0.80))
+    focal_std_map = t_std_map[cy0:cy1, cx0:cx1]
+    p75_std = float(np.percentile(t_std_map, 75))
+    subj_mask = t_std_map >= max(2.5, p75_std)
+    active_subj_std = float(t_std_map[subj_mask].mean()) if subj_mask.any() else float(t_std_map.mean())
+
+    # Sliding ~2.0s local window temporal std so sub-clips are fairly benchmarked against typical local activity
+    win_n = min(n, max(4, int(round(2.0 / max(dt, 1e-4)))))
+    win_stride = max(1, win_n // 3)
+    win_stds: list[float] = []
+    win_focal_stds: list[float] = []
+    win_active_fracs: list[float] = []
+    if n >= win_n:
+        for i0 in range(0, n - win_n + 1, win_stride):
+            seg_f = rgb_f32[i0 : i0 + win_n]
+            wmap = seg_f.std(axis=0).mean(axis=-1)
+            win_stds.append(float(wmap.mean()))
+            win_focal_stds.append(float(wmap[cy0:cy1, cx0:cx1].mean()))
+            win_active_fracs.append(float((wmap > 2.5).mean()))
+    if not win_stds:
+        win_stds = [float(t_std_map.mean())]
+        win_focal_stds = [float(focal_std_map.mean())]
+        win_active_fracs = [float((t_std_map > 2.5).mean())]
+
+    scale_to_180 = 180.0 / float(max(h, 1))
+    valid_fm = flow_mag[valid_t]
+    flow_p95_180 = float(np.percentile(valid_fm, 95) * scale_to_180) if len(valid_fm) else 0.0
+    focal_fm = valid_fm[:, cy0:cy1, cx0:cx1] if len(valid_fm) else valid_fm
+    focal_flow_p95_180 = float(np.percentile(focal_fm, 95) * scale_to_180) if len(focal_fm) else 0.0
+    flow_active_frac = float(((valid_fm * scale_to_180) > 0.30).mean()) if len(valid_fm) else 0.0
+
+    wrap_mae_full = float(np.abs(rgb_f32[-1] - rgb_f32[0]).mean())
+    full_wrap_ratio = float(wrap_mae_full / max(med_mae, 0.5))
+    source_motion_profile = {
+        "temporalStdMean": round(float(t_std_map.mean()), 4),
+        "temporalStdP90": round(float(np.percentile(t_std_map, 90)), 4),
+        "focalTemporalStdMean": round(float(focal_std_map.mean()), 4),
+        "activeSubjectStdMean": round(active_subj_std, 4),
+        "localWindowSec": round(win_n * dt, 3),
+        "localWindowStdMedian": round(float(np.median(win_stds)), 4),
+        "localWindowStdP85": round(float(np.percentile(win_stds, 85)), 4),
+        "localWindowStdMin": round(float(np.min(win_stds)), 4),
+        "localFocalStdMedian": round(float(np.median(win_focal_stds)), 4),
+        "localFocalStdP85": round(float(np.percentile(win_focal_stds, 85)), 4),
+        "localActiveAreaMedian": round(float(np.median(win_active_fracs)), 4),
+        "medianStepMae": round(med_mae, 4),
+        "p90StepMae": round(float(np.percentile(frame_mae, 90)), 4),
+        "flowP95Norm180": round(flow_p95_180, 4),
+        "focalFlowP95Norm180": round(focal_flow_p95_180, 4),
+        "activeAreaFraction": round(float((t_std_map > 2.5).mean()), 4),
+        "focalActiveAreaFraction": round(float((focal_std_map > 2.5).mean()), 4),
+        "flowActiveAreaFraction": round(flow_active_frac, 4),
+        "fullVideoWrapMae": round(wrap_mae_full, 4),
+        "fullVideoWrapRatio": round(full_wrap_ratio, 4),
+        "isSeamlessFullSource": bool(full_wrap_ratio <= 1.35 and not cuts and not ping_pong and not is_static),
+        "transientPlusPhotometricFraction": round(float(transient_frac + photometric_frac), 4),
+    }
+
     # Overall classification prefers highest-capability resolution verdict (640x360 has largest budget)
     priority = [CLASS_NATURAL, CLASS_SYNTHESIS, CLASS_REGIONAL, CLASS_CORRECTABLE, CLASS_UNSUITABLE]
     best_res = min(per_resolution, key=lambda r: priority.index(r["classification"]))
@@ -856,6 +918,7 @@ def analyze_levels(
         "confidenceLabel": "forte" if best_res["confidence"] >= 0.72 else ("moderada" if best_res["confidence"] >= 0.45 else "limitada"),
         "reasons": best_res["reasons"],
         "source": source_info,
+        "sourceMotionProfile": source_motion_profile,
         "levelA": level_a,
         "levelB": level_b,
         "levelC": level_c,

@@ -26,12 +26,13 @@ from .regions import RegionalRecipe
 
 def _score_candidate_for_profile(
     cand: dict[str, Any],
-    profile_id: str,
+    profile_id: str | dict[str, Any],
     *,
     source_duration: float = 10.0,
     used_intervals: list[tuple[float, float, int]] | None = None,
 ) -> float:
-    """Profile-specific multi-objective ranking with perceptual duration floor, RAF smoothness & Pareto boost."""
+    """Profile-specific multi-objective ranking with perceptual duration floor, motion fidelity, RAF smoothness & Pareto boost."""
+    pid = str(profile_id["id"]) if isinstance(profile_id, dict) else str(profile_id)
     costs = cand.get("costs") or {}
     total_cost = float(costs.get("totalCost", 10.0))
     seam_ratio = float(costs.get("seamRatio", 2.0))
@@ -46,6 +47,22 @@ def _score_candidate_for_profile(
     accel_ratio = float(costs.get("accelRatio", 1.2))
     pareto_bonus = 0.35 if cand.get("paretoFrontier") else 0.0
     hard_veto = -4.5 if costs.get("hasHardDefect") else 0.0
+
+    # Temporal motion fidelity term: prevent dead/low-motion windows from winning purely via high int_ssim!
+    motion_term = 0.0
+    if costs.get("motionFidelityScore") is not None:
+        mf_sc = float(costs["motionFidelityScore"])
+        src_exc = float(costs.get("sourceExcursionRetention", 1.0))
+        src_foc = float(costs.get("sourceFocalRetention", 1.0))
+        m_starved = bool(costs.get("motionStarved", False))
+        motion_term = (
+            (mf_sc / 10.0) * 2.4
+            + min(1.2, max(0.0, src_exc - 0.85) * 1.4)
+            + min(1.0, max(0.0, src_foc - 0.85) * 1.2)
+            - max(0.0, 0.78 - src_exc) * 4.5
+            - max(0.0, 0.76 - src_foc) * 3.0
+            - (3.6 if m_starved else 0.0)
+        )
 
     # Intervention 01 (CZAR-ABS-AUD-006): quadratic perceptual floor for micro-loops when source allows >= 2.0s
     micro_pen = 0.0
@@ -92,16 +109,17 @@ def _score_candidate_for_profile(
                 base_dup = 1.65 if cand.get("_crossPool") else (0.95 if abs(frames - ucnt) <= 2 else 0.55)
                 dup_pen = max(dup_pen, base_dup)
 
-    if profile_id == "quality":
+    if pid == "quality":
         # Proposta 1 (720p, <=13..16 frames): prioritize visual fidelity + clean motion at >= 6 FPS (1.0-2.2s sweet spot)
         over_dur_pen = 0.15 if (dir_cos >= 0.55 and seam_ratio <= 1.15) else 0.45
         sweet_dur = min(dur, 2.4) * 0.65 - max(0.0, dur - 2.6) * over_dur_pen
         return (
-            seam_ssim * 2.6
-            + int_ssim * 1.35
+            seam_ssim * 2.4
+            + int_ssim * 1.10
             + dir_cos * 1.45
             + min(fps, 12.0) / 12.0 * 1.25
             + sweet_dur
+            + motion_term
             + pareto_bonus
             + hard_veto
             - seam_ratio * 1.25
@@ -116,15 +134,16 @@ def _score_candidate_for_profile(
             - cross_pen
             - dup_pen
         )
-    if profile_id == "flexibility":
+    if pid == "flexibility":
         # Proposta 3 (360p, <=48 frames): prioritize continuity, frame count, temporal regularity & longer cycle
         return (
-            min(frames / 48.0, 1.0) * 2.1
-            + min(dur, 4.0) / 4.0 * 1.9
+            min(frames / 48.0, 1.0) * 2.2
+            + min(dur, 4.0) / 4.0 * 1.95
             + min(fps, 20.0) / 20.0 * 1.15
             + dir_cos * 1.25
-            + seam_ssim * 1.25
-            + int_ssim * 0.85
+            + seam_ssim * 1.20
+            + int_ssim * 0.75
+            + motion_term
             + pareto_bonus
             + hard_veto
             - seam_ratio * 1.05
@@ -141,12 +160,13 @@ def _score_candidate_for_profile(
         )
     # "balance" (540p, <=24 frames): natural movement, balanced continuity, duration (1.6-3.2s) & definition
     return (
-        seam_ssim * 2.1
-        + int_ssim * 1.15
+        seam_ssim * 2.0
+        + int_ssim * 0.95
         + dir_cos * 1.45
-        + min(dur, 3.0) / 3.0 * 1.45
-        + min(frames / 24.0, 1.0) * 0.95
+        + min(dur, 3.0) / 3.0 * 1.55
+        + min(frames / 24.0, 1.0) * 1.40
         + min(fps, 15.0) / 15.0 * 0.90
+        + motion_term
         + pareto_bonus
         + hard_veto
         - seam_ratio * 1.10
@@ -186,6 +206,9 @@ def _adapt_candidate_to_profile(
         n = max(4, min(n, distinct_gif))
     while n > 4 and n * dds_bytes_for(*size) > RAF_SIZE_LIMIT:
         n -= 1
+    # Never adapt a long 540p/360p interval down to a sub-5.5 FPS 720p cross-pool slideshow!
+    if size[0] >= 1280 and (span / float(max(n, 1))) > 0.185:
+        return None
     opt = optimize_wait_scipy(span, n, grid_sec=WAIT_GRID_SEC)
     wait = float(min(MAX_WAIT_SECONDS, max(MIN_WAIT_SECONDS, opt["snappedWaitSec"])))
     if not (0.78 <= opt["speedRatioAtSnapped"] <= 1.25):
@@ -321,6 +344,7 @@ def _compact_metrics_summary(render_report: dict[str, Any]) -> dict[str, Any]:
     gh = m.get("ghosting") or {}
     fl = m.get("flicker") or {}
     tk = m.get("trajectoryKinematics") or {}
+    tf = m.get("temporalFidelity") or {}
     dds_d = m.get("ddsDelta") or {}
     ctq = dds_d.get("compressedTemporalQuality") or {}
     ten = render_report.get("tenCycleAudit") or {}
@@ -346,6 +370,16 @@ def _compact_metrics_summary(render_report: dict[str, Any]) -> dict[str, Any]:
         "definitiveLoopScore": tk.get("definitiveLoopScore"),
         "kltMaxStepBurstRatio": tk.get("kltMaxStepBurstRatio"),
         "tailPoseReversalSeverity": tk.get("tailPoseReversalSeverity"),
+        "motionFidelityScore": tf.get("motionFidelityScore"),
+        "temporalStdMean": tf.get("temporalStdMean"),
+        "focalTemporalStdMean": tf.get("focalTemporalStdMean"),
+        "activeAreaFraction": tf.get("activeAreaFraction"),
+        "rawToOutputExcursionRetention": tf.get("rawToOutputExcursionRetention"),
+        "sourceExcursionRetention": tf.get("sourceExcursionRetention"),
+        "sourceFocalRetention": tf.get("sourceFocalRetention"),
+        "nearDuplicatePairs": tf.get("nearDuplicatePairs"),
+        "motionStarved": bool(tf.get("motionStarved", False)),
+        "independentAxes": m.get("independentAxes"),
         "issues": list(ev.get("issues") or []),
     }
 
@@ -373,16 +407,23 @@ def _build_proposal_tradeoffs(
         advantages.append(f"Maior margem temporal ({rend['frames']} quadros · {rend['duration']:.2f}s no teto de 6 MiB)")
 
     if metrics.get("definitiveLoopScore") is not None:
+        mf_part = (
+            f" · Movimento {float(metrics['motionFidelityScore']):.1f}/10"
+            if metrics.get("motionFidelityScore") is not None
+            else ""
+        )
         advantages.append(
             f"Nota Definitiva {float(metrics['definitiveLoopScore']):.2f}/10 "
-            f"(O-KTCS {float(metrics.get('ouroborosKtcsScore') or 0):.2f} vs KLT {float(metrics.get('independentKltScore') or 0):.2f})"
+            f"(O-KTCS {float(metrics.get('ouroborosKtcsScore') or 0):.2f} vs KLT {float(metrics.get('independentKltScore') or 0):.2f}{mf_part})"
         )
     elif metrics["passed"] and metrics["tenCyclePass"]:
         advantages.append("Validado pós-DDS e estável ao longo de 10 ciclos contínuos")
     elif metrics["seamSsim"] >= 0.90:
         advantages.append(f"Emenda visual discreta (SSIM {metrics['seamSsim']:.3f})")
 
-    if metrics["ddsMeanPsnr"] is not None and float(metrics["ddsMeanPsnr"]) >= 38.0:
+    if metrics.get("motionFidelityScore") is not None and float(metrics["motionFidelityScore"]) >= 8.5 and not metrics.get("motionStarved"):
+        advantages.append(f"Movimento original preservado ({float(metrics['motionFidelityScore']):.1f}/10)")
+    elif metrics["ddsMeanPsnr"] is not None and float(metrics["ddsMeanPsnr"]) >= 38.0:
         advantages.append(f"Alta fidelidade pós-DXT1a ({float(metrics['ddsMeanPsnr']):.1f} dB)")
     if plan.get("phaseLocked"):
         advantages.append("Fechamento travado na fase exata do quadro nativo")
@@ -392,6 +433,8 @@ def _build_proposal_tradeoffs(
     elif profile_id == "flexibility":
         limitations.append("Menor resolução espacial (640×360) quando ampliada na tela inteira")
 
+    if metrics.get("motionStarved"):
+        limitations.append("Atividade temporal reduzida frente à fonte original")
     if rend["fps"] < 6.0:
         limitations.append(f"Cadência baixa ({rend['fps']:.1f} FPS) para caber no teto RAF")
     if rend["duration"] < 1.2:
@@ -444,6 +487,7 @@ def generate_three_proposals(
         or source_duration
     )
     src_fps = float((analysis.get("sentinela") or {}).get("source", {}).get("fps") or 12.0)
+    source_motion_profile = (analysis.get("sentinela") or {}).get("sourceMotionProfile")
 
     proposals: list[dict[str, Any]] = []
     profile_reports: dict[str, dict[str, Any]] = {}
@@ -474,6 +518,7 @@ def generate_three_proposals(
             finish_enabled=True,
             stabilize_camera=stabilize_camera,
             source_sha256=sha,
+            source_motion_profile=source_motion_profile,
             progress=lambda stg, pct, bp=base_pct, t=prof["shortTitle"]: progress(
                 f"{t}: {stg}", min(95, bp + int(pct * 0.16))
             ),
@@ -557,23 +602,28 @@ def generate_three_proposals(
         _clear_flow_cache()
         _gc.collect()
 
-    # Pick recommended proposal honestly: verdict & 10-cycle pass first, then Definitive Loop Score
-    # (O-KTCS x INDEP-KLT), seam fidelity, and slight preference for crisp 720p/540p over 360p.
-    def _rec_sort(p: dict[str, Any]) -> tuple[int, int, float, float]:
+    # Pick recommended proposal honestly: verdict, non-starved motion, & 10-cycle pass first,
+    # then Definitive Loop Score + Motion Fidelity + seam fidelity.
+    def _rec_sort(p: dict[str, Any]) -> tuple[int, int, int, float, float]:
         m = p["metrics"]
         def_score = m.get("definitiveLoopScore")
         def_norm = float(def_score) / 10.0 if def_score is not None else float(m["seamSsim"])
+        mf_score = m.get("motionFidelityScore")
+        mf_norm = float(mf_score) / 10.0 if mf_score is not None else 1.0
+        not_starved = 0 if m.get("motionStarved") else 1
         res_bonus = 0.04 if p["profileId"] in {"quality", "balance"} else 0.0
         bal_bonus = 0.02 if p["profileId"] == "balance" else 0.0
         composite = (
-            def_norm * 0.65
-            + float(m["seamSsim"]) * 0.25
-            - float(m["seamRatio"]) * 0.20
+            def_norm * 0.55
+            + mf_norm * 0.25
+            + float(m["seamSsim"]) * 0.20
+            - float(m["seamRatio"]) * 0.18
             + res_bonus
             + bal_bonus
         )
         return (
             _verdict_rank(p["verdict"]),
+            not_starved,
             1 if m["tenCyclePass"] else 0,
             composite,
             float(p["duration"]),

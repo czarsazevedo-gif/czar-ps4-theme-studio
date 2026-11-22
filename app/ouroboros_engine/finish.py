@@ -219,6 +219,7 @@ def apply_deluxe_finish(
     *,
     protected_mask: np.ndarray | None = None,
     reference_frames: Sequence[np.ndarray] | np.ndarray | None = None,
+    source_motion_profile: dict | None = None,
     backend: str = DEFAULT_OUROBOROS_BC1_BACKEND,
     enable_dither: bool = True,
     enable_flicker_fix: bool = True,
@@ -248,7 +249,15 @@ def apply_deluxe_finish(
     base_res = (
         precomputed_baseline
         if precomputed_baseline is not None
-        else evaluate_post_dds(src, wait, protected_mask=prot_eval, reference_frames=ref, backend=backend, return_blobs=True)
+        else evaluate_post_dds(
+            src,
+            wait,
+            protected_mask=prot_eval,
+            reference_frames=ref,
+            source_motion_profile=source_motion_profile,
+            backend=backend,
+            return_blobs=True,
+        )
     )
     base_eval = base_res["report"]
     best_frames = src
@@ -262,7 +271,13 @@ def apply_deluxe_finish(
     def _try_stage(stage_name: str, candidate_frames: np.ndarray, *, prefer_banding: bool = False) -> None:
         nonlocal best_frames, best_eval, best_blobs, best_decoded
         res = evaluate_post_dds(
-            candidate_frames, wait, protected_mask=prot_eval, reference_frames=ref, backend=backend, return_blobs=True
+            candidate_frames,
+            wait,
+            protected_mask=prot_eval,
+            reference_frames=ref,
+            source_motion_profile=source_motion_profile,
+            backend=backend,
+            return_blobs=True,
         )
         cand_eval = res["report"]
         cmp = compare_before_after(best_eval, cand_eval)

@@ -132,11 +132,45 @@ def estimate_2d_flow_field(
     pv_mags = np.hypot(pair_vecs[:, 0], pair_vecs[:, 1])
     temp_coh = float(np.hypot(pair_vecs[:, 0].sum(), pair_vecs[:, 1].sum()) / max(float(pv_mags.sum()), 1e-6))
 
+    # Measure how well steady Eulerian advection actually explains frame-to-frame changes
+    # (high for drifting clouds/water; low for crackling lightning, character expressions, or stochastic dynamics)
+    hs, ws = work.shape[1:3]
+    steady_s = (
+        np.stack(
+            [
+                cv2.resize(steady[..., 0], (ws, hs), interpolation=cv2.INTER_AREA) * float(scale),
+                cv2.resize(steady[..., 1], (ws, hs), interpolation=cv2.INTER_AREA) * float(scale),
+            ],
+            axis=-1,
+        )
+        if steady.shape[:2] != (hs, ws)
+        else steady
+    )
+    yy_s, xx_s = np.mgrid[0:hs, 0:ws].astype(np.float32)
+    step_s = max(1, min(3, n - 2, int(round(1.5 / max(p90_speed * float(scale), 0.35)))))
+    map_x = np.clip(xx_s - steady_s[..., 0] * float(step_s), 0.0, ws - 1.0).astype(np.float32)
+    map_y = np.clip(yy_s - steady_s[..., 1] * float(step_s), 0.0, hs - 1.0).astype(np.float32)
+    act_s = cv2.resize(active_mask, (ws, hs), interpolation=cv2.INTER_NEAREST) > 0.5 if active_mask.shape != (hs, ws) else (active_mask > 0.5)
+    expl_vals: list[float] = []
+    valid_starts = [idx for idx in pair_indices if idx + step_s < n]
+    for idx in valid_starts[:: max(1, len(valid_starts) // 6)]:
+        pred = cv2.remap(work[idx], map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+        if act_s.any():
+            raw_e = float(np.abs(work[idx + step_s][act_s].astype(np.float32) - work[idx][act_s].astype(np.float32)).mean())
+            adv_e = float(np.abs(work[idx + step_s][act_s].astype(np.float32) - pred[act_s].astype(np.float32)).mean())
+        else:
+            raw_e = float(np.abs(work[idx + step_s].astype(np.float32) - work[idx].astype(np.float32)).mean())
+            adv_e = float(np.abs(work[idx + step_s].astype(np.float32) - pred.astype(np.float32)).mean())
+        if raw_e > 0.4:
+            expl_vals.append(float(np.clip(1.0 - adv_e / raw_e, -0.5, 1.0)))
+    adv_explain = float(np.median(expl_vals)) if expl_vals else 0.0
+
     stats = {
         "meanSpeedPx": round(mean_speed, 4),
         "p90SpeedPx": round(p90_speed, 4),
         "spatialCoherence": round(coherence, 4),
         "temporalCoherence": round(temp_coh, 4),
+        "advectionExplainability": round(adv_explain, 4),
         "meanVec": [round(float(u_s.mean()), 4), round(float(v_s.mean()), 4)],
         "activeFraction": round(float(sel.mean()), 4),
     }
@@ -323,11 +357,14 @@ def synthesize_periodic_2d(
 
     scaled_flow = flow_field.astype(np.float32) * float(speed_scale)
     max_sp = float(np.percentile(np.hypot(scaled_flow[..., 0][active], scaled_flow[..., 1][active]), 90)) if active.any() else 1.0
-    max_safe_span = (0.44 * min(h, w)) / max(max_sp, 1.0)
-    if cycle_steps is not None:
-        span = float(min(float(cycle_steps), 7.5, max(4.0, max_safe_span)))
-    else:
-        span = float(np.clip(float(n_frames), 4.0, min(7.5, max(4.0, max_safe_span))))
+    # Bound per-plate advection displacement to frame geometry WITHOUT slowing down physical per-frame velocity!
+    # When target total travel exceeds safe single-plate travel, subdivide into integer `k_cycles` phase handoffs
+    # so d(t_a)/di == (k_cycles / n_frames) * (target_total / k_cycles) == target_total / n_frames (1.0x speed!).
+    travel_cap_px = max(34.0, 0.24 * min(h, w))
+    max_handoff_span = float(np.clip(travel_cap_px / max(max_sp, 0.45), 8.0, 18.0))
+    target_total = max(4.0, float(cycle_steps)) if cycle_steps is not None else float(n_frames)
+    k_cycles = max(1, int(math.ceil(target_total / max(max_handoff_span, 8.0))))
+    span = float(target_total / float(k_cycles))
 
     if base_frame_b is not None:
         base_b = np.asarray(base_frame_b, dtype=np.uint8)
@@ -348,14 +385,14 @@ def synthesize_periodic_2d(
             use_exact_wrap = True
             u_sign = 1.0 if float(scaled_flow[..., 0][active].mean()) >= 0 else -1.0
             nat_travel = abs(float(scaled_flow[..., 0][active].mean())) * n_frames
-            k_cycles = max(1, int(round(nat_travel / px)))
-            wrap_step = (u_sign * k_cycles * px) / float(n_frames)
+            k_wrap = max(1, int(round(nat_travel / px)))
+            wrap_step = (u_sign * k_wrap * px) / float(n_frames)
         elif py > 0 and v_std < 0.35 and abs(float(scaled_flow[..., 0][active].mean())) < 0.2:
             use_exact_wrap = True
             v_sign = 1.0 if float(scaled_flow[..., 1][active].mean()) >= 0 else -1.0
             nat_travel = abs(float(scaled_flow[..., 1][active].mean())) * n_frames
-            k_cycles = max(1, int(round(nat_travel / py)))
-            wrap_step = (v_sign * k_cycles * py) / float(n_frames)
+            k_wrap = max(1, int(round(nat_travel / py)))
+            wrap_step = (v_sign * k_wrap * py) / float(n_frames)
 
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     u_m = float(scaled_flow[..., 0][active].mean()) if active.any() else 1.0
@@ -376,7 +413,7 @@ def synthesize_periodic_2d(
                 my = np.mod(yy - i * wrap_step, h).astype(np.float32)
             dyn = cv2.remap(base, mx, my, interpolation=cv2.INTER_CUBIC, borderMode=cv2.BORDER_WRAP)
         else:
-            phi_a = i / float(n_frames)
+            phi_a = (k_cycles * i / float(n_frames)) % 1.0
             phi_b = (phi_a + 0.5) % 1.0
             t_a = (phi_a - 0.5) * span
             t_b = (phi_b - 0.5) * span
@@ -426,6 +463,7 @@ def synthesize_genesis_supreme(
             "p90SpeedPx": round(float(np.percentile(mags, 90)), 4),
             "spatialCoherence": 1.0,
             "temporalCoherence": 1.0,
+            "advectionExplainability": 1.0,
             "meanVec": [
                 round(float(flow_field[..., 0][sel].mean()) if sel.any() else 0.0, 4),
                 round(float(flow_field[..., 1][sel].mean()) if sel.any() else 0.0, 4),
@@ -439,10 +477,8 @@ def synthesize_genesis_supreme(
         if flow_stats["temporalCoherence"] < 0.35:
             raise SynthesisRejected("A fonte apresenta reversão ou movimento incoerente para síntese unidirecional.")
 
-    # Preserve 1.0x measured physical velocity per frame while bounding half-cycle travel to frame geometry
-    h_s, w_s = base.shape[:2]
-    max_safe_span = (0.44 * min(h_s, w_s)) / max(float(flow_stats["p90SpeedPx"]) * float(speed_scale), 1.0)
-    cycle_steps = float(np.clip(float(n_frames), 4.0, min(28.0, max(4.0, max_safe_span)))) * float(speed_scale)
+    # Preserve exact 1.0x measured physical velocity per frame across any frame count (subdivided safely by k_cycles)
+    cycle_steps = max(4.0, float(n_frames)) * float(speed_scale)
 
     synthesized = synthesize_periodic_2d(
         base,

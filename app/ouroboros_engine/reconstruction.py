@@ -703,7 +703,7 @@ def level4_content_bridge_reconstruct(
     work = level2_photometric_harmonize(work, protected_mask=protected_mask)
     prot = None if protected_mask is None else _align_protected_dxt1(protected_mask)
 
-    bridge_k = min(6, max(2, n // 3))
+    bridge_k = min(10, max(2, n // 4))
     out = work.copy()
 
     # Estimate dominant motion vector across head & tail to align seam sweep strictly WITH the motion!
@@ -737,16 +737,26 @@ def level4_content_bridge_reconstruct(
             drift_mask[prot] = 0.0
         try:
             if _cached_flow_f is None:
-                _cached_flow_f, _ = estimate_2d_flow_field(work, protected_mask=prot)
+                _cached_flow_f, _flow_st = estimate_2d_flow_field(work, protected_mask=prot)
+                if (
+                    float(_flow_st.get("temporalCoherence", 0.0)) < 0.45
+                    or float(_flow_st.get("advectionExplainability", 0.0)) < 0.12
+                ):
+                    return bridged, 0.0
             if anchor_idx not in _cached_steady:
-                _cached_steady[anchor_idx] = synthesize_periodic_2d(
+                raw_steady = synthesize_periodic_2d(
                     work[anchor_idx],
                     _cached_flow_f,
                     n,
                     protected_mask=prot,
-                    cycle_steps=min(float(n), 6.0),
+                    cycle_steps=float(n),
                     align_dxt1_blocks=False,
                 )
+                # Find the exact frame in raw_steady matching work[anchor_idx] in phase (works for any k_cycles or exact wrap!)
+                best_match = int(
+                    np.argmin([float(cv2.absdiff(raw_steady[j], work[anchor_idx]).mean()) for j in range(n)])
+                )
+                _cached_steady[anchor_idx] = np.roll(raw_steady, anchor_idx - best_match, axis=0)
             steady_seq = _cached_steady[anchor_idx]
             res_full = bridged.copy()
             res_ramp = bridged.copy()
@@ -1103,6 +1113,7 @@ def reconstruct_best(
     protected_mask: np.ndarray | None = None,
     region_specs: list[dict] | None = None,
     sentinela_report: dict | None = None,
+    source_motion_profile: dict | None = None,
     stabilize_camera: bool = False,
     transient_mask: np.ndarray | None = None,
     verify_dds: bool = True,
@@ -1117,7 +1128,7 @@ def reconstruct_best(
     eval_fn = evaluate_post_dds if verify_dds else evaluate_loop
 
     # Level 1: Evaluate baseline first — only skip ladder when seam is already near-perfect globally and locally!
-    base_eval = eval_fn(src, wait, protected_mask=prot_eval)
+    base_eval = eval_fn(src, wait, protected_mask=prot_eval, source_motion_profile=source_motion_profile)
     base_vs = (base_eval.get("metrics") or {}).get("visualSimilarity") or {}
     if (
         base_eval["passed"]
@@ -1178,19 +1189,55 @@ def reconstruct_best(
         if l4_out_meta.get("applied"):
             candidates.append(("level4_content_bridge_lead_out", l4_out, l4_out_meta))
 
-    # Level 5: Anti-ghosting dynamic texture synthesis (dual-phase Eulerian advection with bounded travel <= 7.5)
-    try:
-        flow_f, f_stats = estimate_2d_flow_field(src, protected_mask=protected_mask)
-        if f_stats["p90SpeedPx"] >= 0.25 and f_stats["temporalCoherence"] >= 0.38:
-            h_s, w_s = src.shape[1:3]
-            max_safe_span = (0.44 * min(h_s, w_s)) / max(float(f_stats["p90SpeedPx"]), 1.0)
-            cyc = float(np.clip(float(n), 4.0, min(7.5, max(4.0, max_safe_span))))
-            l5 = synthesize_periodic_2d(
-                src[0], flow_f, n, base_frame_b=src[n // 2] if n >= 3 else None, protected_mask=protected_mask, cycle_steps=cyc, align_dxt1_blocks=True
-            )
-            candidates.append(("level5_dynamic_texture_synthesis", l5, {"flowStats": f_stats}))
-    except SynthesisRejected:
-        pass
+    # Level 5: Anti-ghosting dynamic texture synthesis (strictly gated to steady advectable fluid/cloud textures!)
+    # Never replace articulated character / stochastic lightning sequences with 2-plate steady advection.
+    lb_s = (sentinela_report or {}).get("levelB") or {}
+    trans_s = float(lb_s.get("transientFraction") or 0.0)
+    photo_s = float(lb_s.get("photometricFraction") or 0.0)
+    osc_s = float(lb_s.get("oscillatoryFraction") or 0.0)
+    prog_s = float(lb_s.get("progressiveFraction") or 0.0)
+    src_tp_frac = float((source_motion_profile or {}).get("transientPlusPhotometricFraction") or 0.0)
+    non_advectable_scene = bool(
+        trans_s >= 0.10
+        or src_tp_frac >= 0.28
+        or (photo_s + trans_s >= 0.28 and prog_s < 0.72)
+        or (osc_s >= 0.35 and prog_s < 0.65)
+    )
+    if not non_advectable_scene:
+        try:
+            flow_f, f_stats = estimate_2d_flow_field(src, protected_mask=protected_mask)
+            adv_expl = float(f_stats.get("advectionExplainability", 0.0))
+            if (
+                f_stats["p90SpeedPx"] >= 0.25
+                and f_stats["temporalCoherence"] >= 0.48
+                and adv_expl >= 0.16
+            ):
+                # Preserve exact 1.0x physical speed via multi-cycle handoff inside synthesize_periodic_2d
+                l5 = synthesize_periodic_2d(
+                    src[0],
+                    flow_f,
+                    n,
+                    base_frame_b=src[n // 2] if n >= 3 else None,
+                    protected_mask=protected_mask,
+                    cycle_steps=float(n),
+                    align_dxt1_blocks=True,
+                )
+                candidates.append(("level5_dynamic_texture_synthesis", l5, {"flowStats": f_stats, "cycleSteps": float(n)}))
+                if 9 < n <= 22:
+                    # Also evaluate smooth single-cycle handoff (<=8.5 steps) for clean cloud/water contours without KLT burst;
+                    # strict motion/excursion retention gates below ensure zero speed collapse!
+                    l5_smooth = synthesize_periodic_2d(
+                        src[0],
+                        flow_f,
+                        n,
+                        base_frame_b=src[n // 2] if n >= 3 else None,
+                        protected_mask=protected_mask,
+                        cycle_steps=8.5,
+                        align_dxt1_blocks=True,
+                    )
+                    candidates.append(("level5_dynamic_texture_synthesis", l5_smooth, {"flowStats": f_stats, "cycleSteps": 8.5}))
+        except SynthesisRejected:
+            pass
 
     # Level 6: Independent multi-region reconstruction
     if region_specs or (sentinela_report and sentinela_report.get("levelB", {}).get("hasMixedStaticDynamic")):
@@ -1210,15 +1257,32 @@ def reconstruct_best(
 
     base_static = any("praticamente estática" in iss for iss in (base_eval.get("issues") or []))
     for strat_name, cand_frames, strat_meta in candidates:
-        ev = eval_fn(cand_frames, wait, protected_mask=prot_eval, reference_frames=src)
+        ev = eval_fn(
+            cand_frames,
+            wait,
+            protected_mask=prot_eval,
+            reference_frames=src,
+            source_motion_profile=source_motion_profile,
+        )
         cmp_res = compare_before_after(base_eval, ev)
         cand_static = any("praticamente estática" in iss for iss in (ev.get("issues") or []))
         motion_ret = float((cmp_res.get("matrix") or {}).get("motionRetention", {}).get("after", 1.0))
+        excursion_ret = float((cmp_res.get("matrix") or {}).get("excursionRetention", {}).get("after", 1.0))
+        cand_tf = (ev.get("metrics") or {}).get("temporalFidelity") or {}
+        subj_ret = float(cand_tf.get("rawToOutputActiveSubjectRetention", 1.0))
         extra_reject = []
         if cand_static and not base_static:
             extra_reject.append("Reconstrução congelou a cena (resultado praticamente estático).")
-        if strat_name == "level6_multi_region" and motion_ret < 0.70:
-            extra_reject.append(f"Reconstrução regional reduziu o movimento excessivamente (retenção {motion_ret:.2f}).")
+        if strat_name in {"level5_dynamic_texture_synthesis", "level6_multi_region"}:
+            if motion_ret < 0.72:
+                extra_reject.append(
+                    f"{strat_name} reduziu a velocidade do movimento excessivamente (retenção {motion_ret:.2f})."
+                )
+            if excursion_ret < 0.75 or subj_ret < 0.72:
+                extra_reject.append(
+                    f"{strat_name} comprimiu a excursão temporal original "
+                    f"(excursão {excursion_ret:.2f}, sujeito {subj_ret:.2f})."
+                )
         accepted = bool(cmp_res["accepted"] and not extra_reject)
         hard_reasons = list(cmp_res["hardRejectReasons"]) + extra_reject
         attempts.append(
@@ -1251,7 +1315,13 @@ def reconstruct_best(
             ref_frames, ref_meta = ref_fn(best_frames, protected_mask=protected_mask)
             if not ref_meta.get("applied"):
                 continue
-            ev_ref = eval_fn(ref_frames, wait, protected_mask=prot_eval, reference_frames=src)
+            ev_ref = eval_fn(
+                ref_frames,
+                wait,
+                protected_mask=prot_eval,
+                reference_frames=src,
+                source_motion_profile=source_motion_profile,
+            )
             cmp_ref = compare_before_after(base_eval, ev_ref)
             cmp_vs_best = compare_before_after(best_eval, ev_ref)
             if (
