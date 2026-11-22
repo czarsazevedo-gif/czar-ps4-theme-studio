@@ -57,24 +57,29 @@ def _principal_axis(centered: np.ndarray, weights: np.ndarray | None) -> np.ndar
 
     `centered` es (N, 16, 3) ya restada la media; `weights` (N, 16) o None (cuando
     todo o quadro é opaco) pone en cero los pixeles transparentes.
+
+    Preserves exact upstream `einsum` / `linalg.norm` arithmetic inside the tiny
+    `(N, 3, 3)` power iteration so even degenerate blocks whose bounding-box
+    diagonal aligns with an unstable minor eigenvector remain 100% byte-identical
+    to upstream `Imxnxl/PS4-Ultimate-Theme-Creator`.
     """
     w = centered if weights is None else (centered * weights[..., None])
-    cov = np.matmul(w.transpose(0, 2, 1), w)  # (N, 3, 3)
+    cov = np.einsum("nij,nik->njk", w, w, optimize=True)  # (N, 3, 3)
 
     # Starting from the bounding box diagonal converges in a few rounds and
     # avoids the pathological case of an initial vector orthogonal to the axis.
     axis = w.max(axis=1) - w.min(axis=1)
-    norm = np.sqrt(np.sum(axis * axis, axis=1, keepdims=True))
+    norm = np.linalg.norm(axis, axis=1, keepdims=True)
     fallback = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    axis = np.where(norm > 1e-6, axis / np.maximum(norm, np.float32(1e-9)), fallback)
+    axis = np.where(norm > 1e-6, axis / np.maximum(norm, 1e-9), fallback)
 
     for _ in range(_POWER_ITERATIONS):
-        axis = np.matmul(cov, axis[..., None])[..., 0]
-        norm = np.sqrt(np.sum(axis * axis, axis=1, keepdims=True))
+        axis = np.einsum("nij,nj->ni", cov, axis, optimize=True)
+        norm = np.linalg.norm(axis, axis=1, keepdims=True)
         # Flat colour block: covariance is zero and the axis does not matter.
-        axis = np.where(norm > 1e-9, axis / np.maximum(norm, np.float32(1e-12)), fallback)
+        axis = np.where(norm > 1e-9, axis / np.maximum(norm, 1e-12), fallback)
 
-    return axis.astype(np.float32, copy=False)
+    return axis.astype(np.float32)
 
 
 def compress_dxt1a(rgba: np.ndarray) -> bytes:
