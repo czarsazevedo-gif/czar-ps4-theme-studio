@@ -555,14 +555,25 @@ def generate_three_proposals(
         _clear_flow_cache()
         _gc.collect()
 
-    # Pick recommended proposal honestly (best verdict first, then balance preference & lower seam ratio)
+    # Pick recommended proposal honestly: verdict & 10-cycle pass first, then Definitive Loop Score
+    # (O-KTCS x INDEP-KLT), seam fidelity, and slight preference for crisp 720p/540p over 360p.
     def _rec_sort(p: dict[str, Any]) -> tuple[int, int, float, float]:
-        is_bal = 1 if p["profileId"] == "balance" else 0
         m = p["metrics"]
+        def_score = m.get("definitiveLoopScore")
+        def_norm = float(def_score) / 10.0 if def_score is not None else float(m["seamSsim"])
+        res_bonus = 0.04 if p["profileId"] in {"quality", "balance"} else 0.0
+        bal_bonus = 0.02 if p["profileId"] == "balance" else 0.0
+        composite = (
+            def_norm * 0.65
+            + float(m["seamSsim"]) * 0.25
+            - float(m["seamRatio"]) * 0.20
+            + res_bonus
+            + bal_bonus
+        )
         return (
             _verdict_rank(p["verdict"]),
             1 if m["tenCyclePass"] else 0,
-            float(m["seamSsim"]) - float(m["seamRatio"]) * 0.35 + is_bal * 0.08,
+            composite,
             float(p["duration"]),
         )
 

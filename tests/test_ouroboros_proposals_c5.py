@@ -93,7 +93,7 @@ def _make_variable_delay_gif(path: Path, *, width: int = 240, height: int = 136)
     )
 
 
-def _poll_task(client: TestClient, pid: str, task_id: str, timeout: float = 120.0) -> dict:
+def _poll_task(client: TestClient, pid: str, task_id: str, timeout: float = 240.0) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         r = client.get(f"/api/ouroboros/jobs/{task_id}?project={pid}")
@@ -353,7 +353,9 @@ def test_playwright_touch_three_proposals_and_apply(tmp_path: Path) -> None:
             page.set_input_files("#anim-file", str(mp4))
 
             # 3. Wait for OUROBOROS to render all 3 proposal cards automatically!
-            page.wait_for_selector('#ouroboros-proposals .ob-card[data-profile="quality"]', timeout=120000)
+            # Checkpoints G/H/I (KLT kinematics, SE(2), Helmholtz-Hodge, Wavelet) take ~112-122s on CPU
+            # (measured on Linux VM: upload 1.11s + backend 122.14s + UI render 0.625s = 124.05s total).
+            page.wait_for_selector('#ouroboros-proposals .ob-card[data-profile="quality"]', timeout=240000)
             page.wait_for_selector('#ouroboros-proposals .ob-card[data-profile="balance"]', timeout=15000)
             page.wait_for_selector('#ouroboros-proposals .ob-card[data-profile="flexibility"]', timeout=15000)
 

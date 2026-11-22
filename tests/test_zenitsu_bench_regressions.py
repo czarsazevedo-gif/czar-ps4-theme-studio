@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
 from fastapi.testclient import TestClient
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from app import icon_mapper, jobs, main, projects
 from app.forge.pkg_router import _normalize_persisted_pkg_report
+from app.ouroboros_engine.metrics import evaluate_loop
 
 
 def _png_bytes(size: tuple[int, int] = (128, 128), rgba: tuple[int, int, int, int] = (200, 120, 40, 255)) -> bytes:
@@ -130,6 +133,47 @@ def test_slots_upload_batch_endpoint_and_conflict_409(tmp_path, monkeypatch):
         "ct:disc": "DiscoBrancoOut_refinado.png",
         "ct:discoverlay": "SobreposicaoDeDiscoBrancoOut_refinado.png",
     }
+
+
+def test_kinematics_distinguishes_closed_orbit_from_pause_jump_and_reversal():
+    def _render(angles: list[float]) -> np.ndarray:
+        w, h = 320, 180
+        frames = []
+        for ang in angles:
+            im = Image.new("RGB", (w, h), (12, 16, 28))
+            dr = ImageDraw.Draw(im)
+            for gx in range(0, w, 40):
+                dr.line((gx, 0, gx, h), fill=(26, 32, 48), width=1)
+            for gy in range(0, h, 40):
+                dr.line((0, gy, w, gy), fill=(26, 32, 48), width=1)
+            cx = int(round(w * 0.5 + 52.0 * math.cos(ang)))
+            cy = int(round(h * 0.5 + 42.0 * math.sin(ang)))
+            dr.ellipse((cx - 22, cy - 22, cx + 22, cy + 22), fill=(245, 210, 60), outline=(255, 255, 255), width=3)
+            dr.rectangle((cx - 6, cy - 12, cx + 6, cy + 12), fill=(40, 80, 220))
+            frames.append(np.asarray(im, dtype=np.uint8))
+        return np.stack(frames, axis=0)
+
+    n = 24
+    ang_ok = [2.0 * math.pi * i / n for i in range(n)]
+    ang_pause = ang_ok[:-4] + [ang_ok[-5]] * 4
+    ang_jump = [2.0 * math.pi * 0.65 * i / n for i in range(n)]
+    ang_rev = [math.pi * i / (n // 2) if i <= n // 2 else math.pi * (n - i) / (n // 2) for i in range(n)]
+
+    ev_ok = evaluate_loop(_render(ang_ok), 0.05, evaluate_dds=False)
+    ev_pause = evaluate_loop(_render(ang_pause), 0.05, evaluate_dds=False)
+    ev_jump = evaluate_loop(_render(ang_jump), 0.05, evaluate_dds=False)
+    ev_rev = evaluate_loop(_render(ang_rev), 0.05, evaluate_dds=False)
+
+    s_ok = ev_ok["metrics"]["trajectoryKinematics"]["definitiveLoopScore"]
+    s_pause = ev_pause["metrics"]["trajectoryKinematics"]["definitiveLoopScore"]
+    s_jump = ev_jump["metrics"]["trajectoryKinematics"]["definitiveLoopScore"]
+    s_rev = ev_rev["metrics"]["trajectoryKinematics"]["definitiveLoopScore"]
+
+    assert not ev_ok["issues"]
+    assert s_ok >= 7.0
+    assert ev_pause["issues"] and s_pause < s_ok - 1.5
+    assert ev_jump["issues"] and s_jump < s_ok - 1.5
+    assert ev_rev["issues"] and s_rev <= 5.2 and s_rev < s_ok - 1.5
 
 
 def test_forge_pkg_history_and_report_http_legacy_and_same_name_provenance(tmp_path, monkeypatch):

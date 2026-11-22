@@ -406,8 +406,14 @@ def _evaluate_kinematic_trajectories(
     independent_score = round(0.40 * ind_closure + 0.40 * ind_burst + 0.20 * ind_cad_dds, 2)
 
     raw_avg = 0.5 * (ouroboros_score + independent_score)
-    # Kinematic dominance cap: open trajectory or violent intra-cycle burst caps the definitive score honestly!
-    kin_cap = min(s_closure, ind_closure if surv_rate > 0.35 else s_closure) + 2.4
+    # Kinematic dominance cap: open trajectory or violent intra-cycle burst caps the definitive score honestly.
+    # For smooth closed orbits of rigid objects, Lagrangian KLT closure tracks the moving object accurately even
+    # when Eulerian grid cells do not cancel to zero, provided survival, seam SSIM, and step continuity are all clean.
+    if surv_rate >= 0.45 and ind_closure >= 8.2 and klt_burst <= 1.8 and float(seam_ssim) >= 0.90:
+        eff_closure = ind_closure
+    else:
+        eff_closure = min(s_closure, ind_closure if surv_rate > 0.35 else s_closure)
+    kin_cap = eff_closure + 2.4
     if klt_burst > 4.0:
         kin_cap = min(kin_cap, 10.0 - min(4.5, (klt_burst - 2.0) * 0.35))
     definitive_score = round(min(raw_avg, max(3.5, kin_cap)), 2)
@@ -843,6 +849,7 @@ def evaluate_loop(
         issues.append("Cena praticamente estática (ausência de movimento não indica bom loop).")
     if has_reversal:
         issues.append("Reversão estrutural / ping-pong detectada.")
+        traj_kin["definitiveLoopScore"] = round(min(float(traj_kin["definitiveLoopScore"]), 5.2), 2)
     if cut_indices:
         issues.append(f"Corte abrupto detectado nos índices {cut_indices}.")
     if freeze_indices:
@@ -1233,10 +1240,18 @@ def evaluate_post_dds(
         )
         raw_avg = 0.5 * (o_sc + i_sc)
         surv_r = float(tk.get("kltParticleSurvivalRate", 1.0))
-        kin_cap = min(sub["trajectoryClosure"], sub["independentClosure"] if surv_r > 0.35 else sub["trajectoryClosure"]) + 2.4
         k_burst = float(tk.get("kltMaxStepBurstRatio", 1.0))
+        s_ssim = float((post_report["metrics"].get("visualSimilarity") or {}).get("seamSsim", 0.0))
+        has_rev_post = bool((post_report["metrics"].get("reversals") or {}).get("detected", False))
+        if surv_r >= 0.45 and sub["independentClosure"] >= 8.2 and k_burst <= 1.8 and s_ssim >= 0.90:
+            eff_cl = sub["independentClosure"]
+        else:
+            eff_cl = min(sub["trajectoryClosure"], sub["independentClosure"] if surv_r > 0.35 else sub["trajectoryClosure"])
+        kin_cap = eff_cl + 2.4
         if k_burst > 4.0:
             kin_cap = min(kin_cap, 10.0 - min(4.5, (k_burst - 2.0) * 0.35))
+        if has_rev_post:
+            kin_cap = min(kin_cap, 5.2)
         tk["ouroborosKtcsScore"] = o_sc
         tk["independentKltScore"] = i_sc
         tk["definitiveLoopScore"] = round(min(raw_avg, max(3.5, kin_cap)), 2)
