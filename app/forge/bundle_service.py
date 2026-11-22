@@ -84,7 +84,9 @@ def resolve_theme_inputs_from_saved_project() -> dict:
 def assemble_theme_tree(
     work_dir: Path,
     params: dict,
-) -> tuple[Path, Path, pkg.PackageMeta, list[dict], BundleValidationReport]:
+    *,
+    validate: bool = True,
+) -> tuple[Path, Path, pkg.PackageMeta, list[dict], BundleValidationReport | None]:
     """Assemble full PS4 theme tree + binary param.sfo + theme.gp4 and run CZAR Bundle Validator."""
     from .. import main as app_main
 
@@ -198,7 +200,7 @@ def assemble_theme_tree(
     gp4_path = work_dir / "theme.gp4"
     gp4_path.write_text(pkg.build_gp4(meta, targets, content_dir.name), encoding="utf-8")
 
-    report = validate_theme_bundle(content_dir, meta=meta, gp4_path=gp4_path)
+    report = validate_theme_bundle(content_dir, meta=meta, gp4_path=gp4_path) if validate else None
     return content_dir, gp4_path, meta, included, report
 
 

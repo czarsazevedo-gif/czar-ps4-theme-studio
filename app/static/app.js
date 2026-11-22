@@ -2701,19 +2701,40 @@ async function forgeLoadHistory(checkActive = true) {
       return;
     }
     $("forge-history-card").hidden = false;
-    $("forge-history-list").innerHTML = items.map((it) => `
-      <div class="forge-history-row">
+    $("forge-history-list").innerHTML = items.map((it) => {
+      const shaShort = it.pkg_sha256 ? `SHA-256 ${it.pkg_sha256.slice(0, 12)}…` : `ID ${String(it.pkg_id || "").slice(0, 8)}`;
+      const revTag = it.project_revision != null ? ` · rev ${it.project_revision}` : "";
+      const isLeg = Boolean(it.legacy_unverified);
+      const isVerified = Boolean(it.structure_validated) && !isLeg && (
+        it.verification_level === "full_bundle_verified" || it.verification_level === "extracted_uncompared"
+      );
+      const verBadge = isLeg
+        ? "Pendente de revalidação (histórico legado sem verification_level)"
+        : isVerified
+          ? (it.verification_level === "full_bundle_verified"
+              ? "Validado (bundle 100% SHA-256)"
+              : "Extraído (sem bundle de referência)")
+          : (it.verification_level === "header_and_sc0_only"
+              ? "Incompleto (apenas cabeçalho/Sc0 · Image0 não extraído)"
+              : "Reprovado / não verificado");
+      const reasonLine = !isVerified && it.verification_reason
+        ? `<div class="dim" style="font-size:11px;color:var(--warn,#f59e0b)">${forgeEsc(it.verification_reason)}</div>`
+        : "";
+      return `
+      <div class="forge-history-row" data-pkg-id="${forgeEsc(it.pkg_id)}" data-verification-level="${forgeEsc(it.verification_level || "")}">
         <div>
           <b><code>${forgeEsc(it.pkg_name)}</code></b>
           <div class="dim" style="font-size:12px">
-            ${fmtBytes(it.pkg_bytes || 0)} · IRO_TAG ${forgeEsc(it.iro_tag_header ?? 2)}/${forgeEsc(it.iro_tag_sfo ?? 2)} · CATEGORY ${forgeEsc(it.category || "ac")} · ${it.structure_validated ? "Validado" : "Falhou"} · Pendente de teste físico
+            ${fmtBytes(it.pkg_bytes || 0)} · <code>${forgeEsc(shaShort)}</code>${forgeEsc(revTag)} · IRO_TAG ${forgeEsc(it.iro_tag_header ?? 2)}/${forgeEsc(it.iro_tag_sfo ?? 2)} · CATEGORY ${forgeEsc(it.category || "ac")} · ${forgeEsc(verBadge)} · ${isVerified ? "Pendente de teste físico" : "Revalidação necessária"}
           </div>
+          ${reasonLine}
         </div>
         <div class="forge-history-actions">
           <a class="btn btn-ghost" href="${Projects.mediaUrl(it.download)}" download="${forgeEsc(it.pkg_name)}">Baixar</a>
           <button type="button" class="btn btn-ghost" onclick="forgeOpenReport('${forgeEsc(it.pkg_id)}')">Relatório</button>
         </div>
-      </div>`).join("");
+      </div>`;
+    }).join("");
 
     if (items[0]?.pkg_id && (!forgeState.lastPkg || (!forgeState.busy && forgeState.lastPkg.pkg_id !== items[0].pkg_id))) {
       try {
@@ -2724,8 +2745,12 @@ async function forgeLoadHistory(checkActive = true) {
           report_url: items[0].report_url,
         };
         if (rep.bundle_report) forgeState.lastValidation = rep.bundle_report;
-        if (rep.pkg_report?.structure_validated && !forgeState.busy) {
-          forgeSetStatus("PENDENTE DE TESTE FÍSICO");
+        const latestVerified = Boolean(rep.pkg_report?.structure_validated)
+          && !rep.pkg_report?.legacy_unverified
+          && (rep.pkg_report?.verification_level === "full_bundle_verified"
+              || rep.pkg_report?.verification_level === "extracted_uncompared");
+        if (!forgeState.busy) {
+          forgeSetStatus(latestVerified ? "PENDENTE DE TESTE FÍSICO" : "PRONTO");
         }
       } catch { /* ignore transient history report fetch */ }
     }
@@ -2763,12 +2788,17 @@ async function forgeOpenReport(pkgId = "") {
     const cmpText = pr.bundle_compared
       ? (pr.bundle_hashes_matched ? "100% correspondente (SHA-256)" : "Divergente do bundle")
       : (pr.image0_extracted ? "Image0 extraído (sem bundle de referência)" : "Image0 não extraído");
+    const verText = pr.legacy_unverified
+      ? "Pendente de revalidação (histórico legado sem verification_level)"
+      : forgeVerificationLabel(pr.verification_level);
     parts.push(`
       <div class="forge-report-kv">
         <div><span>PACOTE GERADO</span><b>${pr.pkg_created ? "Sim" : "Não"}</b></div>
-        <div><span>PACOTE VALIDADO ESTRUTURALMENTE</span><b>${pr.structure_validated ? "Sim" : "Não"}</b></div>
+        <div><span>PACOTE VALIDADO ESTRUTURALMENTE</span><b>${pr.structure_validated && !pr.legacy_unverified ? "Sim" : "Não"}</b></div>
         <div><span>PACOTE TESTADO NO PS4</span><b>${pr.physical_compatibility === "verified" ? "Sim" : "Pendente (PS4 Slim 12.52)"}</b></div>
-        <div><span>NÍVEL DE VERIFICAÇÃO</span><b>${forgeEsc(forgeVerificationLabel(pr.verification_level))}</b></div>
+        <div><span>NÍVEL DE VERIFICAÇÃO</span><b>${forgeEsc(verText)}</b></div>
+        ${pr.verification_reason ? `<div><span>MOTIVO / DETALHE</span><b>${forgeEsc(pr.verification_reason)}</b></div>` : ""}
+        ${record?.project_revision != null ? `<div><span>REVISÃO DO PROJETO</span><b>rev ${forgeEsc(record.project_revision)}</b></div>` : ""}
         <div><span>CABEÇALHO &amp; Sc0</span><b>Cabeçalho: ${pr.header_and_crypto_valid ? "OK" : "Falhou"} · Sc0: ${pr.sc0_validated ? "OK" : "Falhou"}</b></div>
         <div><span>TIPO DE TEMA</span><b>${forgeEsc(pr.volume_type)}</b></div>
         <div><span>CONTENT_ID</span><code>${forgeEsc(pr.content_id)}</code></div>
@@ -2776,7 +2806,7 @@ async function forgeOpenReport(pkgId = "") {
         <div><span>IRO_TAG</span><b>Cabeçalho 0x98 = ${forgeEsc(pr.iro_tag_header)} · SFO = ${forgeEsc(pr.iro_tag_sfo)}</b></div>
         <div><span>CATEGORY</span><b>${forgeEsc(pr.category)}</b></div>
         <div><span>bgmhome_loud</span><b>${pr.bgmhome_loud ? `${forgeEsc(pr.bgmhome_loud)} LKFS` : "Não aplicável"}</b></div>
-        <div><span>SHA-256 do PKG</span><code>${forgeEsc(pr.pkg_sha256 || "")}</code></div>
+        <div><span>SHA-256 do PKG</span><code>${forgeEsc(pr.pkg_sha256 || record?.pkg_sha256 || "")}</code></div>
         <div><span>Extração ↔ Bundle (SHA-256)</span><b>${forgeEsc(cmpText)}</b></div>
         <div><span>Builder / Validador</span><code>${forgeEsc(pr.builder_backend)} / ${forgeEsc(pr.validator_backend)}</code></div>
       </div>

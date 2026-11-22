@@ -163,7 +163,7 @@ def _execute_pkg_task(task: PkgTask, params: dict) -> None:
         stage_dir.mkdir(parents=True, exist_ok=True)
         task.progress("Montando árvore canônica do tema e param.sfo", 10)
         _persist_task_snapshot(task)
-        content_dir, gp4_path, meta, included, _pre_report = assemble_theme_tree(stage_dir, params)
+        content_dir, gp4_path, meta, included, _pre_report = assemble_theme_tree(stage_dir, params, validate=False)
 
         task.check()
         pkg_out_dir = stage_dir / "pkg"
@@ -192,6 +192,8 @@ def _execute_pkg_task(task: PkgTask, params: dict) -> None:
             "pkg_id": pkg_id,
             "pkg_name": final_pkg.name,
             "pkg_bytes": final_pkg.stat().st_size,
+            "pkg_sha256": pkg_report.pkg_sha256,
+            "project_revision": params.get("project_revision"),
             "content_id": meta.content_id,
             "title_id": meta.title_id,
             "title": meta.title,
@@ -390,6 +392,65 @@ def forge_pkg_job_cancel(task_id: str) -> dict:
         return task.public()
 
 
+def _normalize_persisted_pkg_report(pr: dict) -> dict:
+    """Normalize persisted pkg_report metadata so legacy/incomplete records NEVER claim validation."""
+    raw_level = pr.get("verification_level")
+    if not raw_level:
+        return {
+            "verification_level": "failed",
+            "structure_validated": False,
+            "package_status": "PACOTE GERADO",
+            "legacy_unverified": True,
+            "verification_reason": (
+                "Histórico legado sem verification_level registrado — revalide o PKG antes de instalar no PS4."
+            ),
+        }
+    level = str(raw_level)
+    if level == "full_bundle_verified":
+        sv = bool(pr.get("structure_validated", False))
+        return {
+            "verification_level": level,
+            "structure_validated": sv,
+            "package_status": pr.get(
+                "package_status",
+                "PACOTE VALIDADO ESTRUTURALMENTE" if sv else "FALHA DE EMPACOTAMENTO",
+            ),
+            "legacy_unverified": False,
+            "verification_reason": (
+                "Verificação completa: Cabeçalho + Sc0 + Image0 extraído + SHA-256 ↔ Bundle."
+                if sv
+                else "Verificação completa reprovada."
+            ),
+        }
+    if level == "extracted_uncompared":
+        sv = bool(pr.get("structure_validated", False))
+        return {
+            "verification_level": level,
+            "structure_validated": sv,
+            "package_status": pr.get(
+                "package_status",
+                "PACOTE VALIDADO ESTRUTURALMENTE" if sv else "PACOTE GERADO",
+            ),
+            "legacy_unverified": False,
+            "verification_reason": "Image0 extraído e validado sem comparação SHA-256 contra o bundle de origem.",
+        }
+    if level == "header_and_sc0_only":
+        return {
+            "verification_level": level,
+            "structure_validated": False,
+            "package_status": pr.get("package_status", "PACOTE GERADO"),
+            "legacy_unverified": False,
+            "verification_reason": "Verificação parcial: apenas cabeçalho e Sc0 conferidos (Image0 não extraído).",
+        }
+    return {
+        "verification_level": level,
+        "structure_validated": False,
+        "package_status": pr.get("package_status", "FALHA DE EMPACOTAMENTO"),
+        "legacy_unverified": False,
+        "verification_reason": "Verificação estrutural reprovada ou incompleta.",
+    }
+
+
 @router.get("/pkg/history")
 def forge_pkg_history() -> dict:
     """List persisted validated PKG builds for the active project (survives server restarts)."""
@@ -406,11 +467,14 @@ def forge_pkg_history() -> dict:
         try:
             rec = json.loads(rep_file.read_text(encoding="utf-8"))
             pr = rec.get("pkg_report", {})
+            norm = _normalize_persisted_pkg_report(pr)
             items.append(
                 {
                     "pkg_id": rec["pkg_id"],
                     "pkg_name": rec["pkg_name"],
                     "pkg_bytes": rec["pkg_bytes"],
+                    "pkg_sha256": rec.get("pkg_sha256") or pr.get("pkg_sha256") or "",
+                    "project_revision": rec.get("project_revision"),
                     "content_id": rec["content_id"],
                     "title": rec.get("title", ""),
                     "created_at": rec.get("created_at", 0),
@@ -419,12 +483,11 @@ def forge_pkg_history() -> dict:
                     "iro_tag_header": pr.get("iro_tag_header"),
                     "iro_tag_sfo": pr.get("iro_tag_sfo"),
                     "category": pr.get("category", ""),
-                    "verification_level": pr.get("verification_level", "failed"),
-                    "package_status": pr.get(
-                        "package_status",
-                        "PACOTE VALIDADO ESTRUTURALMENTE" if pr.get("structure_validated") else "PACOTE GERADO",
-                    ),
-                    "structure_validated": pr.get("structure_validated", False),
+                    "verification_level": norm["verification_level"],
+                    "package_status": norm["package_status"],
+                    "structure_validated": norm["structure_validated"],
+                    "legacy_unverified": norm["legacy_unverified"],
+                    "verification_reason": norm["verification_reason"],
                     "theme_type_valid": pr.get("theme_type_valid", False),
                     "physical_compatibility": pr.get("physical_compatibility", "pending"),
                 }
@@ -456,6 +519,14 @@ def _load_persisted_pkg(pkg_id: str) -> tuple[Path, dict]:
 @router.get("/pkg/{pkg_id}/report")
 def forge_pkg_report(pkg_id: str) -> dict:
     _pkg_path, rec = _load_persisted_pkg(pkg_id)
+    pr = rec.get("pkg_report")
+    if isinstance(pr, dict):
+        norm = _normalize_persisted_pkg_report(pr)
+        pr_out = dict(pr)
+        pr_out.update(norm)
+        rec = dict(rec)
+        rec["pkg_report"] = pr_out
+        rec.setdefault("pkg_sha256", pr_out.get("pkg_sha256") or "")
     return rec
 
 
