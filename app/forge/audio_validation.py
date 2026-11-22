@@ -400,6 +400,20 @@ def validate_at9(
                 errors.append(f"smpl.playCount={riff['play_count']} (esperado 0 para loop infinito).")
             if riff["loop_start"] is None or riff["loop_end"] is None or riff["loop_end"] <= riff["loop_start"]:
                 errors.append("Pontos de loop no bloco 'smpl' são inválidos.")
+            else:
+                delay = int(riff.get("encoder_delay") or 0)
+                ls = int(riff["loop_start"])
+                le = int(riff["loop_end"])
+                if ls < delay:
+                    errors.append(f"smpl.loop_start ({ls}) é menor que encoder_delay ({delay}).")
+                if (le - ls) < 1024:
+                    errors.append(f"Intervalo de loop muito curto ({le - ls} amostras < 1024).")
+                if riff["fact_samples"]:
+                    max_valid_end = int(riff["fact_samples"]) + delay + 2048
+                    if le > max_valid_end:
+                        errors.append(
+                            f"smpl.loop_end ({le}) excede o total de amostras em 'fact' ({riff['fact_samples']} + delay {delay})."
+                        )
 
     # Independent FFprobe inspection
     codec_name = "unknown"
@@ -436,6 +450,8 @@ def validate_at9(
         peak = float(np.max(np.abs(pcm))) if pcm.size else 0.0
         decoded_peak_dbfs = round(20.0 * math.log10(peak), 2) if peak > 1e-12 else -120.0
         decoded_clipped = int(np.sum(np.abs(pcm) >= 0.9995))
+        if decoded_peak_dbfs <= -70.0:
+            warnings.append(f"Áudio ATRAC9 praticamente mudo/silencioso (pico {decoded_peak_dbfs} dBFS).")
         if riff["fact_samples"]:
             expected = int(riff["fact_samples"])
             # Lossy codec padding/delay allows up to 2 superframes (2048 samples) tolerance
@@ -444,6 +460,12 @@ def validate_at9(
                 errors.append(
                     f"Decodificação truncada: {decoded_samples} amostras decodificadas "
                     f"contra {expected} declaradas em 'fact'."
+                )
+        if require_loop and riff["has_smpl"] and riff["loop_end"] is not None and decoded_samples > 0:
+            delay = int(riff.get("encoder_delay") or 0)
+            if int(riff["loop_end"]) > decoded_samples + delay + 2048:
+                errors.append(
+                    f"smpl.loop_end ({riff['loop_end']}) ultrapassa o total decodificado ({decoded_samples} + delay {delay})."
                 )
         if decoded_samples == 0:
             truncated = True
@@ -472,6 +494,14 @@ def validate_at9(
                 and riff.get("loop_start") is not None
                 and riff.get("loop_end") is not None
             ):
+                if int(vgm["loop_end"]) <= int(vgm["loop_start"]):
+                    errors.append(
+                        f"vgmstream-cli reportou loop degenerado [{vgm['loop_start']}..{vgm['loop_end']}]."
+                    )
+                if vgm.get("total_samples") and int(vgm["loop_end"]) > int(vgm["total_samples"]) + 2048:
+                    errors.append(
+                        f"vgmstream-cli loop_end ({vgm['loop_end']}) excede stream total ({vgm['total_samples']})."
+                    )
                 delay = int(riff.get("encoder_delay") or 0)
                 exp_ls = max(0, int(riff["loop_start"]) - delay)
                 exp_le = max(exp_ls + 1, int(riff["loop_end"]) - delay + 1)

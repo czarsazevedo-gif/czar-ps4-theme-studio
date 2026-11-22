@@ -165,6 +165,16 @@ PackageStatusTier = Literal[
     "PACOTE TESTADO NO PS4",
 ]
 
+ReleaseGateState = Literal[
+    "BUILD_FAILED",
+    "STRUCTURE_VALIDATED",
+    "SEMANTICALLY_VALIDATED",
+    "INDEPENDENTLY_COMPARED",
+    "PHYSICAL_TEST_PENDING",
+    "PHYSICALLY_VERIFIED",
+    "REGRESSION_DETECTED",
+]
+
 
 class PkgValidationReport(ForgeModel):
     pkg_created: bool
@@ -172,6 +182,8 @@ class PkgValidationReport(ForgeModel):
     theme_type_valid: bool
     package_status: PackageStatusTier = "FALHA DE EMPACOTAMENTO"
     verification_level: PkgVerificationLevel = "failed"
+    release_gate: ReleaseGateState = "BUILD_FAILED"
+    release_gate_reasons: list[str] = Field(default_factory=list)
     header_and_crypto_valid: bool = False
     sc0_validated: bool = False
     image0_extracted: bool = False
@@ -187,10 +199,14 @@ class PkgValidationReport(ForgeModel):
     bgmhome_loud: str | None = None
     pkg_bytes: int = 0
     pkg_sha256: str = ""
+    inputs_fingerprint: str = ""
+    stale_vs_project: bool = False
     files: list[dict] = Field(default_factory=list)
     extracted_match: bool = False
     hash_mismatches: list[str] = Field(default_factory=list)
+    digital_twin_summary: dict | None = None
     physical_compatibility: PhysicalCompatStatus = "pending"
+    physical_evidence_sha256: str | None = None
     builder_backend: str = ""
     validator_backend: str = ""
     errors: list[str] = Field(default_factory=list)

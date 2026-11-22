@@ -29,6 +29,8 @@ from .contracts import (
     PS4_THEME_VOLUME_TYPE,
     PkgValidationReport,
 )
+from .digital_twin import simulate_extracted_theme
+from .release_gates import evaluate_release_gate
 from .sfo import parse_param_sfo
 from .subproc import SubprocessTimeoutError, run_cancellable_process
 
@@ -202,8 +204,20 @@ def parse_pkg_binary(pkg_path: Path) -> dict[str, Any]:
             if actual_d != expected_d:
                 entry_digest_mismatches.append(ent["name"])
 
+    # Detect duplicate CNT entry IDs (prevent silent overwrite attacks on Sc0 / DIGESTS / METAS)
+    seen_entry_ids: set[int] = set()
+    duplicate_entry_ids: list[str] = []
+    for ent in entries:
+        eid = int(ent["id"])
+        if eid in seen_entry_ids:
+            duplicate_entry_ids.append(f"0x{eid:04x}")
+        else:
+            seen_entry_ids.add(eid)
+
     # Verify SC entries 1 & 2 hashes
-    by_id = {e["id"]: e for e in entries}
+    by_id: dict[int, dict[str, Any]] = {}
+    for e in entries:
+        by_id.setdefault(e["id"], e)
     sc1_ok = False
     sc2_ok = False
     if all(eid in by_id for eid in (ENTRY_KEYS, ENTRY_IMAGE_KEY, ENTRY_GENERAL_DIGESTS, ENTRY_METAS, ENTRY_DIGESTS)):
@@ -257,6 +271,7 @@ def parse_pkg_binary(pkg_path: Path) -> dict[str, Any]:
         "sc_entries1_hash_ok": sc1_ok,
         "sc_entries2_hash_ok": sc2_ok,
         "entry_digest_mismatches": entry_digest_mismatches,
+        "duplicate_entry_ids": duplicate_entry_ids,
         "entries": entries,
         "sc0_blobs": sc0_blobs,
     }
@@ -406,6 +421,41 @@ def compare_param_sfo_fields(expected_sfo_bytes: bytes, extracted_sfo_bytes: byt
     return diffs
 
 
+def _compact_digital_twin_summary(twin: dict[str, Any]) -> dict[str, Any]:
+    raf_s = twin.get("raf_simulation") or {}
+    ico_s = twin.get("icons_and_presentation") or {}
+    aud_s = twin.get("audio_simulation") or {}
+    bgm_s = aud_s.get("bgm") or {}
+    bgm_mc = bgm_s.get("multi_cycle_simulation") or {}
+    return {
+        "twin_version": twin.get("twin_version", "ps4-theme-digital-twin-v1"),
+        "verification_kind": twin.get("verification_kind", "SEMANTIC_SIMULATION_ONLY"),
+        "physical_execution_proven": False,
+        "passed": bool(twin.get("passed", False)),
+        "theme_kind": twin.get("theme_kind"),
+        "raf_present": bool(raf_s.get("present")),
+        "raf_valid": bool(raf_s.get("valid", True)),
+        "raf_frames": raf_s.get("frames"),
+        "raf_resolution": raf_s.get("resolution"),
+        "raf_total_dds_bytes": raf_s.get("total_dds_bytes"),
+        "raf_cycle_duration_sec": raf_s.get("cycle_duration_sec"),
+        "raf_effective_fps": raf_s.get("effective_fps"),
+        "raf_simulated_cycles": raf_s.get("simulated_cycles"),
+        "raf_seam_to_interior_ratio": raf_s.get("seam_to_interior_ratio"),
+        "icons_function_count": ico_s.get("function_icons_count", 0),
+        "icons_glow_count": ico_s.get("function_glows_count", 0),
+        "icons_content_count": ico_s.get("content_icons_count", 0),
+        "duplicate_icon_groups": ico_s.get("duplicate_icon_groups") or [],
+        "audio_bgm_present": bool(bgm_s.get("present")),
+        "audio_bgm_cycles": bgm_mc.get("cycles"),
+        "audio_bgm_decoder": bgm_mc.get("decoder"),
+        "audio_bgm_peak_dbfs": bgm_mc.get("peak_dbfs"),
+        "audio_sfx_slots": sorted((aud_s.get("sfx") or {}).keys()),
+        "error_count": len(twin.get("errors") or []),
+        "warning_count": len(twin.get("warnings") or []),
+    }
+
+
 def inspect_and_validate_pkg(
     pkg_path: Path,
     *,
@@ -413,11 +463,13 @@ def inspect_and_validate_pkg(
     passcode: str = PS4_PKG_DEFAULT_PASSCODE,
     builder_backend: str = "",
     pkgtool_bin: Path | None = None,
+    inputs_fingerprint: str = "",
+    run_digital_twin: bool = True,
     check: Callable[[], None] = lambda: None,
     register_proc: Callable[[subprocess.Popen | None], None] = lambda *_: None,
 ) -> PkgValidationReport:
     """Full independent PKG inspection, cryptographic digest verification, Sc0/param.sfo check,
-    extraction, and byte-for-byte SHA-256 comparison against the source theme bundle."""
+    extraction, Digital Twin semantic simulation, and byte-for-byte SHA-256 comparison."""
     errors: list[str] = []
     warnings: list[str] = []
     files_list: list[dict] = []
@@ -430,6 +482,9 @@ def inspect_and_validate_pkg(
             structure_validated=False,
             theme_type_valid=False,
             verification_level="failed",
+            release_gate="BUILD_FAILED",
+            release_gate_reasons=["Arquivo .pkg ausente ou vazio."],
+            inputs_fingerprint=inputs_fingerprint,
             builder_backend=builder_backend,
             validator_backend="czar-python-pkg-inspector",
             errors=["Arquivo .pkg ausente ou vazio."],
@@ -446,8 +501,11 @@ def inspect_and_validate_pkg(
             structure_validated=False,
             theme_type_valid=False,
             verification_level="failed",
+            release_gate="BUILD_FAILED",
+            release_gate_reasons=[f"Falha ao ler cabeçalho binário PKG: {exc}"],
             pkg_bytes=pkg_bytes,
             pkg_sha256=pkg_sha256,
+            inputs_fingerprint=inputs_fingerprint,
             builder_backend=builder_backend,
             validator_backend="czar-python-pkg-inspector",
             errors=[f"Falha ao ler cabeçalho binário PKG: {exc}"],
@@ -479,6 +537,8 @@ def inspect_and_validate_pkg(
         errors.append("sc_entries2_hash (0x120) inválido.")
     if parsed["entry_digest_mismatches"]:
         errors.append(f"Digests de entradas Sc0 divergiram: {parsed['entry_digest_mismatches']}")
+    if parsed.get("duplicate_entry_ids"):
+        errors.append(f"IDs de entrada duplicados na tabela CNT do PKG: {parsed['duplicate_entry_ids']}")
 
     # 2. Verify PS4 Theme binary identity (content_type=0x1B AC AND iro_tag=2 SS_THEME)
     content_type_hdr = int(parsed["content_type"])
@@ -530,6 +590,8 @@ def inspect_and_validate_pkg(
                 errors.append(f"TITLE_ID inválido ou incoerente em param.sfo: '{title_id}'.")
             if "APP_TYPE" in vals or "APP_VER" in vals:
                 errors.append("Sc0/param.sfo contém campos de aplicativo (APP_TYPE/APP_VER) proibidos em tema.")
+            if not str(vals.get("TITLE") or "").strip():
+                errors.append("Sc0/param.sfo possui TITLE vazio.")
         except Exception as exc:
             errors.append(f"Falha ao decodificar Sc0/param.sfo: {exc}")
 
@@ -559,10 +621,13 @@ def inspect_and_validate_pkg(
         if not pv_ok:
             errors.append(f"Validador auxiliar pkg_validate reportou falha: {pv_out[:300]}")
 
-    # 5. Extract Image0 PFS and compare SHA-256 hashes against expected source bundle (when provided)
+    # 5. Extract Image0 PFS, verify semantic contract + Digital Twin, and compare hashes against source bundle
     image0_extracted = False
     bundle_compared = False
     bundle_hashes_matched = False
+    semantic_contract_passed: bool | None = None
+    digital_twin_passed: bool | None = None
+    digital_twin_summary: dict[str, Any] | None = None
 
     check()
     with tempfile.TemporaryDirectory(prefix="czar-pkg-extract-") as td:
@@ -592,25 +657,39 @@ def inspect_and_validate_pkg(
             else:
                 img0_root = ex_dir
 
-            # Defense in depth: a valid PKG container does not mean the theme it
-            # contains is usable. Reassemble the unencrypted Sc0 files alongside
-            # the extracted Image0 and rerun the full content validator. Without
-            # this, a PKG with a malformed theme.xml, missing icons, broken RAF,
-            # or invalid ATRAC9 could be marked "structurally validated" merely
-            # because pkg_extract succeeded and theme.xml existed.
+            # Defense in depth: verify any inner PFS sce_sys files against Sc0 BEFORE reassembling
+            # Sc0 alongside Image0, then rerun both the semantic bundle validator and the Digital Twin.
             sc_sys_dir = img0_root / "sce_sys"
             if sc_sys_dir.is_symlink() or (sc_sys_dir.exists() and not sc_sys_dir.is_dir()):
                 errors.append("Image0/sce_sys é link simbólico ou não é diretório; extração insegura.")
+                semantic_contract_passed = False
+                digital_twin_passed = False
             else:
                 sc_sys_dir.mkdir(parents=True, exist_ok=True)
                 unsafe_sc0 = False
                 for sc_name in ("Sc0/param.sfo", "Sc0/icon0.png", "Sc0/pic1.png"):
                     if sc_name in sc0_blobs:
-                        target = sc_sys_dir / Path(sc_name).name
+                        fname = Path(sc_name).name
+                        target = sc_sys_dir / fname
                         if target.is_symlink():
-                            errors.append(f"Image0/sce_sys/{target.name} é link simbólico inseguro.")
+                            errors.append(f"Image0/sce_sys/{fname} é link simbólico inseguro.")
                             unsafe_sc0 = True
                         else:
+                            if target.is_file():
+                                inner_bytes = target.read_bytes()
+                                sc_bytes = sc0_blobs[sc_name]
+                                if fname == "param.sfo":
+                                    if inner_bytes != sc_bytes:
+                                        inner_sfo_diffs = compare_param_sfo_fields(inner_bytes, sc_bytes)
+                                        if inner_sfo_diffs:
+                                            errors.append(
+                                                "Divergência semântica entre Image0/sce_sys/param.sfo (PFS) e Sc0/param.sfo: "
+                                                + "; ".join(inner_sfo_diffs[:3])
+                                            )
+                                elif hashlib.sha256(inner_bytes).digest() != hashlib.sha256(sc_bytes).digest():
+                                    errors.append(
+                                        f"Divergência SHA-256 entre Image0/sce_sys/{fname} (PFS interno) e {sc_name} (Sc0 externo)."
+                                    )
                             target.write_bytes(sc0_blobs[sc_name])
 
                 unsafe_links = [
@@ -620,9 +699,13 @@ def inspect_and_validate_pkg(
                 if unsafe_links:
                     errors.append(f"Links simbólicos não permitidos em Image0: {unsafe_links[:8]}")
 
-                if not unsafe_sc0 and not unsafe_links:
+                if unsafe_sc0 or unsafe_links:
+                    semantic_contract_passed = False
+                    digital_twin_passed = False
+                else:
                     check()
                     extracted_bundle_report = validate_theme_bundle(img0_root)
+                    semantic_contract_passed = bool(extracted_bundle_report.valid)
                     if not extracted_bundle_report.valid:
                         errors.extend(
                             f"Conteúdo extraído inválido: {detail}"
@@ -632,6 +715,24 @@ def inspect_and_validate_pkg(
                         f"Conteúdo extraído: {detail}"
                         for detail in extracted_bundle_report.warnings
                     )
+
+                    if run_digital_twin:
+                        check()
+                        try:
+                            twin_report = simulate_extracted_theme(img0_root)
+                            digital_twin_passed = bool(twin_report.get("passed", False))
+                            digital_twin_summary = _compact_digital_twin_summary(twin_report)
+                            if not digital_twin_passed:
+                                existing_err_text = " ".join(errors)
+                                for detail in twin_report.get("errors") or []:
+                                    if detail not in existing_err_text:
+                                        errors.append(f"Digital Twin: {detail}")
+                            for warn in twin_report.get("warnings") or []:
+                                if warn not in warnings:
+                                    warnings.append(f"Digital Twin: {warn}")
+                        except Exception as exc:
+                            digital_twin_passed = False
+                            errors.append(f"Falha ao executar PS4 Theme Digital Twin sobre conteúdo extraído: {exc}")
 
             extracted_image0: dict[str, tuple[int, str]] = {}
             for p in sorted(img0_root.rglob("*")):
@@ -723,9 +824,7 @@ def inspect_and_validate_pkg(
         and iro_tag_sfo == PS4_THEME_IRO_TAG
     )
 
-    # CZAR-AUD-004 + Section 19: strict, honest verification tiers — NEVER mark structure_validated=True
-    # when Image0 could not be extracted, NEVER mark extracted_match=True without bundle comparison,
-    # and NEVER automatically claim PACOTE TESTADO NO PS4!
+    # CZAR-AUD-004 + Section 19 + Operação Fortaleza Fase 11: strict fail-closed tiers & Release Gates
     base_ok = len(errors) == 0 and theme_type_valid and header_and_crypto_valid and sc0_validated
     if not base_ok:
         verification_level = "failed"
@@ -744,12 +843,30 @@ def inspect_and_validate_pkg(
         structure_validated = True
         package_status = "PACOTE VALIDADO ESTRUTURALMENTE"
 
+    gate_eval = evaluate_release_gate(
+        pkg_created=True,
+        header_and_crypto_valid=header_and_crypto_valid,
+        sc0_validated=sc0_validated,
+        theme_type_valid=theme_type_valid,
+        image0_extracted=image0_extracted,
+        semantic_contract_passed=semantic_contract_passed,
+        digital_twin_passed=digital_twin_passed if run_digital_twin else semantic_contract_passed,
+        bundle_compared=bundle_compared,
+        bundle_hashes_matched=bundle_hashes_matched,
+        independent_verifiers_passed=None,
+        pkg_sha256=pkg_sha256,
+        inputs_fingerprint=inputs_fingerprint,
+        errors=errors,
+    )
+
     return PkgValidationReport(
         pkg_created=True,
         structure_validated=structure_validated,
         theme_type_valid=theme_type_valid,
         package_status=package_status,
         verification_level=verification_level,
+        release_gate=gate_eval["state"],
+        release_gate_reasons=gate_eval["reasons"],
         header_and_crypto_valid=header_and_crypto_valid,
         sc0_validated=sc0_validated,
         image0_extracted=image0_extracted,
@@ -765,9 +882,11 @@ def inspect_and_validate_pkg(
         bgmhome_loud=bgmhome_loud,
         pkg_bytes=pkg_bytes,
         pkg_sha256=pkg_sha256,
+        inputs_fingerprint=inputs_fingerprint,
         files=files_list,
         extracted_match=bundle_hashes_matched,
         hash_mismatches=hash_mismatches,
+        digital_twin_summary=digital_twin_summary,
         physical_compatibility="pending",
         builder_backend=builder_backend,
         validator_backend=validator_backend,

@@ -103,6 +103,7 @@ def build_and_validate_theme_pkg(
     meta: pkg.PackageMeta,
     dest_dir: Path,
     *,
+    inputs_fingerprint: str = "",
     progress: Callable[[str, int], None] = lambda *_: None,
     check: Callable[[], None] = lambda: None,
     register_proc: Callable[[subprocess.Popen | None], None] = lambda *_: None,
@@ -193,6 +194,7 @@ def build_and_validate_theme_pkg(
             passcode=meta.passcode,
             builder_backend=backend,
             pkgtool_bin=pkgtool_bin,
+            inputs_fingerprint=inputs_fingerprint,
             check=check,
             register_proc=register_proc,
         )

@@ -14,6 +14,7 @@ theme specifications before packaging:
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import struct
 import xml.etree.ElementTree as ET
@@ -21,7 +22,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from .. import mdx, media, pkg, theme_xml
+from .. import dxt1, mdx, media, pkg, raf as raf_mod, theme_xml
 from ..config import (
     ANIMATED_SIZES,
     CONTENT_ICONS,
@@ -51,6 +52,17 @@ from .sfo import parse_param_sfo
 ALLOWED_SFX_NAMES = {"se_decide.vag", "se_cursor.vag", "se_cancel.vag"}
 ALLOWED_FUNCTION_ICON_FILES = {f"{n}.png" for n in FUNCTION_ICONS} | {f"{n}_glow.png" for n in FUNCTION_ICONS}
 ALLOWED_CONTENT_ICON_FILES = {f"{n}.png" for n in CONTENT_ICONS}
+_FORBIDDEN_XML_RE = re.compile(r"<!\s*(DOCTYPE|ENTITY)\b", re.IGNORECASE)
+_COLOR_VEC_RE = re.compile(
+    r"^\s*([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)\s*$"
+)
+_DDS_FRAME_RE = re.compile(r"^[0-9]{2}\.dds$")
+
+
+def _safe_parse_xml_text(text: str, label: str) -> ET.Element:
+    if _FORBIDDEN_XML_RE.search(text):
+        raise ValueError(f"{label}: declarações DOCTYPE/ENTITY proibidas por segurança.")
+    return ET.fromstring(text)
 
 
 def _sha256_file(path: Path) -> str:
@@ -78,6 +90,7 @@ def _check_png(
         with Image.open(path) as im:
             w, h = im.size
             mode = im.mode
+            im.load()
     except Exception as exc:
         return False, f"{path.name}: PNG corrompido ({exc})."
     if (w, h) != expected_size:
@@ -93,7 +106,7 @@ def _check_dds_dxt1(path: Path) -> tuple[bool, tuple[int, int] | None, str]:
     raw = path.read_bytes()
     if len(raw) < 128 or raw[:4] != b"DDS ":
         return False, None, f"{path.name}: cabeçalho DDS ausente ou truncado."
-    dw_size, _flags, height, width = struct.unpack_from("<IIII", raw, 4)
+    dw_size, _flags, height, width, linear_size, _depth, mip_count = struct.unpack_from("<7I", raw, 4)
     fourcc = raw[84:88]
     if dw_size != 124:
         return False, None, f"{path.name}: dwSize={dw_size} (esperado 124)."
@@ -104,6 +117,16 @@ def _check_dds_dxt1(path: Path) -> tuple[bool, tuple[int, int] | None, str]:
     expected_len = dds_bytes_for(width, height)
     if len(raw) != expected_len:
         return False, (width, height), f"{path.name}: tamanho {len(raw)} B != esperado {expected_len} B."
+    if mip_count != 0:
+        return False, (width, height), f"{path.name}: mipmaps={mip_count} (esperado 0 para RAF PS4)."
+    if linear_size != expected_len - 128:
+        return False, (width, height), f"{path.name}: dwPitchOrLinearSize={linear_size} != esperado {expected_len - 128}."
+    try:
+        dec = dxt1.decode_dds(raw)
+        if dec.shape[:2] != (height, width):
+            return False, (width, height), f"{path.name}: shape decodificado {dec.shape[:2]} diverge de {(height, width)}."
+    except Exception as exc:
+        return False, (width, height), f"{path.name}: falha ao decodificar blocos DXT1a ({exc})."
     return True, (width, height), f"DDS DXT1 {width}×{height} ({len(raw):,} B)"
 
 
@@ -221,24 +244,29 @@ def validate_theme_bundle(
         add("xml.missing", "xml", "Image0/theme.xml", "fail", "theme.xml ausente (o PS4 falha ao aplicar sem ele).", "Image0/theme.xml")
     else:
         try:
-            tree = ET.fromstring(xml_path.read_text(encoding="utf-8"))
+            tree = _safe_parse_xml_text(xml_path.read_text(encoding="utf-8"), "theme.xml")
             if tree.tag != "theme":
                 add("xml.root", "xml", "Image0/theme.xml", "fail", f"Raiz XML inválida: <{tree.tag}>.", "Image0/theme.xml")
             else:
                 fv = (tree.findtext("format-version") or "").strip()
                 tc_raw = (tree.findtext("themecolor") or "").strip()
+                label_raw = (tree.findtext("label") or "").strip()
                 bgm_raw = (tree.findtext("homebgm-enable") or "").strip()
                 xml_issues: list[str] = []
                 if fv != theme_xml.FORMAT_VERSION:
                     xml_issues.append(f"format-version='{fv}' (esperado '{theme_xml.FORMAT_VERSION}')")
                 if not tc_raw.isdigit() or not (0 <= int(tc_raw) <= 7):
                     xml_issues.append(f"themecolor='{tc_raw}' fora de 0..7")
+                if not label_raw or not theme_xml.LABEL_RE.match(label_raw):
+                    xml_issues.append(f"label='{label_raw}' ausente ou inválido")
                 for color_tag in (
                     "fontcolor", "fontshadowcolor", "focuscolor",
                     "homescreen-dimmer", "functionscreen-dimmer", "titlename-dimmer",
                 ):
                     cval = tree.findtext(color_tag)
-                    if cval is not None and not theme_xml.ARGB_RE.match(cval.strip()):
+                    if cval is None or not cval.strip():
+                        xml_issues.append(f"campo obrigatório <{color_tag}> ausente")
+                    elif not theme_xml.ARGB_RE.match(cval.strip()):
                         xml_issues.append(f"{color_tag}='{cval}' não é ARGB #AARRGGBB")
                 if bgm_raw not in {"True", "False"}:
                     xml_issues.append(f"homebgm-enable='{bgm_raw}' deve ser 'True' ou 'False'")
@@ -399,25 +427,133 @@ def validate_theme_bundle(
         if total_dds > RAF_SIZE_LIMIT:
             raf_errors.append(f"Soma dos DDS ({total_dds:,} B) excede o orçamento de 6 MiB ({RAF_SIZE_LIMIT:,} B).")
 
-        if not plane_path.is_file() or not plane_path.read_bytes().startswith(mdx.MAGIC):
-            raf_errors.append("plane.mdx ausente ou com cabeçalho XDM/MDX inválido.")
+        if not plane_path.is_file():
+            raf_errors.append("plane.mdx ausente.")
+        else:
+            try:
+                raw_mdx = plane_path.read_bytes()
+                mdx_recs = mdx.parse(raw_mdx)
+                mdx_tags: set[int] = set()
+
+                def _collect_tags(items: list) -> None:
+                    for it in items:
+                        if isinstance(it, mdx.Record):
+                            mdx_tags.add(it.tag)
+                            _collect_tags(it.children)
+
+                _collect_tags(mdx_recs)
+                req_mdx = {mdx.TAG_ROOT, mdx.TAG_MODEL, mdx.TAG_GEOMETRY, mdx.TAG_MESH, mdx.TAG_ARRAYS}
+                if not req_mdx.issubset(mdx_tags):
+                    raf_errors.append("plane.mdx sem geometria canônica completa (ROOT/MODEL/GEOMETRY/MESH/ARRAYS).")
+            except Exception as exc:
+                raf_errors.append(f"plane.mdx inválido ou truncado: {exc}")
 
         if not raf_xml_path.is_file():
             raf_errors.append("scene/background.raf/index.xml ausente.")
         else:
             try:
                 raf_xml_txt = raf_xml_path.read_text(encoding="utf-8")
-                raf_root = ET.fromstring(raf_xml_txt)
+                raf_root = _safe_parse_xml_text(raf_xml_txt, "index.xml")
                 if raf_root.tag != "raf":
                     raf_errors.append(f"index.xml com raiz inválida <{raf_root.tag}>.")
-                mats = raf_root.findall(".//material")
-                cases = raf_root.findall(".//case")
+
+                top_textures: dict[str, str] = {}
+                for t_el in raf_root.findall("texture"):
+                    tid = (t_el.attrib.get("id") or "").strip()
+                    tfile = (t_el.attrib.get("file") or "").strip()
+                    if tid and tfile:
+                        top_textures[tid] = tfile
+
+                mat_dds_map: dict[str, str] = {}
+                mats = raf_root.findall("material")
+                for m_el in mats:
+                    mid = (m_el.attrib.get("id") or "").strip()
+                    if not mid:
+                        raf_errors.append("index.xml contém <material> sem id.")
+                        continue
+                    if mid in mat_dds_map:
+                        raf_errors.append(f"index.xml contém material duplicado '{mid}'.")
+                        continue
+                    tex_el = m_el.find("texture")
+                    tfile = ""
+                    if tex_el is not None:
+                        tfile = (tex_el.attrib.get("file") or "").strip()
+                        if not tfile:
+                            tref = (tex_el.attrib.get("id") or tex_el.attrib.get("ref") or "").strip()
+                            tfile = top_textures.get(tref, "")
+                    if not tfile:
+                        tref = (m_el.attrib.get("texture") or m_el.attrib.get("diffuse") or "").strip()
+                        tfile = top_textures.get(tref, "")
+                    if not tfile:
+                        raf_errors.append(f"Material '{mid}' não declara arquivo de textura .dds.")
+                        continue
+                    if "/" in tfile or "\\" in tfile or ".." in tfile or not (raf_dir / tfile).is_file():
+                        raf_errors.append(f"Material '{mid}' referencia DDS ausente ou inseguro: '{tfile}'.")
+                    mat_dds_map[mid] = tfile
+
+                disk_dds_set = {p.name for p in dds_files}
+                orphan_dds = sorted(disk_dds_set - set(mat_dds_map.values()))
+                if orphan_dds:
+                    raf_errors.append(f"Arquivos DDS não referenciados em index.xml: {orphan_dds}.")
+
+                models_map = {
+                    (el.attrib.get("id") or "").strip(): (el.attrib.get("file") or "").strip()
+                    for el in raf_root.findall(".//model")
+                    if (el.attrib.get("id") or "").strip()
+                }
+                if "plane.fbx" not in models_map.values():
+                    raf_errors.append("index.xml não referencia o modelo canônico plane.fbx.")
+
+                actors_map: dict[str, dict[str, str]] = {}
+                for a_el in raf_root.findall("actor"):
+                    aid = (a_el.attrib.get("id") or "").strip()
+                    if not aid:
+                        continue
+                    amodel = (a_el.attrib.get("model") or "").strip()
+                    amat = (a_el.attrib.get("material") or "").strip()
+                    if not amodel or amodel not in models_map:
+                        raf_errors.append(f"Actor '{aid}' referencia model inexistente '{amodel}'.")
+                    if not amat or amat not in mat_dds_map:
+                        raf_errors.append(f"Actor '{aid}' referencia material inexistente '{amat}'.")
+                    actors_map[aid] = {"model": amodel, "material": amat}
+
+                cases = raf_root.findall(".//sequence/case")
                 if len(mats) != len(dds_files):
                     raf_errors.append(f"index.xml declara {len(mats)} materiais para {len(dds_files)} arquivos .dds.")
                 if len(cases) != len(dds_files):
                     raf_errors.append(f"index.xml declara {len(cases)} <case> para {len(dds_files)} arquivos .dds.")
-                if 'file="plane.fbx"' not in raf_xml_txt:
-                    raf_errors.append("index.xml não referencia o modelo canônico plane.fbx.")
+
+                for idx, c_el in enumerate(cases):
+                    w_raw = (c_el.attrib.get("wait") or "").strip()
+                    try:
+                        w_val = float(w_raw)
+                        if not math.isfinite(w_val) or w_val < 0.01 or w_val > 10.0:
+                            raise ValueError
+                    except Exception:
+                        raf_errors.append(f"<case #{idx}> com wait inválido: {w_raw!r} (esperado [0.01, 10.0] s).")
+                    out_id = None
+                    in_id = None
+                    for ca in c_el.findall("actor"):
+                        cid = (ca.attrib.get("id") or "").strip()
+                        col = (ca.attrib.get("color") or "").strip()
+                        if cid not in actors_map:
+                            raf_errors.append(f"<case #{idx}> referencia actor inexistente '{cid}'.")
+                            continue
+                        mc = _COLOR_VEC_RE.match(col)
+                        if not mc:
+                            raf_errors.append(f"<case #{idx}> cor inválida '{col}' em actor '{cid}'.")
+                            continue
+                        av = float(mc.group(4))
+                        if av <= 0.05:
+                            out_id = cid
+                        elif av >= 0.95:
+                            in_id = cid
+                    exp_out = raf_mod.frame_id(idx)
+                    exp_in = raf_mod.frame_id((idx + 1) % max(len(cases), 1))
+                    if out_id != exp_out or in_id != exp_in:
+                        raf_errors.append(
+                            f"<case #{idx}> transição fora de ordem ({out_id}->{in_id}; esperado {exp_out}->{exp_in})."
+                        )
             except Exception as exc:
                 raf_errors.append(f"index.xml inválido: {exc}")
 
@@ -494,6 +630,10 @@ def validate_theme_bundle(
                 sfo_errs.append(f"IRO_TAG={vals.get('IRO_TAG')!r} (exigido 2)")
             if vals.get("FORMAT") != "obs":
                 sfo_errs.append(f"FORMAT={vals.get('FORMAT')!r} (exigido 'obs')")
+            if not str(vals.get("TITLE") or "").strip():
+                sfo_errs.append("TITLE ausente ou vazio em param.sfo")
+            if not str(vals.get("VERSION") or "").strip():
+                sfo_errs.append("VERSION ausente em param.sfo")
             for forbidden in ("APP_TYPE", "APP_VER"):
                 if forbidden in vals:
                     sfo_errs.append(f"Chave de aplicativo '{forbidden}' não deve existir em tema PS4")
@@ -544,7 +684,7 @@ def validate_theme_bundle(
         else:
             try:
                 gp4_txt = gp4_path.read_text(encoding="utf-8-sig")
-                gp4_root = ET.fromstring(gp4_txt)
+                gp4_root = _safe_parse_xml_text(gp4_txt, gp4_path.name)
                 gp4_errs: list[str] = []
                 vol = gp4_root.find("volume")
                 if vol is None:
@@ -572,6 +712,13 @@ def validate_theme_bundle(
                 else:
                     for f_el in files_el.findall("file"):
                         tp = f_el.attrib.get("targ_path", "").replace("\\", "/")
+                        op = f_el.attrib.get("orig_path", "").replace("\\", "/")
+                        if not tp or tp.startswith("/") or ".." in Path(tp).parts or ".." in Path(op).parts:
+                            gp4_errs.append(f"Caminho inseguro/traversal no GP4: targ_path={tp!r}, orig_path={op!r}")
+                            continue
+                        if tp in declared_targets:
+                            gp4_errs.append(f"Entrada duplicada no GP4: {tp}")
+                            continue
                         declared_targets.add(tp)
                         if not (content_dir / tp).is_file():
                             gp4_errs.append(f"Arquivo declarado no GP4 ausente em disco: {tp}")
@@ -596,6 +743,41 @@ def validate_theme_bundle(
                     )
             except Exception as exc:
                 add("gp4.parse", "gp4", "Projeto GP4", "fail", f"Erro ao ler GP4 XML: {exc}", gp4_path.name)
+
+    # 10b. Canonical PS4 theme path whitelist (reject stray/unexpected files anywhere in content_dir)
+    stray_paths: list[str] = []
+    for p in sorted(content_dir.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(content_dir).as_posix()
+        allowed = (
+            rel in {"theme.xml", "texture/preview.png", "sce_sys/param.sfo", "sce_sys/icon0.png", "sce_sys/pic1.png"}
+            or rel in {"texture/background/homescreen.png", "texture/background/functionscreen.png"}
+            or (rel.startswith("texture/function_icon/") and rel.split("/", 2)[-1] in ALLOWED_FUNCTION_ICON_FILES and rel.count("/") == 2)
+            or (rel.startswith("texture/content_icon/") and rel.split("/", 2)[-1] in ALLOWED_CONTENT_ICON_FILES and rel.count("/") == 2)
+            or (rel.startswith("sound/") and rel.split("/", 1)[-1] in ({"bgm_home.at9"} | ALLOWED_SFX_NAMES) and rel.count("/") == 1)
+            or (
+                rel.startswith("scene/background.raf/")
+                and rel.count("/") == 2
+                and (
+                    rel.endswith("/index.xml")
+                    or rel.endswith("/plane.mdx")
+                    or bool(_DDS_FRAME_RE.match(rel.split("/", 2)[-1]))
+                )
+            )
+        )
+        if not allowed:
+            stray_paths.append(rel)
+    if stray_paths:
+        add(
+            "tree.stray",
+            "structure",
+            "Árvore canônica do tema",
+            "fail",
+            f"Arquivos fora do esquema canônico de tema PS4: {stray_paths[:10]}",
+        )
+    else:
+        add("tree.clean", "structure", "Árvore canônica do tema", "pass", "Todos os arquivos respeitam o esquema canônico PS4.")
 
     # 11. Inventory & SHA-256 hashes of all bundle files
     files_manifest: list[dict] = []
