@@ -378,7 +378,7 @@ def _rasterize_svg_rgba(src: Path, size: tuple[int, int]) -> "Image.Image":
         out_png = Path(td) / "raster.png"
         try:
             import cairosvg
-        except ImportError:
+        except (ImportError, OSError):
             magick = _find_svg_rasterizer()
             if not magick:
                 raise MediaError(
