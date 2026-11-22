@@ -253,6 +253,17 @@ def test_svg_icon_import_zero_halo_and_security_guard(tmp_path: Path, monkeypatc
         r_bad = client.post("/api/library", files={"file": ("evil.svg", fh, "image/svg+xml")})
     assert r_bad.status_code == 422, r_bad.text
 
+    # CSS url(...) could bypass the older literal href="http" string guard.
+    # This must be rejected before any SVG rasterizer can fetch a resource.
+    evil_css = tmp_path / "evil_css.svg"
+    evil_css.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24">'
+        '<rect width="24" height="24" fill="url(https://example.invalid/remote.svg)"/>'
+        '</svg>', encoding="utf-8",
+    )
+    with pytest.raises(media.MediaError, match="URL de recurso externo"):
+        media.render_image(evil_css, tmp_path / "must-not-exist.png", (128, 128))
+
 
 def test_benchmark_scripts_reject_zero_videos_and_valid_hyperfine_syntax(tmp_path: Path) -> None:
     """Section 14: benchmark_ouroboros_corpus.py MUST exit non-zero when 0 videos run or all fail; hyperfine script syntax OK."""

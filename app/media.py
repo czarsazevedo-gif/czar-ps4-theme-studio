@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -336,28 +337,70 @@ def validate_svg_safe(src: Path) -> None:
         if forbidden in low:
             raise MediaError(f"SVG contém recurso externo ou script não permitido ({forbidden}).")
 
+    # Attribute syntax can contain whitespace, namespaces, and CSS url(...)
+    # references. Reject all non-local resource URLs before passing the SVG to
+    # either renderer, so neither CairoSVG nor ImageMagick can fetch external
+    # files or URLs through a crafted icon.
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        raise MediaError(f"SVG inválido: {exc}") from exc
+    if root.tag.rsplit("}", 1)[-1].lower() != "svg":
+        raise MediaError("SVG precisa ter o elemento <svg> como raiz.")
+    if "@import" in low:
+        raise MediaError("SVG contém importação CSS externa não permitida.")
+    for target in re.findall(r"url\(\s*([^)]*)\)", text, flags=re.IGNORECASE):
+        if not target.strip(" \t\r\n'\"").startswith("#"):
+            raise MediaError("SVG contém URL de recurso externo não permitida.")
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1].lower() in {"script", "foreignobject"}:
+            raise MediaError("SVG contém elemento ativo não permitido.")
+        for attribute, value in element.attrib.items():
+            name = attribute.rsplit("}", 1)[-1].lower()
+            if name.startswith("on") or (name in {"href", "src"} and not value.strip().startswith("#")):
+                raise MediaError(f"SVG contém atributo inseguro ({name}).")
+
 
 def _rasterize_svg_rgba(src: Path, size: tuple[int, int]) -> "Image.Image":
-    """Rasterize an SVG cleanly onto transparent RGBA with zero dark alpha halo via ImageMagick + Pillow Lanczos."""
+    """Rasterize SVG to transparent RGBA without relying on ImageMagick's optional rsvg delegate.
+
+    CairoSVG is the preferred deterministic renderer. ImageMagick remains a
+    fallback for installations that have the system SVG delegate configured.
+    """
     import tempfile
     from PIL import Image
 
     validate_svg_safe(src)
-    magick = _find_svg_rasterizer()
-    if not magick:
-        raise MediaError("ImageMagick (magick/convert) indisponível para rasterizar ícones SVG.")
     width, height = size
     supersample = min(1024, max(width, height) * 2)
     with tempfile.TemporaryDirectory(prefix="czar-svg-") as td:
         out_png = Path(td) / "raster.png"
-        _run([
-            magick,
-            "-background", "none",
-            "-density", "384",
-            str(src),
-            "-resize", f"{supersample}x{supersample}",
-            f"PNG32:{out_png}",
-        ])
+        try:
+            import cairosvg
+        except ImportError:
+            magick = _find_svg_rasterizer()
+            if not magick:
+                raise MediaError(
+                    "Rasterizador SVG ausente: instale CairoSVG ou ImageMagick com rsvg-convert."
+                )
+            _run([
+                magick,
+                "-background", "none",
+                "-density", "384",
+                str(src),
+                "-resize", f"{supersample}x{supersample}",
+                f"PNG32:{out_png}",
+            ])
+        else:
+            try:
+                cairosvg.svg2png(
+                    url=str(src), write_to=str(out_png),
+                    output_width=supersample, output_height=supersample,
+                    unsafe=False,
+                )
+            except Exception as exc:
+                raise MediaError(f"Falha ao rasterizar ícone SVG com CairoSVG: {exc}") from exc
         if not out_png.is_file():
             raise MediaError("Falha ao rasterizar ícone SVG com ImageMagick.")
         with Image.open(out_png) as im:

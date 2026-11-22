@@ -43,7 +43,15 @@ def pkg_client(tmp_path, monkeypatch):
         yield client, ws
 
 
-def _prepare_complete_animated_project(client: TestClient, name: str = "PKG Gold Master") -> tuple[str, dict]:
+def _prepare_complete_animated_project(
+    client: TestClient,
+    name: str = "PKG Gold Master",
+    *,
+    frames: int = 6,
+    size: str = "640x360",
+    theme_title: str = "Tema de teste",
+    theme_title_id: str = "CUSA00123",
+) -> tuple[str, dict]:
     pid = client.post("/api/projects", json={"name": name}).json()["id"]
     params = {"project": pid}
 
@@ -54,7 +62,7 @@ def _prepare_complete_animated_project(client: TestClient, name: str = "PKG Gold
         "/api/animated/upload",
         params=params,
         files={"file": ("sample.mp4", SAMPLE_MP4.open("rb"), "video/mp4")},
-        data={"frames": "6", "size": "640x360"},
+        data={"frames": str(frames), "size": size},
     )
     assert anim_up.status_code == 200, anim_up.text
     anim_job = anim_up.json()["job_id"]
@@ -75,11 +83,19 @@ def _prepare_complete_animated_project(client: TestClient, name: str = "PKG Gold
     ).json()["job_id"]
 
     st = editor_state()
+    st["campos"]["pkg-title"] = theme_title
+    st["campos"]["pkg-title-id"] = theme_title_id
     st["bgMode"] = "animated"
     st["slots"] = {"home": home_job, "fn:trophy": fn_job, "ct:browser": ct_job}
     st["bgm"] = bgm_job
     st["sfx"] = {"se_decide": sfx_job}
-    st["anim"] = {"jobId": anim_job, "frames": 6, "wait": 0.1, "size": [640, 360], "backend": "native"}
+    st["anim"] = {
+        "jobId": anim_job,
+        "frames": frames,
+        "wait": 0.1,
+        "size": [int(v) for v in size.split("x")],
+        "backend": "native",
+    }
     save_r = client.put(f"/api/projects/{pid}", json={"name": name, "revision": 1, "state": st})
     assert save_r.status_code == 200, save_r.text
     return pid, params
@@ -159,6 +175,25 @@ def test_section19_full_animated_pkg_build_3tier_status_and_truncated_corrupted_
     assert r_bad.status_code == 200
     assert r_bad.json()["package_status"] == "FALHA DE EMPACOTAMENTO"
     assert r_bad.json()["structure_validated"] is False
+
+    # 5. Fault injection in distinct integrity domains: an untrusted package
+    # must fail closed even if it still starts with a syntactically valid CNT.
+    parsed_ok = pkg_inspector.parse_pkg_binary(pkg_file)
+    icon_entry = next(e for e in parsed_ok["entries"] if e["id"] == pkg_inspector.ENTRY_ICON0_PNG)
+    mutations = {
+        "iro_tag": 0x98,
+        "pfs_payload": parsed_ok["pfs_image_offset"] + 4096,
+        "sc0_icon": icon_entry["data_offset"] + 24,
+    }
+    for label, offset in mutations.items():
+        broken = bytearray(pkg_bytes)
+        broken[offset] ^= 0x01
+        broken_path = tmp_path / f"corrupt-{label}.pkg"
+        broken_path.write_bytes(broken)
+        failed = pkg_inspector.inspect_and_validate_pkg(broken_path)
+        assert failed.structure_validated is False, label
+        assert failed.verification_level == "failed", label
+        assert failed.errors, label
 
 
 @pytest.mark.skipif(pkg_forge.find_liborbispkg_tool() is None, reason="liborbispkg pkgtool not installed")

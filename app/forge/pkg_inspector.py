@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .. import media, pkg
+from .bundle_validator import validate_theme_bundle
 from .contracts import (
     PS4_PKG_CONTENT_TYPE_AC,
     PS4_PKG_DEFAULT_PASSCODE,
@@ -590,8 +591,52 @@ def inspect_and_validate_pkg(
                 img0_root = ex_dir / "uroot"
             else:
                 img0_root = ex_dir
+
+            # Defense in depth: a valid PKG container does not mean the theme it
+            # contains is usable. Reassemble the unencrypted Sc0 files alongside
+            # the extracted Image0 and rerun the full content validator. Without
+            # this, a PKG with a malformed theme.xml, missing icons, broken RAF,
+            # or invalid ATRAC9 could be marked "structurally validated" merely
+            # because pkg_extract succeeded and theme.xml existed.
+            sc_sys_dir = img0_root / "sce_sys"
+            if sc_sys_dir.is_symlink() or (sc_sys_dir.exists() and not sc_sys_dir.is_dir()):
+                errors.append("Image0/sce_sys é link simbólico ou não é diretório; extração insegura.")
+            else:
+                sc_sys_dir.mkdir(parents=True, exist_ok=True)
+                unsafe_sc0 = False
+                for sc_name in ("Sc0/param.sfo", "Sc0/icon0.png", "Sc0/pic1.png"):
+                    if sc_name in sc0_blobs:
+                        target = sc_sys_dir / Path(sc_name).name
+                        if target.is_symlink():
+                            errors.append(f"Image0/sce_sys/{target.name} é link simbólico inseguro.")
+                            unsafe_sc0 = True
+                        else:
+                            target.write_bytes(sc0_blobs[sc_name])
+
+                unsafe_links = [
+                    p.relative_to(img0_root).as_posix()
+                    for p in img0_root.rglob("*") if p.is_symlink()
+                ]
+                if unsafe_links:
+                    errors.append(f"Links simbólicos não permitidos em Image0: {unsafe_links[:8]}")
+
+                if not unsafe_sc0 and not unsafe_links:
+                    check()
+                    extracted_bundle_report = validate_theme_bundle(img0_root)
+                    if not extracted_bundle_report.valid:
+                        errors.extend(
+                            f"Conteúdo extraído inválido: {detail}"
+                            for detail in extracted_bundle_report.errors
+                        )
+                    warnings.extend(
+                        f"Conteúdo extraído: {detail}"
+                        for detail in extracted_bundle_report.warnings
+                    )
+
             extracted_image0: dict[str, tuple[int, str]] = {}
             for p in sorted(img0_root.rglob("*")):
+                if p.is_symlink():
+                    continue
                 if not p.is_file():
                     continue
                 rel = p.relative_to(img0_root).as_posix()
