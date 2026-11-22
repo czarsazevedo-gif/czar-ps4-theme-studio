@@ -162,15 +162,24 @@ def healthy(folder: Path, key: str, check) -> bool:
                 return False
             prof_dir = folder / pid
             files_map = prop.get("files") or {}
+            dds_map = prop.get("ddsHashes") or {}
+            png_map = prop.get("framePngHashes") or {}
             expected_names = [f"{i:02d}.webp" for i in range(count)] + [
                 "source.png",
                 "diff.png",
                 "background.raf.zip",
             ]
             for i in range(count):
-                if not (prof_dir / "deluxe_dds" / f"{i:02d}.dds").is_file():
+                check()
+                d_name = f"{i:02d}.dds"
+                p_name = f"{i:02d}.png"
+                d_path = prof_dir / "deluxe_dds" / d_name
+                p_path = prof_dir / "deluxe_frames" / p_name
+                if not d_path.is_file() or not p_path.is_file():
                     return False
-                if not (prof_dir / "deluxe_frames" / f"{i:02d}.png").is_file():
+                if dds_map.get(d_name) != engine_media.digest(d_path, check):
+                    return False
+                if png_map and png_map.get(p_name) != engine_media.digest(p_path, check):
                     return False
             for name in expected_names:
                 check()

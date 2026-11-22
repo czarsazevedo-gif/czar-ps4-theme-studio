@@ -505,6 +505,7 @@ def generate_three_proposals(
         rend["profileId"] = pid
         rend["profileTitle"] = prof["title"]
         rend["renderKey"] = render_key
+        rend["sourceInterval"] = [plan["start"], plan["end"]]
         rend["files"] = artifact_digests
         profile_reports[pid] = rend
 
@@ -545,6 +546,7 @@ def generate_three_proposals(
             "tenCycleAudit": rend["tenCycleAudit"],
             "metrics": compact_m,
             "ddsHashes": rend["ddsHashes"],
+            "framePngHashes": rend.get("framePngHashes") or {},
             "files": artifact_digests,
             "recipe": rend["recipe"],
         }

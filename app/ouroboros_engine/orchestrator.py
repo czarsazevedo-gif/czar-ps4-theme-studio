@@ -372,9 +372,13 @@ class OuroborosEngine:
         dds_dir.mkdir(exist_ok=True)
 
         dds_hashes: dict[str, str] = {}
+        frame_png_hashes: dict[str, str] = {}
         for i in range(frames):
             check()
-            Image.fromarray(final_frames[i]).save(frames_dir / f"{i:02d}.png", "PNG", compress_level=1)
+            png_name = f"{i:02d}.png"
+            png_path = frames_dir / png_name
+            Image.fromarray(final_frames[i]).save(png_path, "PNG", compress_level=1)
+            frame_png_hashes[png_name] = sha256_bytes(png_path.read_bytes())
             d_name = theme.frame_name(i)
             (dds_dir / d_name).write_bytes(dds_blobs[i])
             dds_hashes[d_name] = sha256_bytes(dds_blobs[i])
@@ -425,6 +429,7 @@ class OuroborosEngine:
             "tenCycleAudit": ten_cycle,
             "beforeAfterRaw": overall_cmp,
             "ddsHashes": dds_hashes,
+            "framePngHashes": frame_png_hashes,
             "recipe": {
                 "algorithmVersion": OUROBOROS_VERSION,
                 "sourceSha256": source_sha256,

@@ -2732,27 +2732,31 @@ async function forgeLoadHistory(checkActive = true) {
       const shaShort = it.pkg_sha256 ? `SHA-256 ${it.pkg_sha256.slice(0, 12)}…` : `ID ${String(it.pkg_id || "").slice(0, 8)}`;
       const revTag = it.project_revision != null ? ` · rev ${it.project_revision}` : "";
       const isLeg = Boolean(it.legacy_unverified);
-      const isVerified = Boolean(it.structure_validated) && !isLeg && (
+      const isStale = Boolean(it.stale_vs_project);
+      const isVerified = Boolean(it.structure_validated) && !isLeg && !isStale && (
         it.verification_level === "full_bundle_verified" || it.verification_level === "extracted_uncompared"
       );
       const verBadge = isLeg
         ? "Pendente de revalidação (histórico legado sem verification_level)"
-        : isVerified
-          ? (it.verification_level === "full_bundle_verified"
-              ? "Validado (bundle 100% SHA-256)"
-              : "Extraído (sem bundle de referência)")
-          : (it.verification_level === "header_and_sc0_only"
-              ? "Incompleto (apenas cabeçalho/Sc0 · Image0 não extraído)"
-              : "Reprovado / não verificado");
-      const reasonLine = !isVerified && it.verification_reason
+        : isStale
+          ? "Obsoleto (projeto alterado após geração — reempacote)"
+          : isVerified
+            ? (it.verification_level === "full_bundle_verified"
+                ? "Validado (bundle 100% SHA-256 + Digital Twin)"
+                : "Extraído (sem bundle de referência)")
+            : (it.verification_level === "header_and_sc0_only"
+                ? "Incompleto (apenas cabeçalho/Sc0 · Image0 não extraído)"
+                : "Reprovado / não verificado");
+      const gateTag = it.release_gate ? ` · Gate ${it.release_gate}` : "";
+      const reasonLine = (!isVerified || isStale) && it.verification_reason
         ? `<div class="dim" style="font-size:11px;color:var(--warn,#f59e0b)">${forgeEsc(it.verification_reason)}</div>`
         : "";
       return `
-      <div class="forge-history-row" data-pkg-id="${forgeEsc(it.pkg_id)}" data-verification-level="${forgeEsc(it.verification_level || "")}">
+      <div class="forge-history-row" data-pkg-id="${forgeEsc(it.pkg_id)}" data-verification-level="${forgeEsc(it.verification_level || "")}" data-release-gate="${forgeEsc(it.release_gate || "")}" data-stale="${isStale ? "true" : "false"}">
         <div>
           <b><code>${forgeEsc(it.pkg_name)}</code></b>
           <div class="dim" style="font-size:12px">
-            ${fmtBytes(it.pkg_bytes || 0)} · <code>${forgeEsc(shaShort)}</code>${forgeEsc(revTag)} · IRO_TAG ${forgeEsc(it.iro_tag_header ?? 2)}/${forgeEsc(it.iro_tag_sfo ?? 2)} · CATEGORY ${forgeEsc(it.category || "ac")} · ${forgeEsc(verBadge)} · ${isVerified ? "Pendente de teste físico" : "Revalidação necessária"}
+            ${fmtBytes(it.pkg_bytes || 0)} · <code>${forgeEsc(shaShort)}</code>${forgeEsc(revTag)} · IRO_TAG ${forgeEsc(it.iro_tag_header ?? 2)}/${forgeEsc(it.iro_tag_sfo ?? 2)} · CATEGORY ${forgeEsc(it.category || "ac")} · ${forgeEsc(verBadge)}${forgeEsc(gateTag)} · ${isVerified ? "Pendente de teste físico" : "Revalidação necessária"}
           </div>
           ${reasonLine}
         </div>
@@ -2774,6 +2778,7 @@ async function forgeLoadHistory(checkActive = true) {
         if (rep.bundle_report) forgeState.lastValidation = rep.bundle_report;
         const latestVerified = Boolean(rep.pkg_report?.structure_validated)
           && !rep.pkg_report?.legacy_unverified
+          && !rep.pkg_report?.stale_vs_project
           && (rep.pkg_report?.verification_level === "full_bundle_verified"
               || rep.pkg_report?.verification_level === "extracted_uncompared");
         if (!forgeState.busy) {
@@ -2817,13 +2822,21 @@ async function forgeOpenReport(pkgId = "") {
       : (pr.image0_extracted ? "Image0 extraído (sem bundle de referência)" : "Image0 não extraído");
     const verText = pr.legacy_unverified
       ? "Pendente de revalidação (histórico legado sem verification_level)"
-      : forgeVerificationLabel(pr.verification_level);
+      : pr.stale_vs_project
+        ? "Obsoleto (projeto modificado após geração — gere novamente)"
+        : forgeVerificationLabel(pr.verification_level);
+    const dt = pr.digital_twin_summary;
+    const twinLine = dt
+      ? `<div><span>DIGITAL TWIN (SIMULAÇÃO SEMÂNTICA)</span><b>${dt.passed ? "Aprovado" : "Reprovado"} · ${forgeEsc(dt.verification_kind || "SEMANTIC_SIMULATION_ONLY")} (não comprova console físico)</b></div>`
+      : "";
     parts.push(`
       <div class="forge-report-kv">
         <div><span>PACOTE GERADO</span><b>${pr.pkg_created ? "Sim" : "Não"}</b></div>
-        <div><span>PACOTE VALIDADO ESTRUTURALMENTE</span><b>${pr.structure_validated && !pr.legacy_unverified ? "Sim" : "Não"}</b></div>
+        <div><span>PACOTE VALIDADO ESTRUTURALMENTE</span><b>${pr.structure_validated && !pr.legacy_unverified && !pr.stale_vs_project ? "Sim" : "Não"}</b></div>
         <div><span>PACOTE TESTADO NO PS4</span><b>${pr.physical_compatibility === "verified" ? "Sim" : "Pendente (PS4 Slim 12.52)"}</b></div>
+        ${pr.release_gate ? `<div><span>PORTÃO DE CONFIANÇA</span><b><code>${forgeEsc(pr.release_gate)}</code></b></div>` : ""}
         <div><span>NÍVEL DE VERIFICAÇÃO</span><b>${forgeEsc(verText)}</b></div>
+        ${twinLine}
         ${pr.verification_reason ? `<div><span>MOTIVO / DETALHE</span><b>${forgeEsc(pr.verification_reason)}</b></div>` : ""}
         ${record?.project_revision != null ? `<div><span>REVISÃO DO PROJETO</span><b>rev ${forgeEsc(record.project_revision)}</b></div>` : ""}
         <div><span>CABEÇALHO &amp; Sc0</span><b>Cabeçalho: ${pr.header_and_crypto_valid ? "OK" : "Falhou"} · Sc0: ${pr.sc0_validated ? "OK" : "Falhou"}</b></div>

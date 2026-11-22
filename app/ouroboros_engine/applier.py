@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import math
+import re
 import shutil
 import subprocess
 import tempfile
 import uuid
+import xml.etree.ElementTree as ET
+import zipfile
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +21,7 @@ from PIL import Image
 from .. import jobs, mdx, media, projects, raf, theme
 from ..config import ANIMATED_SIZES, PKG_DEFAULTS, RAF_SIZE_LIMIT, dds_bytes_for, max_frames_for
 from . import OUROBOROS_VERSION
+from . import media_io as io_media
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -170,12 +175,61 @@ def apply_loop_to_project(
     wait = float(report["wait"])
     dds_hashes: dict[str, str] = report.get("ddsHashes") or {}
     file_hashes: dict[str, str] = report.get("files") or {}
+    frame_png_hashes: dict[str, str] = report.get("framePngHashes") or {}
+    recipe = report.get("recipe")
 
     if size not in ANIMATED_SIZES or not 4 <= frames <= max_frames_for(size):
         raise ValueError("Orçamento ou resolução incompatível com o projeto PS4.")
+    if not math.isfinite(wait) or not (0.01 <= wait <= 10.0):
+        raise ValueError("Intervalo temporal wait inválido para aplicação no projeto.")
     expected_bytes = frames * dds_bytes_for(*size)
     if expected_bytes > RAF_SIZE_LIMIT:
         raise ValueError("Sequência DDS excede o limite canônico de 6 MiB.")
+
+    # Fail-closed parameter consistency against recipe & cryptographic renderKey when present
+    if isinstance(recipe, dict):
+        if "frames" in recipe and int(recipe["frames"]) != frames:
+            raise ValueError("Inconsistência de integridade: frames diverge da receita registrada.")
+        if "size" in recipe and tuple(recipe["size"]) != size:
+            raise ValueError("Inconsistência de integridade: resolução diverge da receita registrada.")
+        if "wait" in recipe and abs(float(recipe["wait"]) - wait) > 1e-4:
+            raise ValueError("Inconsistência de integridade: wait diverge da receita registrada.")
+        pid = report.get("profileId")
+        src_sha = recipe.get("sourceSha256")
+        strat_used = report.get("strategyUsed") or recipe.get("strategyUsed")
+        src_interval = report.get("sourceInterval")
+        if pid and src_sha and strat_used and report.get("renderKey"):
+            st_v = src_interval[0] if isinstance(src_interval, (list, tuple)) and len(src_interval) == 2 else recipe.get("start")
+            en_v = src_interval[1] if isinstance(src_interval, (list, tuple)) and len(src_interval) == 2 else recipe.get("end")
+            if st_v is not None and en_v is not None:
+                expected_rk = io_media.fingerprint(
+                    [
+                        OUROBOROS_VERSION,
+                        src_sha,
+                        str(pid),
+                        list(size),
+                        st_v,
+                        en_v,
+                        frames,
+                        wait,
+                        strat_used,
+                        dds_hashes,
+                    ]
+                )
+                if expected_rk != report["renderKey"]:
+                    raise ValueError(
+                        "Identidade criptográfica renderKey diverge dos parâmetros ou hashes DDS da proposta."
+                    )
+
+    # Fail-closed completeness check on ddsHashes and files manifests
+    expected_dds_names = [theme.frame_name(i) for i in range(frames)]
+    if not isinstance(dds_hashes, dict) or set(dds_hashes.keys()) != set(expected_dds_names):
+        raise ValueError("Manifesto ddsHashes ausente ou incompleto — aplicação bloqueada (fail-closed).")
+    if not isinstance(file_hashes, dict) or not file_hashes.get("background.raf.zip"):
+        raise ValueError("Manifesto files sem hash de background.raf.zip — aplicação bloqueada (fail-closed).")
+    for i in range(frames):
+        if not file_hashes.get(f"{i:02d}.webp"):
+            raise ValueError(f"Manifesto files sem hash de {i:02d}.webp — aplicação bloqueada (fail-closed).")
 
     dds_src = result_folder / "deluxe_dds"
     png_src = result_folder / "deluxe_frames"
@@ -183,29 +237,85 @@ def apply_loop_to_project(
     if not (dds_src.is_dir() and png_src.is_dir() and raf_src.is_file()):
         raise ValueError("Artefatos renderizados incompletos para aplicação.")
 
-    if file_hashes.get("background.raf.zip"):
-        if sha256_bytes(raf_src.read_bytes()) != file_hashes["background.raf.zip"]:
-            raise ValueError("Integridade SHA-256 falhou para background.raf.zip.")
+    raf_bytes = raf_src.read_bytes()
+    if sha256_bytes(raf_bytes) != file_hashes["background.raf.zip"]:
+        raise ValueError("Integridade SHA-256 falhou para background.raf.zip.")
+    for opt_extra in ("source.png", "diff.png"):
+        if file_hashes.get(opt_extra):
+            ep = result_folder / opt_extra
+            if not ep.is_file() or sha256_bytes(ep.read_bytes()) != file_hashes[opt_extra]:
+                raise ValueError(f"Integridade SHA-256 falhou para {opt_extra}.")
+
+    # Verify internal contents of background.raf.zip (every DDS matches ddsHashes, valid plane.mdx & index.xml)
+    try:
+        with zipfile.ZipFile(raf_src, "r") as zf:
+            znames = [n for n in zf.namelist() if not n.endswith("/")]
+            for zn in znames:
+                if zn.startswith("/") or ".." in Path(zn).parts:
+                    raise ValueError(f"Caminho inseguro em background.raf.zip: {zn}")
+            # theme.zip_raf_folder packs entries under `scene/background.raf/<name>`
+            by_norm: dict[str, str] = {}
+            for zn in znames:
+                if zn.startswith("scene/background.raf/"):
+                    norm = zn[len("scene/background.raf/"):]
+                elif zn.startswith("background.raf/"):
+                    norm = zn[len("background.raf/"):]
+                else:
+                    norm = zn
+                if "/" in norm:
+                    raise ValueError(f"Estrutura inesperada em background.raf.zip: {zn}")
+                by_norm[norm] = zn
+            zip_dds = {n for n in by_norm if n.endswith(".dds")}
+            if zip_dds != set(expected_dds_names):
+                raise ValueError("Lista de arquivos DDS dentro de background.raf.zip diverge do esperado.")
+            for d_name in expected_dds_names:
+                if sha256_bytes(zf.read(by_norm[d_name])) != dds_hashes[d_name]:
+                    raise ValueError(f"DDS interno em background.raf.zip diverge de ddsHashes: {d_name}.")
+            if raf.MODEL_REAL_FILE not in by_norm or "index.xml" not in by_norm:
+                raise ValueError("background.raf.zip não contém plane.mdx e index.xml.")
+            mdx.parse(zf.read(by_norm[raf.MODEL_REAL_FILE]))
+            idx_text = zf.read(by_norm["index.xml"]).decode("utf-8")
+            if re.search(r"<!\s*(DOCTYPE|ENTITY)\b", idx_text, re.IGNORECASE):
+                raise ValueError("index.xml dentro de background.raf.zip contém DOCTYPE/ENTITY proibido.")
+            idx_root = ET.fromstring(idx_text)
+            idx_cases = idx_root.findall(".//sequence/case")
+            if len(idx_cases) != frames:
+                raise ValueError(
+                    f"index.xml dentro de background.raf.zip tem {len(idx_cases)} etapas (esperado {frames})."
+                )
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"background.raf.zip inválido ou corrompido: {exc}") from exc
 
     loaded_frames = []
     total_bytes = 0
     for i in range(frames):
         d_name = theme.frame_name(i)
+        p_name = f"{i:02d}.png"
         w_name = f"{i:02d}.webp"
         d_path = dds_src / d_name
-        p_path = png_src / f"{i:02d}.png"
+        p_path = png_src / p_name
         w_path = result_folder / w_name
         if not (d_path.is_file() and p_path.is_file() and w_path.is_file()):
             raise ValueError(f"Quadro {i:02d} ausente nos derivados renderizados.")
         blob = d_path.read_bytes()
-        if dds_hashes.get(d_name) and sha256_bytes(blob) != dds_hashes[d_name]:
+        if sha256_bytes(blob) != dds_hashes[d_name]:
             raise ValueError(f"Integridade SHA-256 falhou para {d_name}.")
-        if file_hashes.get(w_name) and sha256_bytes(w_path.read_bytes()) != file_hashes[w_name]:
+        if sha256_bytes(w_path.read_bytes()) != file_hashes[w_name]:
             raise ValueError(f"Integridade SHA-256 falhou para {w_name}.")
+        if frame_png_hashes:
+            if p_name not in frame_png_hashes or sha256_bytes(p_path.read_bytes()) != frame_png_hashes[p_name]:
+                raise ValueError(f"Integridade SHA-256 falhou para deluxe_frames/{p_name}.")
         if blob[:4] != b"DDS " or blob[84:88] != b"DXT1":
             raise ValueError(f"Cabeçalho DDS inválido em {d_name}.")
         total_bytes += len(blob)
         with Image.open(p_path) as im:
+            im.load()
+            if im.size != size:
+                raise ValueError(
+                    f"Resolução de deluxe_frames/{p_name} ({im.size[0]}×{im.size[1]}) diverge de {size[0]}×{size[1]}."
+                )
             loaded_frames.append(np.asarray(im.convert("RGB")))
 
     if total_bytes != expected_bytes:

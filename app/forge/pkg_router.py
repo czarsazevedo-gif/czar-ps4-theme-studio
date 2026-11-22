@@ -30,8 +30,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from .. import at9, jobs, pkg, theme_xml
 from ..config import MAX_UPLOAD_BYTES, PKG_DEFAULTS
 from ..dds import DEFAULT_BACKEND
-from .bundle_service import _parse_params, assemble_theme_tree
+from .bundle_service import _parse_params, assemble_theme_tree, resolve_theme_inputs_from_saved_project
 from .contracts import PS4_PKG_DEFAULT_PASSCODE
+from .manifest import build_fortaleza_manifest, compute_theme_inputs_fingerprint
 from .pkg_forge import (
     PkgForgeCancelled,
     PkgForgeError,
@@ -172,37 +173,56 @@ def _execute_pkg_task(task: PkgTask, params: dict) -> None:
             task.progress(stage_txt, pct)
             _persist_task_snapshot(task)
 
+        inputs_fp, _inputs_detail = compute_theme_inputs_fingerprint(params, task.workspace)
         pkg_path, bundle_report, pkg_report, log_steps = build_and_validate_theme_pkg(
             content_dir,
             gp4_path,
             meta,
             pkg_out_dir,
+            inputs_fingerprint=inputs_fp,
             progress=_on_progress,
             check=task.check,
             register_proc=task.register_proc,
         )
 
-        # Persist only final validated .pkg + reports atomically (clean heavy intermediate staging)
+        # Persist only final validated .pkg + reports + integrity manifest atomically
         pub_stage = store_root / f".publish-{pkg_id}"
         pub_stage.mkdir(parents=True, exist_ok=True)
         final_pkg = pub_stage / pkg_path.name
         shutil.move(str(pkg_path), str(final_pkg))
+
+        bundle_dump = bundle_report.model_dump()
+        pkg_dump = pkg_report.model_dump()
+        integrity_manifest = build_fortaleza_manifest(
+            params=params,
+            workspace=task.workspace,
+            bundle_report=bundle_dump,
+            pkg_report=pkg_dump,
+            digital_twin=pkg_dump.get("digital_twin_summary"),
+        )
 
         record = {
             "pkg_id": pkg_id,
             "pkg_name": final_pkg.name,
             "pkg_bytes": final_pkg.stat().st_size,
             "pkg_sha256": pkg_report.pkg_sha256,
+            "inputs_fingerprint": inputs_fp,
             "project_revision": params.get("project_revision"),
+            "release_gate": pkg_report.release_gate,
+            "release_gate_reasons": list(pkg_report.release_gate_reasons),
             "content_id": meta.content_id,
             "title_id": meta.title_id,
             "title": meta.title,
             "created_at": time.time(),
             "included": included,
-            "bundle_report": bundle_report.model_dump(),
-            "pkg_report": pkg_report.model_dump(),
+            "bundle_report": bundle_dump,
+            "pkg_report": pkg_dump,
+            "integrity_manifest": integrity_manifest,
             "log": log_steps,
         }
+        (pub_stage / "integrity_manifest.json").write_text(
+            json.dumps(integrity_manifest, indent=2), encoding="utf-8"
+        )
         (pub_stage / "report.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
         pub_stage.rename(final_dir)
 
@@ -392,62 +412,96 @@ def forge_pkg_job_cancel(task_id: str) -> dict:
         return task.public()
 
 
-def _normalize_persisted_pkg_report(pr: dict) -> dict:
-    """Normalize persisted pkg_report metadata so legacy/incomplete records NEVER claim validation."""
+def _current_project_fingerprint() -> tuple[str | None, int | None]:
+    """Compute live inputs fingerprint & revision of the active saved project (None if unsaved/non-project)."""
+    ws = jobs.project_workspace.get()
+    if ws is None or not (ws.parent / "manifest.json").is_file():
+        return None, None
+    try:
+        live_params = resolve_theme_inputs_from_saved_project()
+        fp, _ = compute_theme_inputs_fingerprint(live_params, ws)
+        rev = live_params.get("project_revision")
+        return fp, (int(rev) if rev is not None else None)
+    except Exception:
+        return None, None
+
+
+def _normalize_persisted_pkg_report(
+    pr: dict,
+    *,
+    record_inputs_fp: str | None = None,
+    record_project_rev: int | None = None,
+    current_inputs_fp: str | None = None,
+    current_project_rev: int | None = None,
+) -> dict:
+    """Normalize persisted pkg_report metadata so legacy, incomplete, or stale records NEVER claim active approval."""
     raw_level = pr.get("verification_level")
+    rec_fp = str(record_inputs_fp or pr.get("inputs_fingerprint") or "").strip()
+    stale = False
+    if rec_fp and current_inputs_fp and rec_fp != current_inputs_fp:
+        stale = True
+    elif not rec_fp and record_project_rev is not None and current_project_rev is not None:
+        if int(record_project_rev) != int(current_project_rev):
+            stale = True
+
     if not raw_level:
         return {
             "verification_level": "failed",
             "structure_validated": False,
             "package_status": "PACOTE GERADO",
             "legacy_unverified": True,
+            "stale_vs_project": stale,
+            "release_gate": "REGRESSION_DETECTED" if stale else "BUILD_FAILED",
             "verification_reason": (
                 "Histórico legado sem verification_level registrado — revalide o PKG antes de instalar no PS4."
             ),
         }
+
     level = str(raw_level)
+    persisted_gate = str(pr.get("release_gate") or "")
     if level == "full_bundle_verified":
         sv = bool(pr.get("structure_validated", False))
-        return {
-            "verification_level": level,
-            "structure_validated": sv,
-            "package_status": pr.get(
-                "package_status",
-                "PACOTE VALIDADO ESTRUTURALMENTE" if sv else "FALHA DE EMPACOTAMENTO",
-            ),
-            "legacy_unverified": False,
-            "verification_reason": (
-                "Verificação completa: Cabeçalho + Sc0 + Image0 extraído + SHA-256 ↔ Bundle."
-                if sv
-                else "Verificação completa reprovada."
-            ),
-        }
-    if level == "extracted_uncompared":
+        gate = persisted_gate or ("PHYSICAL_TEST_PENDING" if sv else "BUILD_FAILED")
+        reason = (
+            "Verificação completa: Cabeçalho + Sc0 + Image0 extraído + Digital Twin + SHA-256 ↔ Bundle."
+            if sv
+            else "Verificação completa reprovada."
+        )
+        status = pr.get(
+            "package_status",
+            "PACOTE VALIDADO ESTRUTURALMENTE" if sv else "FALHA DE EMPACOTAMENTO",
+        )
+    elif level == "extracted_uncompared":
         sv = bool(pr.get("structure_validated", False))
-        return {
-            "verification_level": level,
-            "structure_validated": sv,
-            "package_status": pr.get(
-                "package_status",
-                "PACOTE VALIDADO ESTRUTURALMENTE" if sv else "PACOTE GERADO",
-            ),
-            "legacy_unverified": False,
-            "verification_reason": "Image0 extraído e validado sem comparação SHA-256 contra o bundle de origem.",
-        }
-    if level == "header_and_sc0_only":
-        return {
-            "verification_level": level,
-            "structure_validated": False,
-            "package_status": pr.get("package_status", "PACOTE GERADO"),
-            "legacy_unverified": False,
-            "verification_reason": "Verificação parcial: apenas cabeçalho e Sc0 conferidos (Image0 não extraído).",
-        }
+        gate = persisted_gate or ("SEMANTICALLY_VALIDATED" if sv else "BUILD_FAILED")
+        reason = "Image0 extraído e validado sem comparação SHA-256 contra o bundle de origem."
+        status = pr.get(
+            "package_status",
+            "PACOTE VALIDADO ESTRUTURALMENTE" if sv else "PACOTE GERADO",
+        )
+    elif level == "header_and_sc0_only":
+        sv = False
+        gate = persisted_gate or "STRUCTURE_VALIDATED"
+        reason = "Verificação parcial: apenas cabeçalho e Sc0 conferidos (Image0 não extraído)."
+        status = pr.get("package_status", "PACOTE GERADO")
+    else:
+        sv = False
+        gate = persisted_gate or "BUILD_FAILED"
+        reason = "Verificação estrutural reprovada ou incompleta."
+        status = pr.get("package_status", "FALHA DE EMPACOTAMENTO")
+
+    if stale:
+        gate = "REGRESSION_DETECTED"
+        reason = "Projeto alterado após a geração deste PKG — selo de aprovação anterior invalidado; gere e valide novamente."
+
     return {
         "verification_level": level,
-        "structure_validated": False,
-        "package_status": pr.get("package_status", "FALHA DE EMPACOTAMENTO"),
+        "structure_validated": sv,
+        "package_status": status,
         "legacy_unverified": False,
-        "verification_reason": "Verificação estrutural reprovada ou incompleta.",
+        "stale_vs_project": stale,
+        "release_gate": gate,
+        "verification_reason": reason,
     }
 
 
@@ -457,6 +511,7 @@ def forge_pkg_history() -> dict:
     root = _forge_store_root(create=False)
     if not root.is_dir():
         return {"items": []}
+    current_fp, current_rev = _current_project_fingerprint()
     items = []
     for child in root.iterdir():
         if not child.is_dir() or not PKG_ID_RE.fullmatch(child.name):
@@ -467,13 +522,20 @@ def forge_pkg_history() -> dict:
         try:
             rec = json.loads(rep_file.read_text(encoding="utf-8"))
             pr = rec.get("pkg_report", {})
-            norm = _normalize_persisted_pkg_report(pr)
+            norm = _normalize_persisted_pkg_report(
+                pr,
+                record_inputs_fp=rec.get("inputs_fingerprint"),
+                record_project_rev=rec.get("project_revision"),
+                current_inputs_fp=current_fp,
+                current_project_rev=current_rev,
+            )
             items.append(
                 {
                     "pkg_id": rec["pkg_id"],
                     "pkg_name": rec["pkg_name"],
                     "pkg_bytes": rec["pkg_bytes"],
                     "pkg_sha256": rec.get("pkg_sha256") or pr.get("pkg_sha256") or "",
+                    "inputs_fingerprint": rec.get("inputs_fingerprint") or pr.get("inputs_fingerprint") or "",
                     "project_revision": rec.get("project_revision"),
                     "content_id": rec["content_id"],
                     "title": rec.get("title", ""),
@@ -487,6 +549,8 @@ def forge_pkg_history() -> dict:
                     "package_status": norm["package_status"],
                     "structure_validated": norm["structure_validated"],
                     "legacy_unverified": norm["legacy_unverified"],
+                    "stale_vs_project": norm["stale_vs_project"],
+                    "release_gate": norm["release_gate"],
                     "verification_reason": norm["verification_reason"],
                     "theme_type_valid": pr.get("theme_type_valid", False),
                     "physical_compatibility": pr.get("physical_compatibility", "pending"),
@@ -495,7 +559,11 @@ def forge_pkg_history() -> dict:
         except (OSError, ValueError, KeyError):
             continue
     items.sort(key=lambda x: x["created_at"], reverse=True)
-    return {"items": items}
+    return {
+        "items": items,
+        "current_inputs_fingerprint": current_fp,
+        "current_project_revision": current_rev,
+    }
 
 
 def _load_persisted_pkg(pkg_id: str) -> tuple[Path, dict]:
@@ -521,11 +589,20 @@ def forge_pkg_report(pkg_id: str) -> dict:
     _pkg_path, rec = _load_persisted_pkg(pkg_id)
     pr = rec.get("pkg_report")
     if isinstance(pr, dict):
-        norm = _normalize_persisted_pkg_report(pr)
+        current_fp, current_rev = _current_project_fingerprint()
+        norm = _normalize_persisted_pkg_report(
+            pr,
+            record_inputs_fp=rec.get("inputs_fingerprint"),
+            record_project_rev=rec.get("project_revision"),
+            current_inputs_fp=current_fp,
+            current_project_rev=current_rev,
+        )
         pr_out = dict(pr)
         pr_out.update(norm)
         rec = dict(rec)
         rec["pkg_report"] = pr_out
+        rec["stale_vs_project"] = norm["stale_vs_project"]
+        rec["release_gate"] = norm["release_gate"]
         rec.setdefault("pkg_sha256", pr_out.get("pkg_sha256") or "")
     return rec
 
