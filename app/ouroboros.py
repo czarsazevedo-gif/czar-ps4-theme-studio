@@ -20,6 +20,7 @@ from pydantic import Field
 
 from . import jobs, library, projects
 from .composition_model import AssetId, Model
+from .config import SESSION_MEDIA_TTL_SECONDS
 from .ouroboros_engine import OUROBOROS_VERSION, OuroborosEngine, media_io as engine_media
 from .ouroboros_engine.regions import RegionalRecipe, list_recipes, load_recipe, save_recipe
 from .projects import JobId
@@ -87,6 +88,18 @@ class Task:
 tasks: dict[str, Task] = {}
 
 
+def touch_ouroboros_tasks(project_root: Path | None = None) -> int:
+    """Refresh finished timestamp of Ouroboros tasks during active keep-alive."""
+    now = time.monotonic()
+    touched = 0
+    with lock:
+        for t in tasks.values():
+            if t.finished and (project_root is None or t.root == project_root):
+                t.finished = now
+                touched += 1
+    return touched
+
+
 def workspace() -> Path:
     root = jobs.project_workspace.get()
     if not root:
@@ -119,7 +132,7 @@ def record(root: Path, key: str) -> tuple[Path, dict]:
 def submit(root: Path, signature: str, calculate, *, preempt: bool = True, force_new: bool = False) -> dict:
     with lock:
         for ident, t in list(tasks.items()):
-            if t.finished and time.monotonic() - t.finished > 600:
+            if t.finished and time.monotonic() - t.finished > SESSION_MEDIA_TTL_SECONDS:
                 del tasks[ident]
         running = [t for t in tasks.values() if t.state == "working"]
         active_other = 0

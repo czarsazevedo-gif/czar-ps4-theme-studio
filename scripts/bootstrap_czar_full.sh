@@ -126,6 +126,12 @@ ensure_system_prereqs() {
     if ! command -v chromium >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then
         missing+=("chromium")
     fi
+    if ! command -v rsvg-convert >/dev/null 2>&1; then
+        missing+=("rsvg-convert")
+    fi
+    if ! ldconfig -p 2>/dev/null | grep -q 'libcairo\.so\.2'; then
+        missing+=("libcairo2")
+    fi
     if (( ${#missing[@]} == 0 )); then
         echo "[OK] Pré-requisitos de sistema já presentes."
         return 0
@@ -146,6 +152,8 @@ ensure_system_prereqs() {
                 autoconf|automake) pkgs+=(autoconf automake) ;;
                 pkg-config) pkgs+=(pkg-config) ;;
                 chromium) pkgs+=(chromium) ;;
+                rsvg-convert) pkgs+=(librsvg2-bin) ;;
+                libcairo2) pkgs+=(libcairo2) ;;
                 git|curl|tar|unzip) pkgs+=("$m") ;;
             esac
         done
@@ -196,7 +204,7 @@ ensure_python_env() {
     # Verifica se tudo já está instalado e sem conflitos de OpenCV
     if "${py_bin}" - <<'PY' >/dev/null 2>&1
 import importlib
-for mod in ("fastapi", "uvicorn", "multipart", "numpy", "pydantic", "PIL", "cv2", "scipy", "skimage", "av", "imageio", "httpx", "pytest", "pytest_asyncio", "playwright", "gdown"):
+for mod in ("fastapi", "uvicorn", "multipart", "numpy", "pydantic", "PIL", "cv2", "scipy", "skimage", "av", "imageio", "resvg_py", "httpx", "pytest", "pytest_asyncio", "playwright", "gdown"):
     importlib.import_module(mod)
 import importlib.metadata as md
 dists = {d.metadata["Name"].lower() for d in md.distributions() if d.metadata.get("Name")}

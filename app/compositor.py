@@ -38,7 +38,7 @@ def lookup(root: Path, ident: str):
     except (ValueError, OSError) as exc:
         raise HTTPException(422, "O original de uma camada está incompleto ou inválido.") from exc
     if asset.extension not in IMAGE_EXTS or asset.kind not in {"image", "animation"}:
-        raise HTTPException(422, "As camadas aceitam somente imagens raster da biblioteca.")
+        raise HTTPException(422, "As camadas aceitam somente imagens (raster ou SVG) da biblioteca.")
     return asset, source
 
 
@@ -77,7 +77,9 @@ def raster(root: Path, ident: str) -> Path:
             with tempfile.TemporaryDirectory(dir=cache) as stage:
                 output = Path(stage) / "raster.png"
                 try:
-                    media.render_image(source, output, (512, 512))
+                    media.render_image(
+                        source, output, (1024, 1024), force_rgba=True, contain_transparent=True
+                    )
                 except media.MediaError as exc:
                     raise HTTPException(422, str(exc)) from exc
                 output.replace(target)

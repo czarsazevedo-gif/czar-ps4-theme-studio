@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 
 from pydantic import BaseModel, ConfigDict
 
-from . import at9, compositor, dxt1, jobs, library, mdx, media, ouroboros, pkg, projects, raf, system_health, theme, theme_xml, vag
+from . import at9, compositor, dxt1, jobs, library, mdx, media, ouroboros, pkg, projects, raf, system_health, theme, theme_xml, uploads, vag
 from .forge import audio_router as forge_audio
 from .forge import bundle_service as forge_bundle
 from .forge import pkg_forge, pkg_router as forge_pkg, sfo as forge_sfo
@@ -39,7 +39,11 @@ from .config import (
     FUNCTION_ICONS,
     AUDIO_EXTS,
     AUDIO_SLOTS,
+    KEEPALIVE_INTERVAL_MS,
     MAX_SFX_SECONDS,
+    MAX_VIDEO_UPLOAD_BYTES,
+    MEDIA_FOLDERS,
+    SESSION_MEDIA_TTL_SECONDS,
     SOUND_EXTS,
     IMAGE_SLOTS,
     ICON_SIZE,
@@ -57,6 +61,7 @@ from .config import (
     STATIC_DIR,
     STATIC_SIZE,
     THEME_PATHS,
+    UPLOAD_CHUNK_BYTES,
     MAX_WAIT_SECONDS,
     MIN_WAIT_SECONDS,
     VIDEO_EXTS,
@@ -66,12 +71,15 @@ from .config import (
 from .dds import DEFAULT_BACKEND, available_backends, encode_frame, encode_sequence
 from .media import MediaError
 
+_SERVER_STARTED_AT = time.time()
+
 app = FastAPI(title="PS4 Theme Asset Creator", docs_url=None, redoc_url=None)
 app.middleware("http")(projects.scope_jobs)
 app.include_router(projects.router)
 app.include_router(library.router)
 app.include_router(compositor.router)
 app.include_router(ouroboros.router)
+app.include_router(uploads.router)
 app.include_router(forge_audio.router)
 app.include_router(forge_bundle.router)
 app.include_router(forge_pkg.router)
@@ -101,20 +109,30 @@ async def _media_error_handler(_request, exc: MediaError):
     return JSONResponse(status_code=422, content={"detail": _sanitize_media_error(str(exc))})
 
 
-async def _read_upload(file: UploadFile, allowed: set[str]) -> bytes:
-    suffix = Path(file.filename or "").suffix.lower()
+def _validate_upload_ext(filename: str | None, allowed: set[str]) -> str:
+    suffix = Path(filename or "").suffix.lower()
     if suffix not in allowed:
         raise HTTPException(
             415,
             f"Unsupported extension: {suffix or '(no extension)'}. "
             f"Accepted: {', '.join(sorted(allowed))}",
         )
+    return suffix
+
+
+async def _read_upload(file: UploadFile, allowed: set[str]) -> bytes:
+    _validate_upload_ext(file.filename, allowed)
     data = await file.read(MAX_UPLOAD_BYTES + 1)
     if not data:
         raise HTTPException(400, "The file arrived empty.")
     if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, f"The file exceeds {MAX_UPLOAD_BYTES // 1048576} MB.")
+        raise HTTPException(
+            413,
+            f"The file exceeds {MAX_UPLOAD_BYTES // 1048576} MB.",
+            headers={"X-Czar-Limit-Error": "1"},
+        )
     return data
+
 
 
 def _get_job(kind: str, job_id: str) -> jobs.Job:
@@ -206,6 +224,53 @@ def healthz() -> dict:
     }
 
 
+@app.api_route("/api/keepalive", methods=["GET", "POST"])
+def api_keepalive(request: Request) -> JSONResponse:
+    """Lightweight heartbeat endpoint (every 25s) to prevent idle drops and refresh active TTLs."""
+    now = time.time()
+    session = projects.owner(request)
+    ws = jobs.project_workspace.get()
+    project_root = ws.parent if (ws is not None and ws.name == "media") else None
+
+    touched_uploads = uploads.touch_session_uploads(session)
+    touched_audio = forge_audio.touch_audio_stages(ws)
+    if session and ws is None:
+        standalone_forge = projects.ROOT / session / "_standalone_forge"
+        if standalone_forge.is_dir():
+            touched_audio += forge_audio.touch_audio_stages(standalone_forge)
+    touched_pkg = forge_pkg.touch_pkg_tasks(ws)
+    touched_ob = ouroboros.touch_ouroboros_tasks(project_root)
+
+    if ws is not None and ws.is_dir():
+        try:
+            (ws / ".keepalive").write_text(f"{now:.3f}\n", encoding="utf-8")
+        except OSError:
+            pass
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "status": "alive",
+            "server_time": now,
+            "uptime_seconds": round(max(0.0, now - _SERVER_STARTED_AT), 2),
+            "ttl_seconds": SESSION_MEDIA_TTL_SECONDS,
+            "keepalive_interval_ms": KEEPALIVE_INTERVAL_MS,
+            "session_active": bool(session),
+            "project_touched": bool(ws is not None),
+            "refreshed": {
+                "uploads": touched_uploads,
+                "audio_stages": touched_audio,
+                "pkg_tasks": touched_pkg,
+                "ouroboros_tasks": touched_ob,
+            },
+        },
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "X-Czar-Keepalive": "1",
+        },
+    )
+
+
 @app.get("/api/system")
 def system_info(refresh: bool = False) -> dict:
     health = system_health.get_system_health(force=refresh)
@@ -218,6 +283,7 @@ def system_info(refresh: bool = False) -> dict:
         "pkg_forge": pkg_forge.pkg_forge_info(),
         "at9tool": tools["at9"]["state"] == "ok",
         "at9_encoder": at9.encoder_info(),
+        "svg_rasterizer": media.svg_rasterizer_info(),
         "health": health,
         "tools_setup": system_health.get_tool_setup_status(),
         "min_gain_db": MIN_GAIN_DB,
@@ -235,6 +301,22 @@ def system_info(refresh: bool = False) -> dict:
         ],
         "limit_bytes": RAF_SIZE_LIMIT,
         "animated_frame_bytes": ANIMATED_FRAME_BYTES,
+        "chunk_size": UPLOAD_CHUNK_BYTES,
+        "max_video_bytes": MAX_VIDEO_UPLOAD_BYTES,
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "keepalive_interval_ms": KEEPALIVE_INTERVAL_MS,
+        "ttl_seconds": SESSION_MEDIA_TTL_SECONDS,
+        "media_folders": [
+            {
+                "id": f["id"],
+                "subdir": f["subdir"],
+                "label": f["label"],
+                "accept_kinds": list(f["accept_kinds"]),
+                "accept_exts": list(f["accept_exts"]),
+                "description": f["description"],
+            }
+            for f in MEDIA_FOLDERS
+        ],
         "sizes": {
             "static": list(STATIC_SIZE),
             "animated": list(ANIMATED_SIZE),
@@ -245,6 +327,7 @@ def system_info(refresh: bool = False) -> dict:
             "image": sorted(IMAGE_EXTS),
         },
     }
+
 
 
 @app.get("/api/system/health")
@@ -396,7 +479,7 @@ def _build_animated_preview(job: jobs.Job, frame_count: int,
 
     # The querystring keeps the browser from reusing frames from a past run.
     stamp = int(time.time() * 1000)
-    return {
+    res = {
         "job_id": job.id,
         "frames": [
             f"/api/animated/{job.id}/preview/{p.name}?v={stamp}" for p in frames
@@ -408,10 +491,59 @@ def _build_animated_preview(job: jobs.Job, frame_count: int,
             "height": info.height,
             "codec": info.codec,
             "frame_count": info.frame_count,
+            "fps": round(info.fps, 3) if info.fps else None,
         },
         "fps_used": round(job.meta["fps_used"], 4),
         "budget": _budget(len(frames), size),
     }
+    if job.meta.get("normalized"):
+        res["normalized"] = job.meta["normalized"]
+    return res
+
+
+def _ingest_animated_from_path(
+    src_path: Path,
+    filename: str,
+    *,
+    frames: int = 12,
+    size: str = "",
+    delete_source: bool = True,
+    cancel_event=None,
+    register_proc=None,
+    progress_cb=None,
+) -> dict:
+    """Ingest an on-disk video/GIF into an animated job with automatic 4K->720p normalization."""
+    job = jobs.create_from_path("animated", filename or "source", src_path, move=delete_source)
+    try:
+        needs_norm, probed = media.video_needs_normalization(job.source)
+        if needs_norm:
+            if progress_cb:
+                progress_cb(
+                    f"Normalizando vídeo {probed.width}×{probed.height} para 1280×720 H.264 alta qualidade…",
+                    55,
+                )
+            norm_tmp = job.root / "source_normalized.mp4"
+            norm_info = media.normalize_video_for_ps4(
+                job.source,
+                norm_tmp,
+                keep_audio=False,
+                delete_source=True,
+                cancel_event=cancel_event,
+                register_proc=register_proc,
+            )
+            final_src = job.root / "source.mp4"
+            norm_tmp.replace(final_src)
+            job.source = final_src
+            job.meta["normalized"] = {k: v for k, v in norm_info.items() if k != "path"}
+            job.save()
+        if progress_cb:
+            progress_cb("Extraindo quadros de prévia do fundo animado…", 85)
+        result = _prepare_animated_upload(job, frames, size)
+        projects.mirror_job_to_project_folder(job, slot_id="animated")
+        return result
+    except BaseException:
+        shutil.rmtree(job.root, ignore_errors=True)
+        raise
 
 
 @app.post("/api/animated/upload")
@@ -420,12 +552,33 @@ async def animated_upload(
     frames: int = Form(12),
     size: str = Form(""),
 ) -> dict:
-    data = await _read_upload(file, VIDEO_EXTS)
-    job = jobs.create("animated", file.filename or "source", data)
+    ext = _validate_upload_ext(file.filename, VIDEO_EXTS)
+    max_bytes = MAX_VIDEO_UPLOAD_BYTES if ext not in {".gif", ".apng"} else MAX_UPLOAD_BYTES
+    job = await jobs.create_streaming("animated", file.filename or "source", file, max_bytes)
     loop = asyncio.get_running_loop()
     ctx = contextvars.copy_context()
+
+    def _run() -> dict:
+        needs_norm, _probed = media.video_needs_normalization(job.source)
+        if needs_norm:
+            norm_tmp = job.root / "source_normalized.mp4"
+            norm_info = media.normalize_video_for_ps4(
+                job.source,
+                norm_tmp,
+                keep_audio=False,
+                delete_source=True,
+            )
+            final_src = job.root / "source.mp4"
+            norm_tmp.replace(final_src)
+            job.source = final_src
+            job.meta["normalized"] = {k: v for k, v in norm_info.items() if k != "path"}
+            job.save()
+        res = _prepare_animated_upload(job, frames, size)
+        projects.mirror_job_to_project_folder(job, slot_id="animated")
+        return res
+
     try:
-        return await loop.run_in_executor(_RAF_EXPORT_POOL, ctx.run, _prepare_animated_upload, job, frames, size)
+        return await loop.run_in_executor(_RAF_EXPORT_POOL, ctx.run, _run)
     except BaseException:
         shutil.rmtree(job.root, ignore_errors=True)
         raise
@@ -433,7 +586,10 @@ async def animated_upload(
 
 def _prepare_animated_upload(job: jobs.Job, frames: int, size: str) -> dict:
     sz = _parse_size(size)
-    return _build_animated_preview(job, _clamp_frames(frames, sz), sz)
+    res = _build_animated_preview(job, _clamp_frames(frames, sz), sz)
+    projects.mirror_job_to_project_folder(job, slot_id="animated")
+    return res
+
 
 
 @app.post("/api/animated/{job_id}/frames")
@@ -665,8 +821,8 @@ async def slot_upload(slot_id: str, file: UploadFile = File(...)) -> dict:
     if spec is None:
         raise HTTPException(404, f"Unknown slot: {slot_id}")
 
-    data = await _read_upload(file, IMAGE_EXTS)
-    job = jobs.create("slot", file.filename or "source", data)
+    _validate_upload_ext(file.filename, IMAGE_EXTS)
+    job = await jobs.create_streaming("slot", file.filename or "source", file, MAX_UPLOAD_BYTES)
     try:
         return _prepare_slot_upload(job, slot_id, spec)
     except BaseException:
@@ -716,8 +872,8 @@ async def slots_upload_batch(files: list[UploadFile] = File(...)) -> dict:
     uploaded: list[dict] = []
     for slot_id, fname in sorted(mapping["mapped"].items()):
         spec = IMAGE_SLOTS[slot_id]
-        data = await _read_upload(by_name[fname], IMAGE_EXTS)
-        job = jobs.create("slot", fname, data)
+        _validate_upload_ext(fname, IMAGE_EXTS)
+        job = await jobs.create_streaming("slot", fname, by_name[fname], MAX_UPLOAD_BYTES)
         try:
             uploaded.append(_prepare_slot_upload(job, slot_id, spec))
         except BaseException:
@@ -737,16 +893,55 @@ def _prepare_slot_upload(job: jobs.Job, slot_id: str, spec: dict) -> dict:
     job.save()
 
     info = media.probe(job.source)
+    stamp = int(time.time() * 1000)
+
+    if spec["group"] in {"function_icon", "content_icon"}:
+        conv = media.render_icon_assets(job.source, job.out_dir, job.preview_dir, spec)
+        job.meta["converted"] = conv["icon_name"]
+        if conv["glow_name"]:
+            job.meta["converted_glow"] = conv["glow_name"]
+        else:
+            job.meta.pop("converted_glow", None)
+        job.meta["icon_conversion"] = {
+            "format": conv["format"],
+            "mode": conv["mode"],
+            "size": conv["icon_size"],
+            "bytes": conv["icon_bytes"],
+            "glow_size": conv["glow_size"],
+            "glow_bytes": conv["glow_bytes"],
+            "source_is_svg": conv["source_is_svg"],
+            "native_glow_from_source": conv["native_glow_from_source"],
+        }
+        job.save()
+        projects.mirror_job_to_project_folder(job, slot_id=slot_id)
+        out = {
+            "slot": slot_id,
+            "job_id": job.id,
+            "preview": f"/api/slot/{job.id}/preview?v={stamp}",
+            "asset": f"/api/slot/{job.id}/asset?v={stamp}",
+            "bytes": conv["preview_bytes"],
+            "target": list(spec["size"]),
+            "path": spec["path"],
+            "converted": job.meta["icon_conversion"],
+            "source": {"name": job.original_name, "width": info.width, "height": info.height, "codec": info.codec},
+        }
+        if conv["glow_name"]:
+            out["glow"] = f"/api/slot/{job.id}/glow?v={stamp}"
+            out["glow_target"] = list(spec["glow_size"])
+            out["glow_path"] = spec["glow_path"]
+        return out
+
     preview = media.render_image(job.source, job.preview_dir / "preview.webp", spec["size"])
+    projects.mirror_job_to_project_folder(job, slot_id=slot_id)
 
     return {
         "slot": slot_id,
         "job_id": job.id,
-        "preview": f"/api/slot/{job.id}/preview?v={int(time.time() * 1000)}",
+        "preview": f"/api/slot/{job.id}/preview?v={stamp}",
         "bytes": preview.stat().st_size,
         "target": list(spec["size"]),
         "path": spec["path"],
-        "source": {"name": job.original_name, "width": info.width, "height": info.height},
+        "source": {"name": job.original_name, "width": info.width, "height": info.height, "codec": info.codec},
     }
 
 
@@ -757,6 +952,30 @@ def slot_preview(job_id: str) -> FileResponse:
     if not path.is_file():
         raise HTTPException(404, "Preview not found.")
     return FileResponse(path, media_type="image/webp")
+
+
+@app.get("/api/slot/{job_id}/asset")
+def slot_asset(job_id: str) -> FileResponse:
+    """Serve the high-quality auto-converted RGBA PNG for function (128x128) or content (512x512) icons."""
+    job = _get_job("slot", job_id)
+    conv = job.meta.get("converted")
+    if conv:
+        path = job.out_dir / str(conv)
+        if Path(str(conv)).name == str(conv) and path.is_file():
+            return FileResponse(path, media_type="image/png", filename=path.name)
+    raise HTTPException(404, "Converted icon PNG not found.")
+
+
+@app.get("/api/slot/{job_id}/glow")
+def slot_glow(job_id: str) -> FileResponse:
+    """Serve the native 152x152 RGBA glow PNG rendered directly from the original high-res/SVG source."""
+    job = _get_job("slot", job_id)
+    conv_glow = job.meta.get("converted_glow")
+    if conv_glow:
+        path = job.out_dir / str(conv_glow)
+        if Path(str(conv_glow)).name == str(conv_glow) and path.is_file():
+            return FileResponse(path, media_type="image/png", filename=path.name)
+    raise HTTPException(404, "Converted glow PNG not found.")
 
 
 @app.get("/api/audio/slots")
@@ -789,8 +1008,8 @@ async def audio_upload(slot_id: str, file: UploadFile = File(...),
     if spec is None:
         raise HTTPException(404, f"Unknown audio slot: {slot_id}")
     filename = file.filename or ""
-    data = await _read_upload(file, _audio_upload_extensions(filename, spec))
-    job = jobs.create("audio", filename or "source", data)
+    _validate_upload_ext(filename, _audio_upload_extensions(filename, spec))
+    job = await jobs.create_streaming("audio", filename or "source", file, MAX_UPLOAD_BYTES)
     try:
         return _prepare_audio_upload(job, slot_id, spec, gain_db)
     except BaseException:
@@ -819,8 +1038,10 @@ def _audio_upload_extensions(filename: str, spec: dict) -> set[str]:
 
 def _prepare_audio_upload(job: jobs.Job, slot_id: str, spec: dict, gain_db: float) -> dict:
     job.meta["slot"] = slot_id
+    res = _procesar_audio(job, spec, _clamp_gain(gain_db))
+    projects.mirror_job_to_project_folder(job, slot_id=slot_id)
+    return res
 
-    return _procesar_audio(job, spec, _clamp_gain(gain_db))
 
 
 class LibraryUse(BaseModel):
@@ -1139,6 +1360,7 @@ def _reapply_forge_bgm_with_gain(job: jobs.Job, spec: dict, gain_db: float) -> d
     )
     job.save()
     forge_audio.ensure_audio_job_previews(job)
+    projects.mirror_job_to_project_folder(job, slot_id="bgm")
     stamp = int(time.time() * 1000)
     return {
         "slot": "bgm",
@@ -1180,7 +1402,9 @@ def audio_gain(job_id: str, gain_db: float = Form(0.0)) -> dict:
     clamped = _clamp_gain(gain_db)
     if slot_id == "bgm" and isinstance(job.meta.get("conversion_params"), dict):
         return _reapply_forge_bgm_with_gain(job, spec, clamped)
-    return _procesar_audio(job, spec, clamped)
+    res = _procesar_audio(job, spec, clamped)
+    projects.mirror_job_to_project_folder(job, slot_id=slot_id)
+    return res
 
 
 @app.get("/api/audio/{job_id}/preview")
@@ -1316,43 +1540,27 @@ def convert_targets() -> dict:
     }
 
 
-@app.post("/api/convert/{target}")
-async def convert_audio(target: str, file: UploadFile = File(...)) -> dict:
-    """Converts a standalone audio file and leaves it ready to download."""
-    spec = CONVERT_TARGETS.get(target)
-    if spec is None:
-        raise HTTPException(404, f"Unknown format: {target}")
-    if spec["needs_tool"] == "at9tool" and not at9.available():
-        raise HTTPException(
-            422, "at9tool was not found, so ATRAC9 cannot be generated."
-        )
+def _convert_audio_job(job: jobs.Job, target: str, spec: dict) -> dict:
+    info = media.probe_audio(job.source)
 
-    data = await _read_upload(file, SOUND_EXTS)
-    job = jobs.create("convert", file.filename or "source", data)
-    try:
-        info = media.probe_audio(job.source)
+    stem = Path(job.original_name).stem or "audio"
+    dest = job.out_dir / f"{stem}{spec['ext']}"
 
-        stem = Path(job.original_name).stem or "audio"
-        dest = job.out_dir / f"{stem}{spec['ext']}"
+    if target == "wav":
+        media.to_wav(job.source, dest, at9.SAMPLE_RATE)
+    elif target == "at9":
+        wav = job.out_dir / "_tmp.wav"
+        try:
+            media.to_wav(job.source, wav, at9.SAMPLE_RATE, at9.MAX_SECONDS)
+            at9.encode(wav, dest)
+        finally:
+            wav.unlink(missing_ok=True)
+    else:
+        pcm = media.pcm_mono(job.source, at9.SAMPLE_RATE, MAX_SFX_SECONDS)
+        dest.write_bytes(vag.encode(pcm, at9.SAMPLE_RATE, stem[:15]))
 
-        if target == "wav":
-            media.to_wav(job.source, dest, at9.SAMPLE_RATE)
-        elif target == "at9":
-            wav = job.out_dir / "_tmp.wav"
-            try:
-                media.to_wav(job.source, wav, at9.SAMPLE_RATE, at9.MAX_SECONDS)
-                at9.encode(wav, dest)
-            finally:
-                wav.unlink(missing_ok=True)
-        else:
-            pcm = media.pcm_mono(job.source, at9.SAMPLE_RATE, MAX_SFX_SECONDS)
-            dest.write_bytes(vag.encode(pcm, at9.SAMPLE_RATE, stem[:15]))
-
-        job.meta["out"] = dest.name
-        job.save()
-    except BaseException:
-        shutil.rmtree(job.root, ignore_errors=True)
-        raise
+    job.meta["out"] = dest.name
+    job.save()
 
     out_info = media.probe_audio(dest) if target != "vag" else None
     return {
@@ -1367,6 +1575,43 @@ async def convert_audio(target: str, file: UploadFile = File(...)) -> dict:
                    "rate": out_info.rate if out_info else at9.SAMPLE_RATE,
                    "channels": out_info.channels if out_info else 1},
     }
+
+
+def _convert_audio_from_path(target: str, src_path: Path, filename: str, *, move_source: bool = True) -> dict:
+    spec = CONVERT_TARGETS.get(target)
+    if spec is None:
+        raise HTTPException(404, f"Unknown format: {target}")
+    if spec["needs_tool"] == "at9tool" and not at9.available():
+        raise HTTPException(
+            422, "at9tool was not found, so ATRAC9 cannot be generated."
+        )
+    _validate_upload_ext(filename, SOUND_EXTS)
+    job = jobs.create_from_path("convert", filename or "source", src_path, move=move_source)
+    try:
+        return _convert_audio_job(job, target, spec)
+    except BaseException:
+        shutil.rmtree(job.root, ignore_errors=True)
+        raise
+
+
+@app.post("/api/convert/{target}")
+async def convert_audio(target: str, file: UploadFile = File(...)) -> dict:
+    """Converts a standalone audio file and leaves it ready to download."""
+    spec = CONVERT_TARGETS.get(target)
+    if spec is None:
+        raise HTTPException(404, f"Unknown format: {target}")
+    if spec["needs_tool"] == "at9tool" and not at9.available():
+        raise HTTPException(
+            422, "at9tool was not found, so ATRAC9 cannot be generated."
+        )
+
+    _validate_upload_ext(file.filename, SOUND_EXTS)
+    job = await jobs.create_streaming("convert", file.filename or "source", file, MAX_UPLOAD_BYTES)
+    try:
+        return _convert_audio_job(job, target, spec)
+    except BaseException:
+        shutil.rmtree(job.root, ignore_errors=True)
+        raise
 
 
 @app.get("/api/convert/{job_id}/download")
@@ -1485,6 +1730,7 @@ def _collect_slot_assets(
     content_dir: Path,
     animated: bool = False,
     glow_sources: dict[str, Path] | None = None,
+    slot_jobs: dict[str, jobs.Job] | None = None,
 ) -> list[dict]:
     """Renderiza cada hueco a su destino dentro del tema.
 
@@ -1498,23 +1744,62 @@ def _collect_slot_assets(
     included: list[dict] = []
     by_group: dict[str, list[str]] = {}
     glow_map = glow_sources or {}
+    job_map = slot_jobs or {}
 
     for slot_id, source in slot_sources.items():
         spec = IMAGE_SLOTS[slot_id]
         if animated and spec.get("hidden_by_raf"):
             continue
+        is_icon = spec["group"] in {"function_icon", "content_icon"}
+        job = job_map.get(slot_id)
+        unchanged_icon_job = (
+            is_icon
+            and job is not None
+            and job.meta.get("slot") == slot_id
+            and source == job.source
+        )
+
         dest = content_dir / spec["path"]
-        media.render_image(source, dest, spec["size"])
+        preconverted = (
+            job.out_dir / str(job.meta.get("converted"))
+            if unchanged_icon_job and job.meta.get("converted")
+            else None
+        )
+        if preconverted is not None and preconverted.is_file():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(preconverted, dest)
+        else:
+            media.render_image(
+                source,
+                dest,
+                spec["size"],
+                force_rgba=is_icon,
+                contain_transparent=is_icon,
+            )
         total = dest.stat().st_size
 
         if "glow_path" in spec:
             glow = content_dir / spec["glow_path"]
             glow_src = glow_map.get(slot_id, source)
+            preconverted_glow = (
+                job.out_dir / str(job.meta.get("converted_glow"))
+                if unchanged_icon_job and job.meta.get("converted_glow")
+                else None
+            )
             if glow_src is not source and glow_src.is_file():
                 glow.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(glow_src, glow)
+            elif preconverted_glow is not None and preconverted_glow.is_file():
+                glow.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(preconverted_glow, glow)
             else:
-                media.render_image(glow_src, glow, spec["glow_size"])
+                media.render_image(
+                    glow_src,
+                    glow,
+                    spec["glow_size"],
+                    force_rgba=True,
+                    contain_transparent=True,
+                )
             total += glow.stat().st_size
 
         by_group.setdefault(spec["group"], []).append(slot_id)
@@ -1591,7 +1876,11 @@ def _collect_theme_assets(
         )
         glow_sources = compositor.composed_glow_slots(composition, orig_sources, Path(staging))
         included += _collect_slot_assets(
-            sources, content_dir, animated=bool(animated_job), glow_sources=glow_sources,
+            sources,
+            content_dir,
+            animated=bool(animated_job),
+            glow_sources=glow_sources,
+            slot_jobs=slot_jobs,
         )
 
         # pic1 uses the same home artwork as the canonical theme.

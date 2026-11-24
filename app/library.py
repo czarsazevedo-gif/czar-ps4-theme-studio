@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -15,12 +16,21 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
-from . import media, projects
-from .config import IMAGE_EXTS, MAX_UPLOAD_BYTES, SOUND_EXTS, VIDEO_EXTS
+from . import icon_mapper, media, projects
+from .config import (
+    IMAGE_EXTS,
+    MAX_UPLOAD_BYTES,
+    MAX_VIDEO_UPLOAD_BYTES,
+    MEDIA_FOLDERS,
+    MEDIA_FOLDER_BY_ID,
+    MEDIA_FOLDER_IDS,
+    SOUND_EXTS,
+    VIDEO_EXTS,
+)
 
 router = APIRouter(prefix="/api/library")
 EXTENSIONS = IMAGE_EXTS | VIDEO_EXTS | SOUND_EXTS
@@ -28,6 +38,7 @@ THUMB = "thumb.webp"
 NO_CACHE = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
 ID = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 Category = Literal["image", "video", "animation", "audio"]
+MediaFolder = Literal["content_icons", "function_icons", "audio", "theme_image", "animated_bg"]
 
 # Match the actual demuxer to an extension already accepted by the editor.
 # The demuxer allowlist also keeps playlists and external input indirection
@@ -65,6 +76,33 @@ FORMATS = {
 }
 
 
+def infer_folder(kind: str, original_name: str, requested_folder: str | None = None) -> MediaFolder:
+    """Resolve an asset's target folder among the 5 dedicated media folders."""
+    req = (requested_folder or "").strip()
+    if req:
+        if req not in MEDIA_FOLDER_BY_ID:
+            raise HTTPException(422, f"Pasta de mídia inválida: {req}")
+        spec = MEDIA_FOLDER_BY_ID[req]
+        if kind not in spec["accept_kinds"]:
+            raise HTTPException(
+                415,
+                f"Este arquivo ({kind}) não é compatível com a pasta '{spec['label']['pt-BR']}'.",
+            )
+        return req  # type: ignore[return-value]
+
+    if kind == "audio":
+        return "audio"
+    if kind in {"video", "animation"}:
+        return "animated_bg"
+    slot_id, _is_glow = icon_mapper.resolve_icon_filename(original_name or "")
+    if slot_id:
+        if slot_id.startswith("fn:"):
+            return "function_icons"
+        if slot_id.startswith("ct:"):
+            return "content_icons"
+    return "theme_image"
+
+
 class Asset(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     schemaVersion: Literal[1] = 1
@@ -74,6 +112,7 @@ class Asset(BaseModel):
     displayName: str
     extension: str
     kind: Category
+    folder: MediaFolder | None = None
     format: str
     mime: str
     bytes: int
@@ -85,13 +124,28 @@ class Asset(BaseModel):
     codec: str
     validation: Literal["verified"] = "verified"
     hasThumbnail: bool
+    normalized: dict | None = None
+
+    def effective_folder(self) -> MediaFolder:
+        if self.folder in MEDIA_FOLDER_BY_ID:
+            return self.folder  # type: ignore[return-value]
+        return infer_folder(self.kind, self.originalName)
 
     def public(self) -> dict:
+        eff_folder = self.effective_folder()
+        data = self.model_dump(mode="json")
+        data["folder"] = eff_folder
+        data["folderSubdir"] = MEDIA_FOLDER_BY_ID[eff_folder]["subdir"]
         return {
-            **self.model_dump(mode="json"),
+            **data,
             "original": f"/api/library/{self.id}/original",
             "thumbnail": f"/api/library/{self.id}/thumbnail" if self.hasThumbnail else None,
         }
+
+
+class FolderUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    folder: MediaFolder
 
 
 def catalog(request: Request) -> Path:
@@ -100,6 +154,32 @@ def catalog(request: Request) -> Path:
 
 def storage_error():
     return HTTPException(503, "Não foi possível acessar o armazenamento da biblioteca.")
+
+
+def _ensure_library_folder_mirrors(root: Path, asset: Asset, source: Path) -> None:
+    """Maintain organized hardlink view in `<owner>/library-v1/folders/<subdir>/`."""
+    try:
+        folders_root = root / "folders"
+        for spec in MEDIA_FOLDERS:
+            (folders_root / spec["subdir"]).mkdir(parents=True, exist_ok=True)
+        # Remove stale mirrors of this asset ID in other folders (e.g. after folder change)
+        prefix = f"{asset.id[:12]}-"
+        for spec in MEDIA_FOLDERS:
+            sub = folders_root / spec["subdir"]
+            for existing in sub.glob(f"{prefix}*"):
+                if existing.is_file():
+                    existing.unlink(missing_ok=True)
+        eff = asset.effective_folder()
+        safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", Path(asset.originalName or f"media{asset.extension}").name).strip("._")
+        if not safe.lower().endswith(asset.extension):
+            safe = f"{Path(safe).stem or 'media'}{asset.extension}"
+        target = folders_root / MEDIA_FOLDER_BY_ID[eff]["subdir"] / f"{prefix}{safe[:80]}"
+        try:
+            os.link(source, target)
+        except OSError:
+            shutil.copyfile(source, target)
+    except OSError:
+        pass
 
 
 def read_asset(root: Path, ident: str) -> tuple[Asset, Path]:
@@ -176,10 +256,10 @@ def webm_header(source: Path) -> bool:
 
 
 def inspect_source(source: Path, thumb: Path) -> dict:
-    extension = source.suffix
+    extension = source.suffix.lower()
     if extension == ".svg":
         try:
-            media.validate_svg_safe(source)
+            probed = media.probe(source)
             media.render_image(source, thumb, (320, 180))
         except media.MediaError as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -190,8 +270,8 @@ def inspect_source(source: Path, thumb: Path) -> dict:
             "format": "SVG",
             "mime": "image/svg+xml",
             "codec": "svg",
-            "width": 512,
-            "height": 512,
+            "width": probed.width or 512,
+            "height": probed.height or 512,
             "fps": None,
             "duration": None,
             "hasThumbnail": True,
@@ -272,13 +352,64 @@ def inspect_source(source: Path, thumb: Path) -> dict:
     }
 
 
-def store_upload(file: UploadFile, root: Path) -> tuple[Asset, bool]:
-    name = (file.filename or "").replace("\\", "/").split("/")[-1].strip()
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while block := fh.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _max_bytes_for_extension(extension: str) -> int:
+    if extension in (VIDEO_EXTS - {".gif", ".apng"}):
+        return MAX_VIDEO_UPLOAD_BYTES
+    return MAX_UPLOAD_BYTES
+
+
+def _write_asset_manifest(directory: Path, asset: Asset) -> None:
+    tmp = directory / f".asset-{os.getpid()}.tmp"
+    try:
+        with tmp.open("w", encoding="utf-8") as manifest:
+            manifest.write(asset.model_dump_json(indent=2))
+            manifest.flush()
+            os.fsync(manifest.fileno())
+        tmp.replace(directory / "asset.json")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def store_file_path(
+    src_path: Path,
+    original_name: str,
+    root: Path,
+    *,
+    folder: str | None = None,
+    delete_source: bool = False,
+    cancel_event=None,
+    register_proc=None,
+    progress_cb=None,
+) -> tuple[Asset, bool]:
+    """Import an on-disk file into the content-addressed library (streaming, zero full-file RAM buffer).
+
+    Automatically normalizes >720p or >16 MiB videos (including 4K 60fps up to 120 MiB) to PS4-optimal
+    1280x720 high-quality H.264 MP4 and deletes the raw 4K temporary file immediately afterwards.
+    Preserves GIF/APNG and light videos (<=720p and <=16 MiB) byte-for-byte intact.
+    """
+    name = (original_name or "").replace("\\", "/").split("/")[-1].strip()
     extension = Path(name).suffix.lower()
     if extension not in EXTENSIONS:
         raise HTTPException(415, "Formato não aceito pelo editor.")
-    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, "O arquivo excede 512 MiB.")
+    limit = _max_bytes_for_extension(extension)
+    size = src_path.stat().st_size if src_path.is_file() else 0
+    if size <= 0:
+        raise HTTPException(400, "O arquivo está vazio.")
+    if size > limit:
+        raise HTTPException(
+            413,
+            f"O arquivo excede o limite de {limit // 1048576} MiB.",
+            headers={"X-Czar-Limit-Error": "1"},
+        )
+
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".import-", dir=root) as incoming:
         entry = Path(incoming) / "entry"
@@ -286,28 +417,93 @@ def store_upload(file: UploadFile, root: Path) -> tuple[Asset, bool]:
         source = entry / f"source{extension}"
         digest = hashlib.sha256()
         count = 0
-        with source.open("xb") as output:
-            while block := file.file.read(1024 * 1024):
+        with src_path.open("rb") as inp, source.open("xb") as output:
+            while block := inp.read(1024 * 1024):
                 count += len(block)
-                if count > MAX_UPLOAD_BYTES:
-                    raise HTTPException(413, "O arquivo excede 512 MiB.")
+                if count > limit:
+                    raise HTTPException(
+                        413,
+                        f"O arquivo excede o limite de {limit // 1048576} MiB.",
+                        headers={"X-Czar-Limit-Error": "1"},
+                    )
                 output.write(block)
                 digest.update(block)
-            if not count:
-                raise HTTPException(400, "O arquivo está vazio.")
-            if file.size is not None and count != file.size:
-                raise HTTPException(400, "A transferência chegou incompleta.")
             output.flush()
             os.fsync(output.fileno())
-        ident = digest.hexdigest()
-        if (root / ident).is_dir():
-            existing, _ = read_asset(root, ident)
-            if existing.extension == extension:
-                return existing, False
+
+        if delete_source:
+            src_path.unlink(missing_ok=True)
+
+        if progress_cb:
+            progress_cb("Verificando formato e integridade da mídia…", 35)
         metadata = inspect_source(source, entry / THUMB)
+
+        norm_meta: dict | None = None
+        if metadata["kind"] == "video":
+            needs_norm, probed_v = media.video_needs_normalization(source)
+            if needs_norm:
+                if progress_cb:
+                    progress_cb(
+                        f"Normalizando vídeo {probed_v.width}×{probed_v.height} para 1280×720 H.264 alta qualidade…",
+                        60,
+                    )
+                norm_dest = entry / "source_normalized.mp4"
+                try:
+                    norm_res = media.normalize_video_for_ps4(
+                        source,
+                        norm_dest,
+                        keep_audio=True,
+                        delete_source=True,
+                        cancel_event=cancel_event,
+                        register_proc=register_proc,
+                    )
+                except media.MediaError as exc:
+                    raise HTTPException(422, str(exc)) from exc
+                source = entry / "source.mp4"
+                norm_dest.replace(source)
+                extension = ".mp4"
+                if not name.lower().endswith(".mp4"):
+                    name = f"{Path(name).stem}.mp4"
+                count = source.stat().st_size
+                with source.open("rb") as nf:
+                    os.fsync(nf.fileno())
+                if progress_cb:
+                    progress_cb("Gerando miniatura e validando vídeo normalizado…", 88)
+                (entry / THUMB).unlink(missing_ok=True)
+                metadata = inspect_source(source, entry / THUMB)
+                norm_meta = {
+                    k: v for k, v in norm_res.items() if k != "path"
+                }
+                ident = _sha256_file(source)
+            else:
+                ident = digest.hexdigest()
+        else:
+            ident = digest.hexdigest()
+
+        resolved_folder = infer_folder(metadata["kind"], name, folder)
+
+        if (root / ident).is_dir():
+            existing, existing_src = read_asset(root, ident)
+            if existing.extension == extension:
+                if folder and existing.effective_folder() != resolved_folder:
+                    updated = existing.model_copy(update={"folder": resolved_folder})
+                    _write_asset_manifest(root / ident, updated)
+                    _ensure_library_folder_mirrors(root, updated, existing_src)
+                    return updated, False
+                _ensure_library_folder_mirrors(root, existing, existing_src)
+                return existing, False
+
         asset = Asset(
-            id=ident, sha256=ident, originalName=name, displayName=name, extension=extension,
-            bytes=count, importedAt=datetime.now(timezone.utc), **metadata,
+            id=ident,
+            sha256=ident,
+            originalName=name,
+            displayName=name,
+            extension=extension,
+            folder=resolved_folder,
+            bytes=count,
+            importedAt=datetime.now(timezone.utc),
+            normalized=norm_meta,
+            **metadata,
         )
         with (entry / "asset.json").open("x", encoding="utf-8") as manifest:
             manifest.write(asset.model_dump_json(indent=2))
@@ -319,14 +515,60 @@ def store_upload(file: UploadFile, root: Path) -> tuple[Asset, bool]:
         except OSError as exc:
             if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY} or not (root / ident).is_dir():
                 raise
-            return read_asset(root, ident)[0], False
+            existing, existing_src = read_asset(root, ident)
+            _ensure_library_folder_mirrors(root, existing, existing_src)
+            return existing, False
+        _ensure_library_folder_mirrors(root, asset, root / ident / f"source{extension}")
         return asset, True
 
 
+def store_upload(file: UploadFile, root: Path, *, folder: str | None = None) -> tuple[Asset, bool]:
+    name = (file.filename or "").replace("\\", "/").split("/")[-1].strip()
+    extension = Path(name).suffix.lower()
+    if extension not in EXTENSIONS:
+        raise HTTPException(415, "Formato não aceito pelo editor.")
+    limit = _max_bytes_for_extension(extension)
+    if file.size is not None and file.size > limit:
+        raise HTTPException(
+            413,
+            f"O arquivo excede {limit // 1048576} MiB.",
+            headers={"X-Czar-Limit-Error": "1"},
+        )
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".import-", dir=root) as incoming:
+        raw_path = Path(incoming) / f"incoming{extension}"
+        count = 0
+        with raw_path.open("xb") as output:
+            while block := file.file.read(1024 * 1024):
+                count += len(block)
+                if count > limit:
+                    raise HTTPException(
+                        413,
+                        f"O arquivo excede {limit // 1048576} MiB.",
+                        headers={"X-Czar-Limit-Error": "1"},
+                    )
+                output.write(block)
+            if not count:
+                raise HTTPException(400, "O arquivo está vazio.")
+            if file.size is not None and count != file.size:
+                raise HTTPException(400, "A transferência chegou incompleta.")
+            output.flush()
+            os.fsync(output.fileno())
+        return store_file_path(raw_path, name, root, folder=folder, delete_source=True)
+
+
 @router.post("")
-def import_asset(request: Request, file: UploadFile = File(...)):
+def import_asset(
+    request: Request,
+    file: UploadFile = File(...),
+    folder: str | None = Form(None),
+    folder_query: str | None = Query(None, alias="folder"),
+):
+    effective_folder = (folder or folder_query or "").strip() or None
     try:
-        asset, created = store_upload(file, catalog(request))
+        asset, created = store_upload(file, catalog(request), folder=effective_folder)
+    except HTTPException:
+        raise
     except (OSError, ValueError) as exc:
         raise storage_error() from exc
     return JSONResponse(asset.public(), status_code=201 if created else 200, headers=NO_CACHE)
@@ -334,19 +576,31 @@ def import_asset(request: Request, file: UploadFile = File(...)):
 
 @router.get("")
 def list_assets(
-    request: Request, q: str = "", kind: Category | None = None,
+    request: Request,
+    q: str = "",
+    kind: Category | None = None,
+    folder: MediaFolder | None = None,
     sort: Literal["recent", "oldest", "name", "size"] = "recent",
     offset: Annotated[int, Query(ge=0)] = 0,
 ):
     root = catalog(request)
     try:
-        assets = [read_asset(root, folder.name)[0] for folder in root.iterdir()
-                  if re.fullmatch(r"[0-9a-f]{64}", folder.name)] if root.is_dir() else []
+        all_assets = [read_asset(root, item.name)[0] for item in root.iterdir()
+                      if re.fullmatch(r"[0-9a-f]{64}", item.name)] if root.is_dir() else []
     except (OSError, ValueError) as exc:
         raise storage_error() from exc
+
+    counts: dict[str, int] = {"all": len(all_assets), **{fid: 0 for fid in MEDIA_FOLDER_IDS}}
+    for asset in all_assets:
+        counts[asset.effective_folder()] += 1
+
     query = q.strip().casefold()
-    assets = [asset for asset in assets if (kind is None or kind == asset.kind) and
-              (query in asset.displayName.casefold() or query in asset.originalName.casefold())]
+    assets = [
+        asset for asset in all_assets
+        if (kind is None or kind == asset.kind)
+        and (folder is None or folder == asset.effective_folder())
+        and (query in asset.displayName.casefold() or query in asset.originalName.casefold())
+    ]
     if sort in {"recent", "oldest"}:
         assets.sort(key=lambda a: (a.importedAt, a.id), reverse=sort == "recent")
     elif sort == "size":
@@ -357,7 +611,37 @@ def list_assets(
     return JSONResponse({
         "items": [asset.public() for asset in assets[offset:end]],
         "next": end if end < len(assets) else None,
+        "counts": counts,
+        "folders": [
+            {
+                "id": f["id"],
+                "subdir": f["subdir"],
+                "label": f["label"],
+                "count": counts[f["id"]],
+            }
+            for f in MEDIA_FOLDERS
+        ],
     }, headers=NO_CACHE)
+
+
+@router.patch("/{ident}/folder")
+def update_asset_folder(request: Request, ident: str, payload: FolderUpdate):
+    """Move an asset to another compatible dedicated media folder."""
+    root = catalog(request)
+    asset, source = get_asset(request, ident)
+    spec = MEDIA_FOLDER_BY_ID[payload.folder]
+    if asset.kind not in spec["accept_kinds"]:
+        raise HTTPException(
+            415,
+            f"Este arquivo ({asset.kind}) não é compatível com a pasta '{spec['label']['pt-BR']}'.",
+        )
+    updated = asset.model_copy(update={"folder": payload.folder})
+    try:
+        _write_asset_manifest(root / ident, updated)
+        _ensure_library_folder_mirrors(root, updated, source)
+    except OSError as exc:
+        raise storage_error() from exc
+    return JSONResponse(updated.public(), headers=NO_CACHE)
 
 
 @router.get("/{ident}/thumbnail")
@@ -380,3 +664,4 @@ def original(request: Request, ident: str, play: bool = False):
         source, media_type=asset.mime, filename=asset.originalName,
         content_disposition_type="inline" if inline else "attachment", headers=NO_CACHE,
     )
+

@@ -28,7 +28,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from .. import at9, jobs, pkg, theme_xml
-from ..config import MAX_UPLOAD_BYTES, PKG_DEFAULTS
+from ..config import MAX_UPLOAD_BYTES, PKG_DEFAULTS, SESSION_MEDIA_TTL_SECONDS
 from ..dds import DEFAULT_BACKEND
 from .bundle_service import _parse_params, assemble_theme_tree, resolve_theme_inputs_from_saved_project
 from .contracts import PS4_PKG_DEFAULT_PASSCODE
@@ -149,8 +149,22 @@ def _load_last_task_snapshot(ws: Path) -> dict | None:
 def _prune_old_tasks() -> None:
     now = time.time()
     for tid, t in list(_tasks.items()):
-        if t.finished_at and (now - t.finished_at) > 3600:
+        if t.finished_at and (now - t.finished_at) > SESSION_MEDIA_TTL_SECONDS:
             del _tasks[tid]
+
+
+def touch_pkg_tasks(ws: Path | None = None) -> int:
+    """Extend finished PKG task lifetimes while the browser keep-alive is active."""
+    now = time.time()
+    touched = 0
+    with _lock:
+        for task in _tasks.values():
+            if ws is not None and task.workspace != ws:
+                continue
+            if task.finished_at is not None:
+                task.finished_at = now
+                touched += 1
+    return touched
 
 
 def _execute_pkg_task(task: PkgTask, params: dict) -> None:
@@ -618,30 +632,40 @@ def forge_pkg_download(pkg_id: str) -> FileResponse:
     )
 
 
+def inspect_pkg_file_path(pkg_path: Path, filename: str, passcode: str = PS4_PKG_DEFAULT_PASSCODE) -> dict:
+    """Independently inspect an on-disk PS4 .pkg file without loading it into RAM."""
+    raw_name = (filename or "theme.pkg").replace("\\", "/").split("/")[-1].strip()
+    if Path(raw_name).suffix.lower() != ".pkg":
+        raise HTTPException(415, "Envie um arquivo com extensão .pkg.")
+    clean_pass = (passcode or PS4_PKG_DEFAULT_PASSCODE).strip()
+    if not pkg.PASSCODE_RE.match(clean_pass):
+        raise HTTPException(422, "O passcode deve ter exatamente 32 caracteres alfanuméricos.")
+    if not pkg_path.is_file() or pkg_path.stat().st_size == 0:
+        raise HTTPException(400, "O arquivo .pkg chegou vazio.")
+    report = inspect_and_validate_pkg(
+        pkg_path,
+        passcode=clean_pass,
+        builder_backend="external-upload",
+        pkgtool_bin=find_liborbispkg_tool(),
+    )
+    return report.model_dump()
+
+
 @router.post("/pkg/inspect")
 async def forge_pkg_inspect(
     file: UploadFile = File(...),
     passcode: str = Form(PS4_PKG_DEFAULT_PASSCODE),
 ) -> dict:
-    """Independently inspect and validate any uploaded PS4 .pkg file."""
+    """Independently inspect and validate any uploaded PS4 .pkg file (streaming to disk)."""
     raw_name = (file.filename or "theme.pkg").replace("\\", "/").split("/")[-1].strip()
     if Path(raw_name).suffix.lower() != ".pkg":
         raise HTTPException(415, "Envie um arquivo com extensão .pkg.")
-    if not pkg.PASSCODE_RE.match(passcode.strip()):
+    clean_pass = passcode.strip()
+    if not pkg.PASSCODE_RE.match(clean_pass):
         raise HTTPException(422, "O passcode deve ter exatamente 32 caracteres alfanuméricos.")
-    data = await file.read(MAX_UPLOAD_BYTES + 1)
-    if not data:
-        raise HTTPException(400, "O arquivo .pkg chegou vazio.")
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, f"O arquivo excede {MAX_UPLOAD_BYTES // 1048576} MiB.")
 
     with tempfile.TemporaryDirectory(prefix="czar-inspect-pkg-") as td:
         tmp_pkg = Path(td) / "uploaded.pkg"
-        tmp_pkg.write_bytes(data)
-        report = inspect_and_validate_pkg(
-            tmp_pkg,
-            passcode=passcode.strip(),
-            builder_backend="external-upload",
-            pkgtool_bin=find_liborbispkg_tool(),
-        )
-    return report.model_dump()
+        await jobs.stream_upload_to_path(file, tmp_pkg, MAX_UPLOAD_BYTES)
+        return inspect_pkg_file_path(tmp_pkg, raw_name, passcode=clean_pass)
+

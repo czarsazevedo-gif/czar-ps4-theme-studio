@@ -21,8 +21,8 @@ from starlette.responses import JSONResponse
 from . import jobs
 from .composition_model import Composition
 from .config import (
-    ANIMATED_SIZES, AUDIO_SLOTS, IMAGE_SLOTS, MIN_WAIT_SECONDS, MAX_WAIT_SECONDS,
-    WORKSPACE, max_frames_for,
+    ANIMATED_SIZES, AUDIO_SLOTS, IMAGE_SLOTS, MEDIA_FOLDERS, MEDIA_FOLDER_BY_ID,
+    MIN_WAIT_SECONDS, MAX_WAIT_SECONDS, WORKSPACE, max_frames_for,
 )
 
 ROOT = WORKSPACE / "studio-projects-v1"
@@ -101,7 +101,10 @@ class Manifest(Model):
 
 def owner(request: Request) -> str | None:
     value = request.cookies.get(COOKIE, "")
-    return value if re.fullmatch(r"[0-9a-f]{64}", value) else None
+    if re.fullmatch(r"[0-9a-f]{64}", value):
+        return value
+    minted = getattr(request.state, "czar_session", None)
+    return minted if isinstance(minted, str) and re.fullmatch(r"[0-9a-f]{64}", minted) else None
 
 
 def owner_path(request: Request) -> Path:
@@ -141,24 +144,73 @@ async def scope_jobs(request: Request, call_next):
     path = request.url.path
     library_apply = path.startswith("/api/library/") and path.endswith("/apply")
     project_tool = path.startswith(("/api/composition/", "/api/ouroboros/"))
+    is_uploads = path.startswith("/api/uploads")
+    is_keepalive = path == "/api/keepalive"
     protected = (
         project is not None
         or project_tool
+        or is_uploads
         or path.startswith(("/api/projects", "/api/library", "/api/forge", "/api/system/tools/"))
     )
-    if protected and request.method in {"POST", "PUT"}:
+    if protected and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         if not valid_origin(request):
             return JSONResponse({"detail": "Origem da solicitação não autorizada."}, status_code=403)
     if (library_apply or project_tool) and project is None:
         return JSONResponse({"detail": "Abra um projeto antes de aplicar a mídia."}, status_code=400)
     if path in STATELESS_CATALOG_PATHS:
         return await call_next(request)
+    if is_keepalive:
+        token = None
+        if project is not None:
+            try:
+                root = project_path(request, project)
+                token = jobs.project_workspace.set(root / "media")
+            except HTTPException:
+                token = None
+        try:
+            response = await call_next(request)
+        finally:
+            if token is not None:
+                jobs.project_workspace.reset(token)
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+    if is_uploads:
+        session = owner(request)
+        minted = False
+        if session is None:
+            session = secrets.token_hex(32)
+            minted = True
+            request.state.czar_session = session
+        token = None
+        if project is not None:
+            try:
+                root = project_path(request, project)
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+            token = jobs.project_workspace.set(root / "media")
+        try:
+            response = await call_next(request)
+        finally:
+            if token is not None:
+                jobs.project_workspace.reset(token)
+        response.headers["Cache-Control"] = "private, no-store"
+        if minted:
+            response.set_cookie(
+                COOKIE,
+                session,
+                httponly=True,
+                samesite="strict",
+                secure=request.url.scheme == "https",
+                max_age=60 * 60 * 24 * 365,
+            )
+        return response
     if project is None and path.startswith("/api/forge/"):
         session = owner(request)
         minted = False
         if session is None:
             session = secrets.token_hex(32)
             minted = True
+            request.state.czar_session = session
         standalone_ws = ROOT / session / "_standalone_forge"
         token = jobs.project_workspace.set(standalone_ws)
         try:
@@ -218,11 +270,15 @@ def valid_origin(request: Request) -> bool:
     domain = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN")
     if name and domain:
         hosts.add(f"{name}-8000.{domain}".lower())
+        port = os.environ.get("CZAR_PORT", "8000").strip()
+        if port:
+            hosts.add(f"{name}-{port}.{domain}".lower())
     try:
         parsed = urlsplit(origin)
         return parsed.scheme in {"http", "https"} and parsed.netloc.lower() in hosts
     except ValueError:
         return False
+
 
 
 def read(root: Path) -> Manifest:
@@ -287,6 +343,152 @@ def find_references(root: Path, state: Editor) -> list[jobs.Job]:
         jobs.project_workspace.reset(token)
 
 
+def folder_for_slot(slot_id: str | None, kind: str = "") -> str:
+    """Map any editor slot or job kind onto one of the 5 dedicated project media folders."""
+    sid = str(slot_id or "")
+    if sid.startswith("ct:"):
+        return "content_icons"
+    if sid.startswith("fn:"):
+        return "function_icons"
+    if sid in AUDIO_SLOTS or kind == "audio":
+        return "audio"
+    if sid == "animated" or kind == "animated":
+        return "animated_bg"
+    return "theme_image"
+
+
+def ensure_project_folders(project_root: Path) -> Path:
+    """Create the 5 dedicated media subfolders inside a project root without altering legacy media/ layout."""
+    base = project_root / "folders"
+    for spec in MEDIA_FOLDERS:
+        (base / spec["subdir"]).mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _link_or_copy(src: Path, dst: Path) -> None:
+    if not src.is_file():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.{secrets.token_hex(4)}.tmp")
+    try:
+        try:
+            os.link(src, tmp)
+        except OSError:
+            shutil.copyfile(src, tmp)
+        tmp.replace(dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _safe_label(name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", Path(name or "media").name).strip("._")
+    return cleaned[:96] or "media"
+
+
+def mirror_job_to_project_folder(job: jobs.Job, *, slot_id: str | None = None) -> Path | None:
+    """Mirror a prepared job's assets into the project's dedicated subfolder (hardlinked when possible)."""
+    ws = jobs.project_workspace.get()
+    if ws is None or ws.name != "media" or not (ws.parent / "manifest.json").is_file():
+        return None
+    project_root = ws.parent
+    try:
+        base = ensure_project_folders(project_root)
+        eff_slot = slot_id or str(job.meta.get("slot") or "")
+        folder_id = folder_for_slot(eff_slot, job.kind)
+        subdir = base / MEDIA_FOLDER_BY_ID[folder_id]["subdir"]
+        subdir.mkdir(parents=True, exist_ok=True)
+
+        if job.kind == "slot":
+            spec = IMAGE_SLOTS.get(eff_slot) or {}
+            stem = str(spec.get("file") or eff_slot.replace(":", "_") or job.id)
+            conv = job.meta.get("converted")
+            conv_glow = job.meta.get("converted_glow")
+            if conv and (job.out_dir / str(conv)).is_file():
+                target = subdir / f"{stem}.png"
+                _link_or_copy(job.out_dir / str(conv), target)
+                if conv_glow and (job.out_dir / str(conv_glow)).is_file():
+                    _link_or_copy(job.out_dir / str(conv_glow), subdir / f"{stem}_glow.png")
+                return target
+            target = subdir / f"{stem}-{job.id}{job.source.suffix.lower()}"
+            _link_or_copy(job.source, target)
+            return target
+
+        if job.kind == "animated":
+            safe = _safe_label(job.original_name)
+            ext = job.source.suffix.lower() or ".mp4"
+            if not safe.lower().endswith(ext):
+                safe = f"{Path(safe).stem}{ext}"
+            target = subdir / f"{job.id}-{safe}"
+            _link_or_copy(job.source, target)
+            return target
+
+        if job.kind == "audio":
+            conv = job.meta.get("converted")
+            src = (job.out_dir / str(conv)) if conv and (job.out_dir / str(conv)).is_file() else job.source
+            ext = src.suffix.lower() or ".at9"
+            prefix = eff_slot or "audio"
+            target = subdir / f"{prefix}-{job.id}{ext}"
+            _link_or_copy(src, target)
+            return target
+    except OSError:
+        return None
+    return None
+
+
+def sync_project_folders_from_state(project_root: Path, state: Editor) -> None:
+    """Ensure every active media reference in `state` is mirrored under `<project>/folders/<subdir>/`."""
+    try:
+        ensure_project_folders(project_root)
+        token = jobs.project_workspace.set(project_root / "media")
+        try:
+            for slot_id, job_id in state.slots.items():
+                j = jobs.load("slot", job_id)
+                if j is not None:
+                    mirror_job_to_project_folder(j, slot_id=slot_id)
+            if state.bgm:
+                j = jobs.load("audio", state.bgm)
+                if j is not None:
+                    mirror_job_to_project_folder(j, slot_id="bgm")
+            for slot_id, job_id in state.sfx.items():
+                j = jobs.load("audio", job_id)
+                if j is not None:
+                    mirror_job_to_project_folder(j, slot_id=slot_id)
+            if state.anim and state.anim.jobId:
+                j = jobs.load("animated", state.anim.jobId)
+                if j is not None:
+                    mirror_job_to_project_folder(j, slot_id="animated")
+        finally:
+            jobs.project_workspace.reset(token)
+    except OSError:
+        pass
+
+
+def list_project_folders(project_root: Path) -> list[dict]:
+    """Return metadata and file listings for all 5 dedicated project media subfolders."""
+    base = ensure_project_folders(project_root)
+    out = []
+    for spec in MEDIA_FOLDERS:
+        folder_dir = base / spec["subdir"]
+        files = []
+        if folder_dir.is_dir():
+            for entry in sorted(folder_dir.iterdir(), key=lambda p: p.name.lower()):
+                if entry.is_file() and not entry.name.startswith("."):
+                    st = entry.stat()
+                    files.append({
+                        "name": entry.name,
+                        "bytes": st.st_size,
+                        "updated_at": st.st_mtime,
+                    })
+        out.append({
+            "id": spec["id"],
+            "subdir": spec["subdir"],
+            "label": spec["label"],
+            "count": len(files),
+            "files": files,
+        })
+    return out
+
+
 def copy_jobs(source: Path, destination: Path, state: Editor) -> None:
     for job in find_references(source, state):
         target = destination / "media" / job.root.name
@@ -296,7 +498,12 @@ def copy_jobs(source: Path, destination: Path, state: Editor) -> None:
         (target / "out").mkdir()
         (target / "preview").mkdir()
         if job.kind == "slot":
-            shutil.copyfile(job.preview_dir / "preview.webp", target / "preview" / "preview.webp")
+            for prev_file in job.preview_dir.glob("*.webp"):
+                if prev_file.is_file():
+                    shutil.copyfile(prev_file, target / "preview" / prev_file.name)
+            for out_file in job.out_dir.glob("*.png"):
+                if out_file.is_file():
+                    shutil.copyfile(out_file, target / "out" / out_file.name)
         if job.kind == "animated" and job.meta.get("deluxe"):
             for sub in ("preview", "deluxe_preview", "deluxe_frames", "deluxe_dds"):
                 src_sub = job.root / sub
@@ -321,6 +528,7 @@ def new_project(parent: Path, name: str, previous: Path | None = None) -> Manife
     with tempfile.TemporaryDirectory(dir=parent, prefix=".project-") as staging:
         root = Path(staging) / "new"
         root.mkdir(mode=0o700)
+        ensure_project_folders(root)
         if previous and state:
             copy_jobs(previous, root, state)
         if previous:
@@ -332,6 +540,8 @@ def new_project(parent: Path, name: str, previous: Path | None = None) -> Manife
                     if rec_file.is_file():
                         shutil.copyfile(rec_file, recipes_dst / rec_file.name)
         atomic_write(root, manifest)
+        if previous and state:
+            sync_project_folders_from_state(root, state)
         root.rename(parent / manifest.id)
     return manifest
 
@@ -377,6 +587,17 @@ def get_project(request: Request, project: str, response: Response):
         raise read_error() from exc
 
 
+@router.get("/{project}/folders")
+def get_project_folders(request: Request, project: str, response: Response):
+    """Inspect the 5 organized media subfolders of a project."""
+    response.headers["Cache-Control"] = "private, no-store"
+    root = project_path(request, project)
+    try:
+        return {"project": project, "folders": list_project_folders(root)}
+    except OSError as exc:
+        raise HTTPException(503, "Não foi possível ler as pastas de mídia do projeto.") from exc
+
+
 @router.put("/{project}", response_model=Manifest)
 def save_project(request: Request, project: str, payload: SaveProject):
     root = project_path(request, project)
@@ -398,6 +619,7 @@ def save_project(request: Request, project: str, payload: SaveProject):
                 "updatedAt": datetime.now(timezone.utc),
             })
             atomic_write(root, updated)
+            sync_project_folders_from_state(root, payload.state)
             return updated
     except OSError as exc:
         raise HTTPException(503, "Falha ao gravar. A última revisão salva foi preservada.") from exc
@@ -415,3 +637,4 @@ def duplicate_project(request: Request, project: str, payload: NewProject):
         raise HTTPException(503, "Não foi possível duplicar o projeto.") from exc
     except ValueError as exc:
         raise read_error() from exc
+

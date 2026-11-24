@@ -85,6 +85,76 @@ def create(kind: str, filename: str, data: bytes) -> Job:
     return job
 
 
+def create_from_path(kind: str, filename: str, src_path: Path, *, move: bool = False) -> Job:
+    """Create a job directly from an on-disk file without buffering it in RAM."""
+    suffix = _safe_suffix(filename)
+    if suffix == ".bin":
+        suffix = _safe_suffix(src_path.name)
+    job = _new_job(kind, filename, suffix)
+    try:
+        if move:
+            shutil.move(str(src_path), str(job.source))
+        else:
+            try:
+                os.link(src_path, job.source)
+            except OSError:
+                shutil.copyfile(src_path, job.source)
+        job.save()
+        return job
+    except BaseException:
+        shutil.rmtree(job.root, ignore_errors=True)
+        raise
+
+
+async def stream_upload_to_path(
+    upload_file,
+    dest: Path,
+    max_bytes: int,
+    *,
+    chunk_size: int = 1024 * 1024,
+) -> int:
+    """Stream a FastAPI UploadFile to disk in bounded chunks (zero full-file RAM buffer)."""
+    from fastapi import HTTPException
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex[:8]}.part")
+    try:
+        with tmp.open("wb") as out:
+            while True:
+                block = await upload_file.read(chunk_size)
+                if not block:
+                    break
+                written += len(block)
+                if written > max_bytes:
+                    raise HTTPException(
+                        413,
+                        f"O arquivo excede o limite máximo permitido de {max_bytes // 1048576} MiB.",
+                        headers={"X-Czar-Limit-Error": "1"},
+                    )
+                out.write(block)
+            out.flush()
+            os.fsync(out.fileno())
+        if written == 0:
+            raise HTTPException(400, "The file arrived empty.")
+        tmp.replace(dest)
+        return written
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+async def create_streaming(kind: str, filename: str, upload_file, max_bytes: int) -> Job:
+    """Create a job by streaming an UploadFile directly onto disk in 1 MiB blocks."""
+    job = _new_job(kind, filename, _safe_suffix(filename))
+    try:
+        await stream_upload_to_path(upload_file, job.source, max_bytes)
+        job.save()
+        return job
+    except BaseException:
+        shutil.rmtree(job.root, ignore_errors=True)
+        raise
+
+
 def _new_job(kind: str, filename: str, suffix: str) -> Job:
     workspace = project_workspace.get() or WORKSPACE
     workspace.mkdir(parents=True, exist_ok=True)
@@ -97,6 +167,7 @@ def _new_job(kind: str, filename: str, suffix: str) -> Job:
     job.preview_dir.mkdir(exist_ok=True)
     job.out_dir.mkdir(exist_ok=True)
     return job
+
 
 
 @contextmanager

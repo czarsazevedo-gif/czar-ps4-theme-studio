@@ -346,7 +346,12 @@ MAX_SFX_SECONDS = 5.0
 # A single theme can use 23 image slots plus the animated background, and all
 # of them have to still be alive when Package is pressed: if pruning takes one
 # mid-session the build fails with a 404. Hence the headroom.
-MAX_JOBS_KEPT = max(150, len(IMAGE_SLOTS) * 5)
+MAX_JOBS_KEPT = max(500, len(IMAGE_SLOTS) * 20)
+
+# Continuous operation TTL (>= 6 hours; 8 hours idle safety window, continuously
+# refreshed by browser /api/keepalive every 25s during active sessions).
+SESSION_MEDIA_TTL_SECONDS = 8 * 3600
+KEEPALIVE_INTERVAL_MS = 25_000
 
 # Quality of the webp sent to the browser for the preview.
 PREVIEW_WEBP_QUALITY = 82
@@ -355,6 +360,61 @@ PREVIEW_WEBP_QUALITY = 82
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".gif", ".apng", ".wmv", ".flv"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".gif", ".dds", ".svg"}
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+
+# Streaming chunked upload & 4K video normalization limits.
+UPLOAD_CHUNK_BYTES = 2 * 1024 * 1024         # 2 MiB per chunk (safe behind *.app.github.dev proxy)
+MAX_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024     # hard per-chunk safety ceiling
+MAX_VIDEO_UPLOAD_BYTES = 120 * 1024 * 1024   # 120 MiB cap for videos (incl. 4K 60fps)
+VIDEO_PASSTHROUGH_MAX_BYTES = 16 * 1024 * 1024  # <= 720p & <= 16 MiB videos stay untouched
+VIDEO_NORMALIZE_SIZE = ANIMATED_SIZE         # (1280, 720) PS4 animation max resolution
+VIDEO_NORMALIZE_FPS_THRESHOLD = 36.0         # >36 fps -> integer divisor (60->30, 50->25, 48->24)
+
+# Five dedicated media folders (both in Media Library UI and project subfolders).
+MEDIA_FOLDERS: tuple[dict, ...] = (
+    {
+        "id": "content_icons",
+        "subdir": "icones-de-conteudo",
+        "label": L("Content icons", "Iconos de contenido", "Ícones de conteúdo"),
+        "accept_kinds": ("image",),
+        "accept_exts": sorted(IMAGE_EXTS),
+        "description": L("512×512 PNG/SVG content icons", "Iconos de contenido 512×512", "Ícones de conteúdo 512×512 (PNG/SVG)"),
+    },
+    {
+        "id": "function_icons",
+        "subdir": "icones-de-funcao",
+        "label": L("Function icons", "Iconos de función", "Ícones de função"),
+        "accept_kinds": ("image",),
+        "accept_exts": sorted(IMAGE_EXTS),
+        "description": L("128×128 + 152×152 glow icons", "Iconos de función 128×128 + glow", "Ícones de função 128×128 + glow 152×152"),
+    },
+    {
+        "id": "audio",
+        "subdir": "audio",
+        "label": L("Audio", "Audio", "Áudio"),
+        "accept_kinds": ("audio",),
+        "accept_exts": sorted(SOUND_EXTS),
+        "description": L("BGM (ATRAC9) & SFX (VAG)", "Música (ATRAC9) y efectos (VAG)", "Música (ATRAC9) e efeitos sonoros (VAG)"),
+    },
+    {
+        "id": "theme_image",
+        "subdir": "imagem-de-tema",
+        "label": L("Theme image", "Imagen de tema", "Imagem de tema"),
+        "accept_kinds": ("image", "animation"),
+        "accept_exts": sorted(IMAGE_EXTS),
+        "description": L("1920×1080 backgrounds, preview & icon0", "Fondos 1920×1080, miniatura e icon0", "Fundos 1920×1080, miniatura e icon0"),
+    },
+    {
+        "id": "animated_bg",
+        "subdir": "fundo-animado",
+        "label": L("Animated background", "Fondo animado", "Fundo animado"),
+        "accept_kinds": ("video", "animation"),
+        "accept_exts": sorted(VIDEO_EXTS),
+        "description": L("Videos (up to 4K 120 MiB) & GIF/APNG", "Videos (hasta 4K 120 MiB) y GIF/APNG", "Vídeos (até 4K 120 MiB) e GIF/APNG"),
+    },
+)
+MEDIA_FOLDER_BY_ID: dict[str, dict] = {f["id"]: f for f in MEDIA_FOLDERS}
+MEDIA_FOLDER_IDS: tuple[str, ...] = tuple(f["id"] for f in MEDIA_FOLDERS)
+
 
 
 def dds_bytes_for(width: int, height: int) -> int:
