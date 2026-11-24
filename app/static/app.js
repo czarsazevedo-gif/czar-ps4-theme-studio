@@ -284,9 +284,13 @@ function applyAnimatedPayload(data, { skipSave = false } = {}) {
 
   const s = data.source;
   $("anim-src-name").textContent = s.name;
-  $("anim-src-meta").textContent =
-    t("bg.src.meta", { w: s.width, h: s.height, d: s.duration,
-                       codec: s.codec, fps: data.fps_used });
+  let srcMeta = t("bg.src.meta", { w: s.width, h: s.height, d: s.duration,
+                                   codec: s.codec, fps: data.fps_used });
+  if (data.normalized?.normalized) {
+    const n = data.normalized;
+    srcMeta += ` · Normalizado de ${n.original_width}×${n.original_height} (${fmtBytes(n.original_bytes)}) → ${n.width}×${n.height} (${fmtBytes(n.bytes)})`;
+  }
+  $("anim-src-meta").textContent = srcMeta;
 
   $("anim-frames").value = String(anim.frameCount);
   pintarFrames();
@@ -1199,28 +1203,91 @@ async function startAnimDiagnostic(jobId = anim.jobId, { forceNew = true } = {})
   }
 }
 
-async function animatedUpload(file) {
-  const fd = new FormData();
-  fd.append("file", file);
-  fd.append("frames", String(anim.frameCount));
-  fd.append("size", $("anim-size").value);
+let animUploadCtrl = null;
 
+function _setAnimUploadBox(visible, { stage = "", pct = null, meta = "" } = {}) {
+  const box = $("anim-upload-box");
+  if (!box) return;
+  box.hidden = !visible;
+  if (!visible) return;
+  if (stage && $("anim-upload-stage")) $("anim-upload-stage").textContent = stage;
+  const bar = $("anim-upload-bar");
+  const pctEl = $("anim-upload-pct");
+  if (bar && pctEl) {
+    if (pct == null || Number.isNaN(pct)) {
+      bar.removeAttribute("value");
+      pctEl.textContent = "…";
+    } else {
+      const clamped = Math.max(0, Math.min(100, Math.round(pct)));
+      bar.value = clamped;
+      pctEl.textContent = `${clamped}%`;
+    }
+  }
+  if (meta && $("anim-upload-meta")) $("anim-upload-meta").textContent = meta;
+}
+
+async function animatedUpload(file) {
+  animUploadCtrl?.abort();
+  const ctrl = new AbortController();
+  animUploadCtrl = ctrl;
+
+  const sizeVal = $("anim-size").value;
   $("anim-drop").hidden = true;
   $("anim-workspace").hidden = false;
   $("anim-result").hidden = true;
+  _setAnimUploadBox(true, {
+    stage: `Enviando ${file.name} (${fmtBytes(file.size)})…`,
+    pct: 0,
+    meta: "Envio em blocos de 2 MiB · vídeos 4K/60fps até 120 MiB são normalizados automaticamente para 1280×720 PS4",
+  });
   setAnimBusy(true);
   player.pause();
 
   try {
-    const data = await api("/api/animated/upload", { method: "POST", body: fd });
+    const data = await window.CzarUploader.uploadData(file, {
+      purpose: "animated",
+      params: { frames: anim.frameCount, size: sizeVal },
+      directUrl: "/api/animated/upload",
+      directFields: { frames: String(anim.frameCount), size: sizeVal },
+      signal: ctrl.signal,
+      abortMessage: "Envio do vídeo cancelado.",
+      onProgress: (ev) => {
+        if (ev.phase === "upload" && typeof ev.ratio === "number") {
+          const pct = Math.round(ev.ratio * 100);
+          _setAnimUploadBox(true, {
+            stage: ev.mode === "chunked"
+              ? `Enviando ${file.name} em blocos de 2 MiB (${fmtBytes(ev.loaded)} / ${fmtBytes(ev.total)})…`
+              : `Enviando ${file.name} (${pct}%)…`,
+            pct,
+          });
+        } else if (ev.phase === "processing") {
+          _setAnimUploadBox(true, {
+            stage: ev.stage || "Processando vídeo no servidor…",
+            pct: typeof ev.percent === "number" ? ev.percent : null,
+          });
+        }
+      },
+      onStage: (stageTxt, pct) => {
+        _setAnimUploadBox(true, { stage: stageTxt, pct });
+      },
+    });
+    _setAnimUploadBox(false);
     await loadBitmaps(data.frames);
     applyAnimatedPayload(data);
+    if (data.normalized?.normalized) {
+      toast(
+        `Vídeo normalizado para PS4 (${data.normalized.width}×${data.normalized.height} · ${data.normalized.fps} fps).`,
+        "ok",
+      );
+    }
     player.start();
     prepareAnimDiagnosticPanel(data.job_id, { autoRun: true });
   } catch (err) {
+    _setAnimUploadBox(false);
     toast(err.message);
     resetAnimated();
   } finally {
+    if (animUploadCtrl === ctrl) animUploadCtrl = null;
     setAnimBusy(false);
   }
 }
@@ -1287,6 +1354,11 @@ async function animatedExport() {
 }
 
 function resetAnimated() {
+  if (animUploadCtrl) {
+    animUploadCtrl.abort();
+    animUploadCtrl = null;
+  }
+  _setAnimUploadBox(false);
   player.pause();
   anim.bitmaps.forEach((b) => b.close?.());
   anim.bitmaps = [];
@@ -1379,7 +1451,7 @@ function slotCard(spec) {
       <div class="slot-sub">${spec.file ? `${spec.file}.png · ` : ""}${spec.size.join("×")}${spec.glow ? ` + glow` : ""}</div>
       <div class="slot-raf-warn">lo tapa el fondo animado</div>
     </div>
-    <input type="file" accept="image/*">`;
+    <input type="file" accept="image/*,.svg,image/svg+xml">`;
 
   const input = el.querySelector("input");
   input.addEventListener("change", () => {
@@ -1423,16 +1495,27 @@ function paintSlot(slotId, previewUrl) {
   }
 }
 
-async function uploadSlot(slotId, file) {
-  const fd = new FormData();
-  fd.append("file", file);
+async function uploadSlot(slotId, file, { silent = false, rethrow = false } = {}) {
   try {
-    const d = await api(`/api/slot/${encodeURIComponent(slotId)}/upload`, {
-      method: "POST", body: fd,
+    const d = await window.CzarUploader.uploadData(file, {
+      purpose: "slot",
+      params: { slot: slotId },
+      directUrl: `/api/slot/${encodeURIComponent(slotId)}/upload`,
     });
     applySlotPayload(d);
+    if (!silent && d.converted) {
+      const sz = Array.isArray(d.converted.size) ? d.converted.size.join("×") : "";
+      const glowTxt = Array.isArray(d.converted.glow_size)
+        ? ` + glow nativo ${d.converted.glow_size.join("×")}`
+        : "";
+      const vecTxt = d.converted.source_is_svg ? " (SVG vetorial)" : "";
+      toast(`Ícone convertido automaticamente: ${sz} RGBA PNG${glowTxt}${vecTxt}.`, "ok");
+    }
+    return d;
   } catch (err) {
-    toast(err.message);
+    if (!silent) toast(err.message);
+    if (rethrow) throw err;
+    return null;
   }
 }
 
@@ -1451,18 +1534,79 @@ function clearSlot(slotId) {
 /** Uploads the same image to every slot in a group. */
 async function bulkUpload(group, file) {
   const ids = slots.catalog.filter((s) => s.group === group).map((s) => s.id);
-  for (const id of ids) await uploadSlot(id, file);
-  toast(t("misc.appliedTo", { n: ids.length }), "ok");
+  let okCount = 0;
+  for (const id of ids) {
+    try {
+      await uploadSlot(id, file, { silent: true, rethrow: true });
+      okCount++;
+    } catch (err) {
+      toast(err.message);
+      break;
+    }
+  }
+  if (okCount) toast(t("misc.appliedTo", { n: okCount }), "ok");
 }
 
-/** Deterministically maps multiple icon files by PT-BR/EN/ES filename via backend (409 on conflict). */
+/** Deterministically maps multiple icon files by PT-BR/EN/ES filename via backend (409 on conflict),
+ *  automatically falling back to per-file 2 MiB chunked streaming on large batches or HTTP 413. */
 async function bulkUploadByName(fileList) {
   const files = Array.from(fileList || []);
   if (!files.length) return;
-  const fd = new FormData();
-  for (const f of files) fd.append("files", f, f.name);
+  const totalBytes = files.reduce((acc, f) => acc + (f.size || 0), 0);
+
+  async function runChunkedBatch() {
+    const byName = new Map();
+    const dupNames = new Set();
+    for (const f of files) {
+      const clean = (f.name || "icon.png").replace(/\\/g, "/").split("/").pop().trim() || "icon.png";
+      if (byName.has(clean)) dupNames.add(clean);
+      byName.set(clean, f);
+    }
+    if (dupNames.size) {
+      throw new Error(
+        `Arquivos duplicados no lote: ${[...dupNames].sort().join(", ")}. Remova duplicatas antes de enviar.`
+      );
+    }
+    const mapping = await api("/api/slots/map-names", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filenames: [...byName.keys()] }),
+    });
+    if (mapping.conflicts?.length) {
+      const reasons = mapping.conflicts.map((c) => c.reason).join("; ");
+      throw new Error(`Conflito de mapeamento detectado (nenhum slot foi sobrescrito): ${reasons}`);
+    }
+    const entries = Object.entries(mapping.mapped || {}).sort(([a], [b]) => a.localeCompare(b));
+    let count = 0;
+    for (const [slotId, fname] of entries) {
+      const file = byName.get(fname);
+      if (!file) continue;
+      await uploadSlot(slotId, file, { silent: true, rethrow: true });
+      count++;
+    }
+    const unm = (mapping.unmatched || []).length;
+    const msg = unm
+      ? `${count} ícone(s) mapeado(s) · ${unm} sem correspondência.`
+      : `${count} ícone(s) mapeado(s) com sucesso.`;
+    toast(msg, count ? "ok" : "");
+  }
+
   try {
-    const res = await api("/api/slots/upload-batch", { method: "POST", body: fd });
+    if (window.CzarUploader.forceChunked || totalBytes > 1.5 * 1024 * 1024) {
+      await runChunkedBatch();
+      return;
+    }
+    const fd = new FormData();
+    for (const f of files) fd.append("files", f, f.name);
+    const response = await Projects.fetchMedia("/api/slots/upload-batch", { method: "POST", body: fd });
+    if (response.status === 413 && response.headers.get("X-Czar-Limit-Error") !== "1") {
+      await runChunkedBatch();
+      return;
+    }
+    const res = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(res?.detail || `${response.status} ${response.statusText}`);
+    }
     const uploaded = res.uploaded || [];
     for (const item of uploaded) applySlotPayload(item);
     const unm = (res.unmatched || []).length;
@@ -1577,14 +1721,30 @@ async function aplicarGanancia() {
 }
 
 async function uploadBgm(file) {
-  const fd = new FormData();
-  fd.append("file", file);
+  bgm.busy = true;
+  $("bgm-info").textContent = "Enviando e processando música do menu…";
   try {
-    paintBgm(await api("/api/audio/bgm/upload", { method: "POST", body: fd }));
+    const d = await window.CzarUploader.uploadData(file, {
+      purpose: "audio",
+      params: { slot: "bgm", gain_db: 0 },
+      directUrl: "/api/audio/bgm/upload",
+      onProgress: (ev) => {
+        if (ev.phase === "upload" && typeof ev.ratio === "number") {
+          $("bgm-info").textContent = `Enviando música · ${Math.round(ev.ratio * 100)}%`;
+        } else if (ev.stage) {
+          $("bgm-info").textContent = ev.stage;
+        }
+      },
+      onStage: (txt) => { $("bgm-info").textContent = txt; },
+    });
+    paintBgm(d);
     refreshChecklist();
     renderTree();
   } catch (err) {
+    if (!bgm.jobId) $("bgm-info").textContent = t("snd.none");
     toast(err.message);
+  } finally {
+    bgm.busy = false;
   }
 }
 
@@ -1625,11 +1785,22 @@ function _setForgeAudioBusy(busy, statusText = "") {
 }
 
 async function forgeInspectFile(file) {
-  _setForgeAudioBusy(true, "Analisando formato real, loudness EBU R128 e pontos de loop…");
-  const fd = new FormData();
-  fd.append("file", file);
+  _setForgeAudioBusy(true, "Enviando música para inspeção…");
   try {
-    const d = await api("/api/forge/audio/inspect", { method: "POST", body: fd });
+    const d = await window.CzarUploader.uploadData(file, {
+      purpose: "forge_audio_inspect",
+      directUrl: "/api/forge/audio/inspect",
+      onProgress: (ev) => {
+        if (ev.phase === "upload" && typeof ev.ratio === "number") {
+          $("forge-audio-status").textContent = `Enviando música · ${Math.round(ev.ratio * 100)}%`;
+        } else if (ev.stage) {
+          $("forge-audio-status").textContent = ev.stage;
+        }
+      },
+      onStage: (txt) => {
+        if ($("forge-audio-status")) $("forge-audio-status").textContent = txt;
+      },
+    });
     forgeAudio.stagingId = d.staging_id;
     forgeAudio.fileName = d.name;
     forgeAudio.duration = d.duration;
@@ -1657,6 +1828,51 @@ async function forgeInspectFile(file) {
     $("forge-audio-status").textContent = `Falhou: ${err.message}`;
   } finally {
     _setForgeAudioBusy(false);
+  }
+}
+
+async function forgeInspectPkgFile(file) {
+  const statusEl = $("forge-pkg-inspect-status");
+  const outEl = $("forge-pkg-inspect-output");
+  if (statusEl) statusEl.textContent = `Enviando ${file.name} (${fmtBytes(file.size)})…`;
+  if (outEl) { outEl.hidden = true; outEl.textContent = ""; }
+  try {
+    const d = await window.CzarUploader.uploadData(file, {
+      purpose: "forge_pkg_inspect",
+      directUrl: "/api/forge/pkg/inspect",
+      onProgress: (ev) => {
+        if (!statusEl) return;
+        if (ev.phase === "upload" && typeof ev.ratio === "number") {
+          statusEl.textContent = `Enviando ${file.name} · ${Math.round(ev.ratio * 100)}%`;
+        } else if (ev.stage) {
+          statusEl.textContent = ev.stage;
+        }
+      },
+      onStage: (txt) => { if (statusEl) statusEl.textContent = txt; },
+    });
+    const rep = d.pkg_report || d;
+    const isValid = Boolean(rep.structure_validated && (!rep.errors || !rep.errors.length));
+    const lines = [
+      `Arquivo: ${file.name} (${fmtBytes(rep.pkg_bytes ?? file.size)})`,
+      `Veredito: ${isValid ? "VÁLIDO" : (rep.release_gate || "COM AVISOS/ERROS")} · Inspetor: ${rep.validator_backend || "independent"}`,
+      `Content ID: ${rep.header_content_id || rep.sfo_content_id || "—"} · Title ID: ${rep.sfo_title_id || "—"} · Category: ${rep.sfo_category || "—"}`,
+      `IRO_TAG: ${rep.iro_tag ?? "—"} · Volume: ${rep.volume_type || "—"} · Entradas: ${rep.entry_count ?? "—"}`,
+      ...(rep.errors || []).map((e) => `Erro: ${e}`),
+      ...(rep.warnings || []).map((w) => `Aviso: ${w}`),
+    ];
+    if (statusEl) {
+      statusEl.textContent = isValid
+        ? `PKG inspecionado com sucesso (${rep.header_content_id || file.name}).`
+        : `PKG inspecionado com alertas (${rep.release_gate || "inválido"}).`;
+    }
+    if (outEl) {
+      outEl.textContent = lines.join("\n");
+      outEl.hidden = false;
+    }
+    toast("Inspeção do PKG concluída.", isValid ? "ok" : "error");
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Falhou: ${err.message}`;
+    toast(err.message);
   }
 }
 
@@ -1722,12 +1938,14 @@ async function forgeConvertAndApplyBgm() {
 const sfx = { chosen: {}, catalog: [], meta: {} };
 
 async function uploadSfx(slotId, file, row) {
-  const fd = new FormData();
-  fd.append("file", file);
   const info = row.querySelector(".bgm-info");
   info.textContent = t("snd.converting");
   try {
-    const d = await api(`/api/audio/${slotId}/upload`, { method: "POST", body: fd });
+    const d = await window.CzarUploader.uploadData(file, {
+      purpose: "audio",
+      params: { slot: slotId, gain_db: 0 },
+      directUrl: `/api/audio/${encodeURIComponent(slotId)}/upload`,
+    });
     applySfxPayload(d, row);
   } catch (err) {
     info.textContent = t("snd.none.sfx");
@@ -3307,6 +3525,7 @@ async function boot() {
   } catch {
     toolsUiState.offline = true;
     renderSystemPills();
+    window.CzarKeepAlive?.boot();
     toast("Não foi possível conectar ao servidor.");
     return;
   }
@@ -3316,6 +3535,7 @@ async function boot() {
   toolsUiState.setup = sys.tools_setup || null;
   renderSystemPills();
   startSystemHealthMonitor();
+  window.CzarKeepAlive?.boot({ intervalMs: sys.keepalive_interval_ms || 25_000 });
   if (toolsUiState.setup?.status === "running") pollToolsSetup();
 
   // Encoder selector only when there is more than one option.
@@ -3388,6 +3608,12 @@ async function boot() {
 
 wireDropzone("anim-drop", "anim-file", animatedUpload);
 
+if ($("anim-upload-cancel")) {
+  $("anim-upload-cancel").addEventListener("click", () => {
+    if (animUploadCtrl) animUploadCtrl.abort();
+  });
+}
+
 // While dragging only the numbers update; the frames are requested on release,
 // so a slider pixel does not trigger an extraction.
 $("anim-frames").addEventListener("input", (e) => {
@@ -3415,6 +3641,13 @@ if ($("forge-audio-file")) {
   $("forge-audio-file").addEventListener("change", (e) => {
     const f = e.target.files?.[0];
     if (f) forgeInspectFile(f);
+    e.target.value = "";
+  });
+}
+if ($("forge-pkg-inspect-file")) {
+  $("forge-pkg-inspect-file").addEventListener("change", (e) => {
+    const f = e.target.files?.[0];
+    if (f) forgeInspectPkgFile(f);
     e.target.value = "";
   });
 }

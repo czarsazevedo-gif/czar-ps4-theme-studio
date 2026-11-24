@@ -232,7 +232,7 @@ const Compositor = (() => {
       Object.values(state.surfaces).reduce((count, item) => count + item.layers.length, 0) < 48;
   }
   function add(item, target = destination()) {
-    if (!Projects.id || !supported(item)) throw new Error("Escolha uma imagem raster da biblioteca.");
+    if (!Projects.id || !supported(item)) throw new Error("Escolha uma imagem (raster ou SVG) da biblioteca.");
     if (!room(target)) throw new Error("Limite de 16 camadas por superfície e 48 por projeto.");
     const [w, h] = dimensions(target);
     const aspect = item.width && item.height ? item.width / item.height : w / h;
@@ -555,13 +555,18 @@ const Compositor = (() => {
     ui("target").onchange = () => {
       selection = null; view = { zoom: 1, x: 0, y: 0 }; status(""); redrawControls(); draw();
     };
-    ui("files").accept = sys.accepted.image.join(",");
+    ui("files").accept = [...sys.accepted.image, "image/svg+xml"].join(",");
     ui("files").onchange = async () => {
       const files = [...ui("files").files], target = destination();
       ui("files").value = "";
+      const targetFolder = target.startsWith("fn:")
+        ? "function_icons"
+        : target.startsWith("ct:")
+          ? "content_icons"
+          : "theme_image";
       const panel = document.getElementById("media-library");
       panel.open = true;
-      await Library.importFiles(files, (asset) => add(asset, target));
+      await Library.importFiles(files, (asset) => add(asset, target), targetFolder);
     };
     ui("library").onclick = () => {
       const panel = document.getElementById("media-library");

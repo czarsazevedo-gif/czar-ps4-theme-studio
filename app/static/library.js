@@ -1,19 +1,59 @@
-/* A separate catalog panel; imports use one canonical multipart transfer each. */
+/* Separate media catalog panel with 5 dedicated folders and streaming chunked
+ * upload fallback (CzarUploader) to defeat reverse-proxy HTTP 413 limits.
+ */
 const Library = (() => {
   const get = (name) => document.getElementById(`library-${name}`);
   let next = null;
   let queryVersion = 0;
-  let upload = null;
+  let uploadAbort = null;
   let stopQueue = false;
   let importing = false;
   let applying = false;
   let selected = null;
+  let activeFolder = "";
   let debounce = null;
 
+  const FOLDERS = {
+    content_icons: {
+      id: "content_icons",
+      label: "Ícones de conteúdo",
+      accept: "image/*,.svg,image/svg+xml",
+      kinds: new Set(["image"]),
+    },
+    function_icons: {
+      id: "function_icons",
+      label: "Ícones de função",
+      accept: "image/*,.svg,image/svg+xml",
+      kinds: new Set(["image"]),
+    },
+    audio: {
+      id: "audio",
+      label: "Áudio",
+      accept: "audio/*,.at9,.wav,.mp3,.flac,.ogg,.m4a,.aac,.opus",
+      kinds: new Set(["audio"]),
+    },
+    theme_image: {
+      id: "theme_image",
+      label: "Imagem de tema",
+      accept: "image/*,.svg,image/svg+xml",
+      kinds: new Set(["image"]),
+    },
+    animated_bg: {
+      id: "animated_bg",
+      label: "Fundo animado",
+      accept: "video/*,.gif,.apng,.mp4,.mov,.mkv,.webm,.avi,.m4v",
+      kinds: new Set(["video", "animation"]),
+    },
+  };
+
+  const folderLabel = (fid) => FOLDERS[fid]?.label || "Imagem de tema";
+
   const summary = (item) => [
-    item.format, item.width && item.height ? `${item.width} × ${item.height}` : null,
+    item.format,
+    item.width && item.height ? `${item.width} × ${item.height}` : null,
     item.duration == null ? null : `${item.duration.toLocaleString("pt-BR", { maximumFractionDigits: 2 })} s`,
     fmtBytes(item.bytes),
+    item.normalized?.normalized ? "720p PS4" : null,
   ].filter(Boolean).join(" · ");
 
   function thumbnail(item) {
@@ -38,27 +78,76 @@ const Library = (() => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "library-card";
+    button.dataset.folder = item.folder || "";
     const text = document.createElement("span");
     text.textContent = item.displayName;
     const meta = document.createElement("small");
     meta.textContent = summary(item);
-    text.append(meta);
+    const badge = document.createElement("span");
+    badge.className = "library-folder-badge";
+    badge.textContent = item.folderLabel || folderLabel(item.folder);
+    text.append(meta, badge);
     button.append(thumbnail(item), text);
     button.onclick = () => openAsset(item);
     entry.append(button);
     return entry;
   }
 
+  function updateFolderTabs(counts) {
+    const nav = get("folders");
+    if (!nav) return;
+    let total = 0;
+    if (counts && typeof counts === "object") {
+      if (typeof counts.all === "number") {
+        total = counts.all;
+      } else {
+        for (const fid of Object.keys(FOLDERS)) total += Number(counts[fid] || 0);
+      }
+    }
+    for (const tab of nav.querySelectorAll(".library-folder-tab")) {
+      const fid = tab.dataset.folder || "";
+      const active = fid === activeFolder;
+      tab.classList.toggle("is-active", active);
+      tab.setAttribute("aria-selected", String(active));
+      const badge = tab.querySelector(".folder-count");
+      if (badge && counts) {
+        badge.textContent = String(fid ? Number(counts[fid] || 0) : total);
+      }
+    }
+    const labelEl = get("files-label");
+    if (labelEl) {
+      labelEl.textContent = activeFolder
+        ? `Importar em "${folderLabel(activeFolder)}"`
+        : "Importar arquivos";
+    }
+    const input = get("files");
+    if (input) {
+      if (activeFolder && FOLDERS[activeFolder]) {
+        input.setAttribute("accept", FOLDERS[activeFolder].accept);
+      } else {
+        input.removeAttribute("accept");
+      }
+    }
+  }
+
+  function setFolder(fid) {
+    activeFolder = FOLDERS[fid] ? fid : "";
+    updateFolderTabs(null);
+    refresh();
+  }
+
   async function refresh(append = false) {
     const version = ++queryVersion;
     const params = new URLSearchParams({ q: get("search").value, sort: get("sort").value });
     if (get("kind").value) params.set("kind", get("kind").value);
+    if (activeFolder) params.set("folder", activeFolder);
     if (append && next !== null) params.set("offset", next);
     get("more").hidden = true;
     get("status").textContent = "Carregando mídias…";
     try {
       const result = await api(`/api/library?${params}`);
       if (version !== queryVersion) return;
+      if (result.counts) updateFolderTabs(result.counts);
       if (!append) get("items").replaceChildren();
       get("items").append(...result.items.map(card));
       next = result.next;
@@ -69,41 +158,47 @@ const Library = (() => {
     }
   }
 
-  function transfer(file, meter, status) {
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      upload = xhr;
-      xhr.open("POST", "/api/library");
-      xhr.responseType = "json";
-      xhr.upload.onprogress = (event) => {
-        if (!event.lengthComputable) return;
-        meter.value = event.loaded / event.total;
-        status.textContent = `Enviando · ${Math.floor(meter.value * 100)}%`;
-      };
-      xhr.upload.onload = () => {
+  async function transfer(file, meter, status, targetFolder) {
+    const controller = new AbortController();
+    uploadAbort = controller;
+    const folder = targetFolder || activeFolder || "";
+    const res = await window.CzarUploader.upload(file, {
+      purpose: "library",
+      params: folder ? { folder } : {},
+      directUrl: "/api/library",
+      directFields: folder ? { folder } : {},
+      signal: controller.signal,
+      abortMessage: "Envio interrompido no navegador.",
+      onProgress: (ev) => {
+        if (ev.phase === "upload" && typeof ev.ratio === "number") {
+          meter.value = ev.ratio;
+          const pct = Math.floor(ev.ratio * 100);
+          status.textContent = ev.mode === "chunked"
+            ? `Enviando em blocos · ${pct}%`
+            : `Enviando · ${pct}%`;
+        } else if (ev.phase === "processing") {
+          if (typeof ev.ratio === "number") meter.value = ev.ratio;
+          else meter.removeAttribute("value");
+          if (ev.stage) status.textContent = ev.stage;
+          else status.textContent = "Verificando e salvando no servidor…";
+        }
+      },
+      onStage: (stageTxt) => {
         meter.removeAttribute("value");
-        status.textContent = "Verificando e salvando no servidor…";
-      };
-      xhr.onload = () => {
-        if (xhr.status === 201 || xhr.status === 200) resolve({ code: xhr.status, asset: xhr.response });
-        else reject(new Error(typeof xhr.response?.detail === "string"
-          ? xhr.response.detail : `O servidor recusou o arquivo (HTTP ${xhr.status}).`));
-      };
-      xhr.onabort = () => reject(new Error("Envio interrompido no navegador."));
-      xhr.onerror = () => reject(new Error("A conexão falhou durante o envio."));
-      const body = new FormData();
-      body.append("file", file);
-      xhr.send(body);
+        status.textContent = stageTxt;
+      },
     });
+    return { code: res.status, asset: res.data };
   }
 
-  async function importFiles(files, onAsset) {
+  async function importFiles(files, onAsset, folderOverride = null) {
     if (importing || !files.length) return;
     importing = true;
     stopQueue = false;
     get("files").disabled = true;
     get("cancel").hidden = false;
     get("queue").replaceChildren();
+    const targetFolder = folderOverride !== null ? folderOverride : activeFolder;
     const queue = files.map((file) => {
       const line = document.createElement("li");
       const meter = document.createElement("progress");
@@ -125,7 +220,7 @@ const Library = (() => {
           continue;
         }
         try {
-          const { code, asset } = await transfer(file, meter, status);
+          const { code, asset } = await transfer(file, meter, status, targetFolder);
           meter.value = 1;
           status.textContent = code === 201 ? "Disponível na biblioteca" : "Este conteúdo já está na biblioteca";
           if (onAsset) {
@@ -135,7 +230,7 @@ const Library = (() => {
         } catch (err) {
           meter.hidden = true;
           status.textContent = err.message;
-        } finally { upload = null; }
+        } finally { uploadAbort = null; }
       }
     } finally {
       importing = false;
@@ -145,10 +240,24 @@ const Library = (() => {
     }
   }
 
+  function orderedImageSlots(folder) {
+    const all = [...slots.catalog];
+    const priority = (spec) => {
+      if (folder === "function_icons") return spec.group === "function_icon" ? 0 : (spec.group === "content_icon" ? 1 : 2);
+      if (folder === "content_icons") return spec.group === "content_icon" ? 0 : (spec.group === "function_icon" ? 1 : 2);
+      if (folder === "theme_image") return spec.group === "background" ? 0 : 1;
+      return 0;
+    };
+    return all.sort((a, b) => priority(a) - priority(b));
+  }
+
   function openAsset(item) {
     selected = item;
     get("title").textContent = item.displayName;
-    get("info").textContent = [summary(item), item.codec,
+    get("info").textContent = [
+      item.folderLabel || folderLabel(item.folder),
+      summary(item),
+      item.codec,
       item.fps == null ? null : `${item.fps.toLocaleString("pt-BR", { maximumFractionDigits: 2 })} FPS`,
     ].filter(Boolean).join(" · ");
     const link = get("original");
@@ -174,14 +283,27 @@ const Library = (() => {
       }
       preview.append(image);
     }
+
+    const folderSel = get("asset-folder");
+    if (folderSel) {
+      folderSel.replaceChildren();
+      for (const f of Object.values(FOLDERS)) {
+        if (f.kinds.has(item.kind)) {
+          folderSel.add(new Option(f.label, f.id));
+        }
+      }
+      if (item.folder) folderSel.value = item.folder;
+      folderSel.disabled = folderSel.options.length <= 1;
+    }
+
     const target = get("target");
     target.replaceChildren();
     if (Projects.id) {
-      if (item.kind === "image" || item.extension === ".gif") {
-        slots.catalog.forEach((spec) => target.add(new Option(lbl(spec.label), spec.id)));
-      }
       if (item.kind === "video" || item.kind === "animation") {
         target.add(new Option("Fundo animado", "animated"));
+      }
+      if (item.kind === "image" || item.extension === ".gif") {
+        orderedImageSlots(item.folder).forEach((spec) => target.add(new Option(lbl(spec.label), spec.id)));
       }
       if (item.kind === "audio") {
         sfx.catalog.filter((spec) => spec.convert || sys.at9tool || item.extension === ".at9")
@@ -194,6 +316,30 @@ const Library = (() => {
     get("apply-status").textContent = Projects.id
       ? (target.disabled ? "Nenhum destino compatível." : "") : "Abra um projeto para usar esta mídia.";
     get("asset").showModal();
+  }
+
+  async function changeAssetFolder() {
+    const folderSel = get("asset-folder");
+    if (!selected || !folderSel || !folderSel.value) return;
+    const nextFolder = folderSel.value;
+    folderSel.disabled = true;
+    get("apply-status").textContent = "Movendo para pasta…";
+    try {
+      const res = await fetch(`/api/library/${encodeURIComponent(selected.id)}/folder`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folder: nextFolder }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`);
+      selected = data;
+      get("apply-status").textContent = `Movido para "${data.folderLabel || folderLabel(nextFolder)}".`;
+      await refresh();
+    } catch (err) {
+      get("apply-status").textContent = err.message;
+    } finally {
+      folderSel.disabled = folderSel.options.length <= 1;
+    }
   }
 
   async function applyAsset() {
@@ -225,6 +371,18 @@ const Library = (() => {
     const panel = document.getElementById("media-library");
     panel.ontoggle = () => { if (panel.open) refresh(); };
     if (panel.open) refresh();
+
+    const nav = get("folders");
+    if (nav) {
+      nav.addEventListener("click", (event) => {
+        const btn = event.target.closest(".library-folder-tab");
+        if (!btn) return;
+        setFolder(btn.dataset.folder || "");
+      });
+    }
+    const folderSel = get("asset-folder");
+    if (folderSel) folderSel.onchange = changeAssetFolder;
+
     get("search").oninput = () => {
       clearTimeout(debounce);
       debounce = setTimeout(() => refresh(), 200);
@@ -237,7 +395,7 @@ const Library = (() => {
       get("files").value = "";
       importFiles(files);
     };
-    get("cancel").onclick = () => { stopQueue = true; upload?.abort(); };
+    get("cancel").onclick = () => { stopQueue = true; uploadAbort?.abort(); };
     get("apply").onclick = applyAsset;
     get("layer").onclick = () => {
       try {
@@ -249,7 +407,8 @@ const Library = (() => {
     };
     get("asset").addEventListener("close", () => get("preview").replaceChildren());
     get("asset").addEventListener("cancel", (event) => { if (applying) event.preventDefault(); });
+    updateFolderTabs(null);
   }
 
-  return { boot, importFiles };
+  return { boot, importFiles, setFolder, refresh };
 })();

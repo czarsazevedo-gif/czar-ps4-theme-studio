@@ -1858,6 +1858,63 @@ a.btn {
   font-weight: 700;
 }
 
+/* ---------- connection keep-alive pill ---------- */
+.conn-pill {
+  white-space: nowrap;
+}
+.conn-pill.warn {
+  border-color: rgba(255, 180, 61, .55);
+  background: rgba(255, 180, 61, .12);
+  color: #ffe2a8;
+}
+.conn-pill.warn::before {
+  background: var(--warn);
+  box-shadow: 0 0 8px var(--warn);
+}
+.conn-pill.err::before {
+  background: var(--danger);
+  box-shadow: 0 0 9px var(--danger);
+}
 
+/* ---------- streaming animated upload & 4K normalization progress ---------- */
+.anim-upload-box {
+  margin: 12px 0;
+  padding: 14px 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--bg-raised);
+  display: grid;
+  gap: 8px;
+}
+.anim-upload-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 14px;
+}
+.anim-upload-box progress {
+  width: 100%;
+  height: 10px;
+}
+.anim-upload-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
 
-
+/* ---------- Forge PKG inspector card ---------- */
+.forge-inspect-card summary {
+  cursor: pointer;
+  font-weight: 600;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+}
+.forge-inspect-body {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}

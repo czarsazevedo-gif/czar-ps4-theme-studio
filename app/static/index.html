@@ -29,6 +29,7 @@
   </div>
   <div class="topbar-right">
     <div id="sysinfo" class="sysinfo"></div>
+    <button id="conn-status" type="button" class="pill conn-pill off" data-state="connecting" aria-live="polite" title="Status da conexão e keep-alive">Conectando…</button>
     <select id="lang-select" class="select lang-select" data-i18n-attr="aria-label:lang.label">
       <option value="pt-BR">Português brasileiro</option>
       <option value="en">English</option>
@@ -69,6 +70,14 @@
 
 <details class="media-library" id="media-library">
   <summary>Biblioteca de mídia</summary>
+  <nav id="library-folders" class="library-folders" role="tablist" aria-label="Pastas de mídia">
+    <button type="button" class="library-folder-tab is-active" data-folder="" role="tab" aria-selected="true">Todas <span class="folder-count" data-count="">0</span></button>
+    <button type="button" class="library-folder-tab" data-folder="content_icons" role="tab" aria-selected="false">Ícones de conteúdo <span class="folder-count" data-count="content_icons">0</span></button>
+    <button type="button" class="library-folder-tab" data-folder="function_icons" role="tab" aria-selected="false">Ícones de função <span class="folder-count" data-count="function_icons">0</span></button>
+    <button type="button" class="library-folder-tab" data-folder="audio" role="tab" aria-selected="false">Áudio <span class="folder-count" data-count="audio">0</span></button>
+    <button type="button" class="library-folder-tab" data-folder="theme_image" role="tab" aria-selected="false">Imagem de tema <span class="folder-count" data-count="theme_image">0</span></button>
+    <button type="button" class="library-folder-tab" data-folder="animated_bg" role="tab" aria-selected="false">Fundo animado <span class="folder-count" data-count="animated_bg">0</span></button>
+  </nav>
   <div class="library-tools">
     <label>Buscar por nome <input id="library-search" class="select" type="search"></label>
     <label>Categoria
@@ -89,7 +98,7 @@
     </label>
   </div>
   <div class="library-actions">
-    <label class="library-files">Importar arquivos <input id="library-files" type="file" multiple></label>
+    <label class="library-files"><span id="library-files-label">Importar arquivos</span> <input id="library-files" type="file" multiple></label>
     <button id="library-cancel" class="btn btn-ghost" hidden>Interromper fila</button>
   </div>
   <ul id="library-queue" class="library-queue" aria-label="Progresso das importações"></ul>
@@ -114,7 +123,7 @@
     <div id="comp-editor" hidden>
       <div class="comp-toolbar">
         <label>Superfície <select id="comp-target" class="select"></select></label>
-        <label class="comp-upload">Importar camada <input type="file" id="comp-files" multiple></label>
+        <label class="comp-upload">Importar camada <input type="file" id="comp-files" accept="image/*,.svg,image/svg+xml" multiple></label>
         <button class="btn btn-ghost" id="comp-library">Escolher da biblioteca</button>
         <button class="btn btn-ghost" id="comp-undo">Desfazer</button>
         <button class="btn btn-ghost" id="comp-redo">Refazer</button>
@@ -281,11 +290,23 @@
       </details>
 
       <div id="anim-drop" class="dropzone">
-        <input type="file" id="anim-file" accept="video/*,.gif,.mp4,.mov,.mkv,.webm,.avi,.m4v">
+        <input type="file" id="anim-file" accept="video/*,.gif,.apng,.mp4,.mov,.mkv,.webm,.avi,.m4v">
         <div class="dz-inner">
           <div class="dz-icon"></div>
           <p class="dz-title" data-i18n="bg.drop.title"></p>
           <p class="dz-hint" data-i18n="bg.drop.hint"></p>
+        </div>
+      </div>
+
+      <div id="anim-upload-box" class="anim-upload-box" hidden aria-live="polite">
+        <div class="anim-upload-head">
+          <span id="anim-upload-stage">Preparando envio…</span>
+          <b id="anim-upload-pct">0%</b>
+        </div>
+        <progress id="anim-upload-bar" max="100" value="0"></progress>
+        <div class="anim-upload-foot">
+          <span id="anim-upload-meta" class="dim">Envio em blocos de 2 MiB · aceita vídeos até 120 MiB (incluindo 4K 60fps)</span>
+          <button id="anim-upload-cancel" type="button" class="btn btn-ghost">Cancelar envio</button>
         </div>
       </div>
 
@@ -432,15 +453,15 @@
     <div class="slot-toolbar">
       <label class="btn btn-primary">
         <span data-i18n="icons.bulkByName">Importar lote por nome (PT/EN)</span>
-        <input type="file" id="bulk-by-name" accept="image/*" multiple hidden>
+        <input type="file" id="bulk-by-name" accept="image/*,.svg,image/svg+xml" multiple hidden>
       </label>
       <label class="btn btn-ghost">
         <span data-i18n="icons.bulkFn"></span>
-        <input type="file" id="bulk-fn" accept="image/*" hidden>
+        <input type="file" id="bulk-fn" accept="image/*,.svg,image/svg+xml" hidden>
       </label>
       <label class="btn btn-ghost">
         <span data-i18n="icons.bulkCt"></span>
-        <input type="file" id="bulk-ct" accept="image/*" hidden>
+        <input type="file" id="bulk-ct" accept="image/*,.svg,image/svg+xml" hidden>
       </label>
       <button id="clear-icons" class="btn btn-ghost" data-i18n="icons.clear"></button>
     </div>
@@ -704,6 +725,21 @@
           <div id="forge-history-list" class="forge-history-list"></div>
         </div>
 
+        <details id="forge-pkg-inspect-card" class="card forge-inspect-card">
+          <summary>Inspecionar arquivo .PKG (Forge Inspector)</summary>
+          <div class="forge-inspect-body">
+            <p class="card-note" style="margin:0">Envie um <code>.pkg</code> de tema PS4 para inspecionar cabeçalho, <code>IRO_TAG</code>, <code>param.sfo</code> e estrutura interna (com upload em blocos de 2 MiB).</p>
+            <div class="bgm-row">
+              <label class="btn btn-ghost">
+                <span>Selecionar .pkg para inspecionar</span>
+                <input type="file" id="forge-pkg-inspect-file" accept=".pkg,application/octet-stream" hidden>
+              </label>
+              <span id="forge-pkg-inspect-status" class="ctl-note" role="status">Nenhum pacote carregado.</span>
+            </div>
+            <pre id="forge-pkg-inspect-output" class="forge-metrics-pre" hidden></pre>
+          </div>
+        </details>
+
         <div class="card">
           <h2 class="card-title" data-i18n="pkg.assets"></h2>
           <ul class="checklist" id="pkg-checklist"></ul>
@@ -807,6 +843,7 @@
   <div id="library-preview"></div>
   <p id="library-info"></p>
   <a id="library-original" class="btn btn-ghost" download>Baixar original</a>
+  <label class="library-destination">Pasta na biblioteca <select id="library-asset-folder" class="select"></select></label>
   <label class="library-destination">Destino no projeto <select id="library-target" class="select"></select></label>
   <button id="library-apply" class="btn btn-primary" disabled>Usar no projeto</button>
   <button id="library-layer" class="btn btn-ghost" hidden>Adicionar como camada</button>
@@ -836,6 +873,8 @@
 </dialog>
 
 <script src="/static/projects.js"></script>
+<script src="/static/uploader.js"></script>
+<script src="/static/keepalive.js"></script>
 <script src="/static/library.js"></script>
 <script src="/static/compositor.js"></script>
 <script src="/static/app.js"></script>

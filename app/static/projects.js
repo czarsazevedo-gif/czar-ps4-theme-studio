@@ -213,5 +213,5 @@ const Projects = (() => {
     return loaded;
   }
 
-  return { id, boot, changed, flush, syncAfterExternalUpdate, mediaUrl, fetchMedia };
+  return { id, boot, changed, save, flush, syncAfterExternalUpdate, mediaUrl, fetchMedia };
 })();
